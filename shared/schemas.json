@@ -1,0 +1,650 @@
+{
+  "$defs": {
+    "Action": {
+      "enum": [
+        "buy",
+        "sell"
+      ],
+      "title": "Action",
+      "type": "string"
+    },
+    "EngineMessage": {
+      "additionalProperties": false,
+      "description": "Envelope for every engine -> dashboard WebSocket message.",
+      "properties": {
+        "data": {
+          "additionalProperties": true,
+          "title": "Data",
+          "type": "object"
+        },
+        "ts": {
+          "format": "date-time",
+          "title": "Ts",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "quote_update",
+            "fair_value",
+            "signal",
+            "order",
+            "fill",
+            "position",
+            "risk",
+            "log",
+            "health"
+          ],
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "ts",
+        "data"
+      ],
+      "title": "EngineMessage",
+      "type": "object"
+    },
+    "FairValue": {
+      "additionalProperties": false,
+      "description": "Our estimate of one contract's YES value.",
+      "properties": {
+        "exchange_id": {
+          "title": "Exchange Id",
+          "type": "string"
+        },
+        "inputs": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "description": "Weight given to each source",
+          "title": "Inputs",
+          "type": "object"
+        },
+        "model_version": {
+          "title": "Model Version",
+          "type": "string"
+        },
+        "ts": {
+          "format": "date-time",
+          "title": "Ts",
+          "type": "string"
+        },
+        "value": {
+          "description": "In milli; need not be on grid",
+          "maximum": 1000,
+          "minimum": 0,
+          "title": "Value",
+          "type": "number"
+        }
+      },
+      "required": [
+        "exchange_id",
+        "value",
+        "inputs",
+        "model_version",
+        "ts"
+      ],
+      "title": "FairValue",
+      "type": "object"
+    },
+    "Fill": {
+      "additionalProperties": false,
+      "description": "Mirrors the API's Fill. `quantity` is signed: negative means NO shares.",
+      "properties": {
+        "exchange_id": {
+          "title": "Exchange Id",
+          "type": "string"
+        },
+        "filled_at": {
+          "format": "date-time",
+          "title": "Filled At",
+          "type": "string"
+        },
+        "id": {
+          "title": "Id",
+          "type": "integer"
+        },
+        "market_id": {
+          "title": "Market Id",
+          "type": "string"
+        },
+        "order_id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Order Id"
+        },
+        "price": {
+          "anyOf": [
+            {
+              "maximum": 200,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Price"
+        },
+        "quantity": {
+          "title": "Quantity",
+          "type": "number"
+        },
+        "side": {
+          "$ref": "#/$defs/Side"
+        }
+      },
+      "required": [
+        "id",
+        "order_id",
+        "exchange_id",
+        "market_id",
+        "price",
+        "quantity",
+        "side",
+        "filled_at"
+      ],
+      "title": "Fill",
+      "type": "object"
+    },
+    "Lean": {
+      "enum": [
+        "D",
+        "R",
+        "none"
+      ],
+      "title": "Lean",
+      "type": "string"
+    },
+    "Market": {
+      "additionalProperties": false,
+      "description": "One SIG market (one candidate's YES/NO contract within a race).",
+      "properties": {
+        "exchanges": {
+          "description": "SIG exchange ids belonging to this market",
+          "items": {
+            "type": "string"
+          },
+          "title": "Exchanges",
+          "type": "array"
+        },
+        "is_composite": {
+          "title": "Is Composite",
+          "type": "boolean"
+        },
+        "lean": {
+          "$ref": "#/$defs/Lean",
+          "default": "none"
+        },
+        "resolution_text": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Copied from the market's Info tab",
+          "title": "Resolution Text"
+        },
+        "settlement_date": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Settlement Date"
+        },
+        "sig_market_id": {
+          "title": "Sig Market Id",
+          "type": "string"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sig_market_id",
+        "title",
+        "exchanges",
+        "is_composite"
+      ],
+      "title": "Market",
+      "type": "object"
+    },
+    "MarketMapping": {
+      "additionalProperties": false,
+      "description": "Links one SIG exchange to the matching Polymarket and Kalshi contracts.",
+      "properties": {
+        "kalshi_ticker": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Kalshi Ticker"
+        },
+        "match_confidence": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Match Confidence",
+          "type": "number"
+        },
+        "mismatch_notes": {
+          "default": "",
+          "title": "Mismatch Notes",
+          "type": "string"
+        },
+        "polymarket_token_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Polymarket Token Id"
+        },
+        "sig_exchange_id": {
+          "title": "Sig Exchange Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sig_exchange_id",
+        "match_confidence"
+      ],
+      "title": "MarketMapping",
+      "type": "object"
+    },
+    "Mode": {
+      "enum": [
+        "manual",
+        "election"
+      ],
+      "title": "Mode",
+      "type": "string"
+    },
+    "ModeCommand": {
+      "additionalProperties": false,
+      "description": "Body of POST /mode.",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/Mode"
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "title": "ModeCommand",
+      "type": "object"
+    },
+    "OrderIntent": {
+      "additionalProperties": false,
+      "description": "An order we want to place. Must pass risk.check() before it is sent.\n\nLimit orders only: `price` is restricted to 1-199 ticks, so a market order\n(price 0 or 200, or no price) cannot be expressed.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/Action"
+        },
+        "exchange_id": {
+          "title": "Exchange Id",
+          "type": "string"
+        },
+        "idempotency_key": {
+          "description": "Saved before sending; reused on retry",
+          "minLength": 1,
+          "title": "Idempotency Key",
+          "type": "string"
+        },
+        "price": {
+          "maximum": 199,
+          "minimum": 1,
+          "title": "Price",
+          "type": "integer"
+        },
+        "qty": {
+          "exclusiveMinimum": 0,
+          "title": "Qty",
+          "type": "integer"
+        },
+        "reason": {
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        },
+        "side": {
+          "$ref": "#/$defs/Side"
+        }
+      },
+      "required": [
+        "idempotency_key",
+        "exchange_id",
+        "side",
+        "action",
+        "qty",
+        "price",
+        "reason"
+      ],
+      "title": "OrderIntent",
+      "type": "object"
+    },
+    "OverrideCommand": {
+      "additionalProperties": false,
+      "description": "Body of POST /override. Expires after 15 minutes; still passes risk.check().",
+      "properties": {
+        "exchange_id": {
+          "title": "Exchange Id",
+          "type": "string"
+        },
+        "value": {
+          "description": "Fair value in milli",
+          "maximum": 1000,
+          "minimum": 0,
+          "title": "Value",
+          "type": "number"
+        }
+      },
+      "required": [
+        "exchange_id",
+        "value"
+      ],
+      "title": "OverrideCommand",
+      "type": "object"
+    },
+    "Position": {
+      "additionalProperties": false,
+      "description": "Mirrors the API's Position. `quantity` is signed: positive YES, negative NO.",
+      "properties": {
+        "avg_cost": {
+          "title": "Avg Cost",
+          "type": "number"
+        },
+        "current_price": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Current Price"
+        },
+        "exchange_id": {
+          "title": "Exchange Id",
+          "type": "string"
+        },
+        "market_id": {
+          "title": "Market Id",
+          "type": "string"
+        },
+        "market_title": {
+          "title": "Market Title",
+          "type": "string"
+        },
+        "quantity": {
+          "title": "Quantity",
+          "type": "number"
+        },
+        "settled": {
+          "title": "Settled",
+          "type": "boolean"
+        },
+        "unrealized_pnl": {
+          "title": "Unrealized Pnl",
+          "type": "number"
+        }
+      },
+      "required": [
+        "exchange_id",
+        "market_id",
+        "market_title",
+        "settled",
+        "quantity",
+        "avg_cost",
+        "current_price",
+        "unrealized_pnl"
+      ],
+      "title": "Position",
+      "type": "object"
+    },
+    "Quote": {
+      "additionalProperties": false,
+      "description": "Top of book from one venue, YES-denominated, in milli (price x 1000).",
+      "properties": {
+        "ask": {
+          "anyOf": [
+            {
+              "maximum": 1000,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Ask"
+        },
+        "bid": {
+          "anyOf": [
+            {
+              "maximum": 1000,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Bid"
+        },
+        "exchange_id": {
+          "title": "Exchange Id",
+          "type": "string"
+        },
+        "mid": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Mid in milli; may fall on a half milli.",
+          "readOnly": true,
+          "title": "Mid"
+        },
+        "source": {
+          "$ref": "#/$defs/QuoteSource"
+        },
+        "ts": {
+          "format": "date-time",
+          "title": "Ts",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "exchange_id",
+        "bid",
+        "ask",
+        "ts",
+        "mid"
+      ],
+      "title": "Quote",
+      "type": "object"
+    },
+    "QuoteSource": {
+      "enum": [
+        "sig",
+        "polymarket",
+        "kalshi"
+      ],
+      "title": "QuoteSource",
+      "type": "string"
+    },
+    "RiskLimits": {
+      "additionalProperties": false,
+      "description": "Limits for one mode. Values come from config/risk.yaml, never from code.",
+      "properties": {
+        "fair_value_max_age_s": {
+          "exclusiveMinimum": 0,
+          "title": "Fair Value Max Age S",
+          "type": "number"
+        },
+        "max_order_susqies": {
+          "exclusiveMinimum": 0,
+          "title": "Max Order Susqies",
+          "type": "number"
+        },
+        "max_race_pct": {
+          "exclusiveMinimum": 0,
+          "maximum": 100,
+          "title": "Max Race Pct",
+          "type": "number"
+        },
+        "max_scenario_loss_pct": {
+          "exclusiveMinimum": 0,
+          "maximum": 100,
+          "title": "Max Scenario Loss Pct",
+          "type": "number"
+        },
+        "min_cash_pct": {
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Min Cash Pct",
+          "type": "number"
+        }
+      },
+      "required": [
+        "max_race_pct",
+        "max_order_susqies",
+        "max_scenario_loss_pct",
+        "fair_value_max_age_s",
+        "min_cash_pct"
+      ],
+      "title": "RiskLimits",
+      "type": "object"
+    },
+    "RiskState": {
+      "additionalProperties": false,
+      "properties": {
+        "kill_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Kill Reason"
+        },
+        "killed": {
+          "title": "Killed",
+          "type": "boolean"
+        },
+        "limits": {
+          "$ref": "#/$defs/RiskLimits"
+        },
+        "mode": {
+          "$ref": "#/$defs/Mode"
+        },
+        "ts": {
+          "format": "date-time",
+          "title": "Ts",
+          "type": "string"
+        }
+      },
+      "required": [
+        "mode",
+        "limits",
+        "killed",
+        "ts"
+      ],
+      "title": "RiskState",
+      "type": "object"
+    },
+    "Side": {
+      "enum": [
+        "yes",
+        "no"
+      ],
+      "title": "Side",
+      "type": "string"
+    },
+    "Signal": {
+      "additionalProperties": false,
+      "description": "A strategy's suggestion. Logged whether or not it is traded.",
+      "properties": {
+        "edge_cents": {
+          "title": "Edge Cents",
+          "type": "number"
+        },
+        "exchange_id": {
+          "title": "Exchange Id",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Human-readable; shown on the dashboard",
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        },
+        "side": {
+          "$ref": "#/$defs/Side"
+        },
+        "size": {
+          "exclusiveMinimum": 0,
+          "title": "Size",
+          "type": "integer"
+        },
+        "strategy": {
+          "title": "Strategy",
+          "type": "string"
+        },
+        "ts": {
+          "format": "date-time",
+          "title": "Ts",
+          "type": "string"
+        }
+      },
+      "required": [
+        "exchange_id",
+        "strategy",
+        "side",
+        "edge_cents",
+        "size",
+        "reason",
+        "ts"
+      ],
+      "title": "Signal",
+      "type": "object"
+    }
+  },
+  "title": "Bellwether shared schemas"
+}
