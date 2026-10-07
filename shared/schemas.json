@@ -58,7 +58,7 @@
           "additionalProperties": {
             "type": "number"
           },
-          "description": "Weight given to each source",
+          "description": "Weight given to each source; finite floats",
           "title": "Inputs",
           "type": "object"
         },
@@ -72,7 +72,7 @@
           "type": "string"
         },
         "value": {
-          "description": "In milli; need not be on grid",
+          "description": "YES fair value. Milli: price x 1000, so 0.537 -> 537. Float 0-1000; need not be on any grid.",
           "maximum": 1000,
           "minimum": 0,
           "title": "Value",
@@ -132,6 +132,7 @@
               "type": "null"
             }
           ],
+          "description": "Execution price, YES-denominated per the API's fill docs. Integer ticks: price x 200, so 0.005 -> 1, 0.5 -> 100, 0.995 -> 199. Integer 0-200.",
           "title": "Price"
         },
         "quantity": {
@@ -303,29 +304,35 @@
     },
     "OrderIntent": {
       "additionalProperties": false,
-      "description": "An order we want to place. Must pass risk.check() before it is sent.\n\nLimit orders only: `price` is restricted to 1-199 ticks, so a market order\n(price 0 or 200, or no price) cannot be expressed.",
+      "description": "An order we want to place. Must pass risk.check() before it is sent.\n\n`price` is restricted to 1-199 ticks, so this model cannot carry a market-order\nprice (0, 200 or none). That alone does not guarantee limit-only execution; the\norder-sending code must still send this price.\n\nqty, idempotency_key and exchange_id follow the API's OrderInput constraints.",
       "properties": {
         "action": {
           "$ref": "#/$defs/Action"
         },
         "exchange_id": {
+          "description": "SIG exchange id: ASCII digits only.",
+          "pattern": "^[0-9]+$",
           "title": "Exchange Id",
           "type": "string"
         },
         "idempotency_key": {
-          "description": "Saved before sending; reused on retry",
+          "description": "Saved before sending; reused on retry. 1-255 characters.",
+          "maxLength": 255,
           "minLength": 1,
           "title": "Idempotency Key",
           "type": "string"
         },
         "price": {
+          "description": "Limit price. Integer ticks: price x 200, so 0.005 -> 1, 0.5 -> 100, 0.995 -> 199. Integer 1-199. Same denomination as the API's order price: per docs/api/openapi.json a NO order is priced in NO terms (`sell yes q@p` == `buy no q@(1-p)`).",
           "maximum": 199,
           "minimum": 1,
           "title": "Price",
           "type": "integer"
         },
         "qty": {
+          "description": "Whole shares, 1-2147483647.",
           "exclusiveMinimum": 0,
+          "maximum": 2147483647,
           "title": "Qty",
           "type": "integer"
         },
@@ -359,7 +366,7 @@
           "type": "string"
         },
         "value": {
-          "description": "Fair value in milli",
+          "description": "YES fair value set by hand. Milli: price x 1000, so 0.537 -> 537. Float 0-1000.",
           "maximum": 1000,
           "minimum": 0,
           "title": "Value",
@@ -432,7 +439,7 @@
     },
     "Quote": {
       "additionalProperties": false,
-      "description": "Top of book from one venue, YES-denominated, in milli (price x 1000).",
+      "description": "Top of book from one venue, YES-denominated, in milli (price x 1000).\n\n`mid` is computed from bid and ask, never accepted as input. A plain dump\n(for the dashboard) includes it; a `round_trip=True` dump (for storage and\nreplay) omits it so the record validates back into a Quote.",
       "properties": {
         "ask": {
           "anyOf": [
@@ -445,6 +452,7 @@
               "type": "null"
             }
           ],
+          "description": "Best YES ask. Milli: price x 1000, so 0.537 -> 537. Integer 0-1000.",
           "title": "Ask"
         },
         "bid": {
@@ -458,6 +466,7 @@
               "type": "null"
             }
           ],
+          "description": "Best YES bid. Milli: price x 1000, so 0.537 -> 537. Integer 0-1000.",
           "title": "Bid"
         },
         "exchange_id": {
@@ -473,7 +482,7 @@
               "type": "null"
             }
           ],
-          "description": "Mid in milli; may fall on a half milli.",
+          "description": "Computed (bid + ask) / 2, YES-denominated. Milli: price x 1000, so 0.537 -> 537. May fall on a half milli. Output only: omitted by round_trip dumps and rejected as input.",
           "readOnly": true,
           "title": "Mid"
         },

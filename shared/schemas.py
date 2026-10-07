@@ -10,8 +10,17 @@ Units:
   Polymarket moves in 0.001 steps, finer than SIG's tick, so quotes are not rounded.
   Fair values and overrides are also in milli (as floats), so everything compared
   against SIG shares one unit. A SIG tick is exactly 5 milli.
-- All prices are YES-denominated. A NO share costs `200 - ticks`.
+- Quotes, fair values, overrides and fills are YES-denominated: a NO share is worth
+  `1000 - milli` or `200 - ticks`. OrderIntent.price follows the API's order `price`,
+  which for a NO order is the NO price (see OrderIntent.price).
+- Every float rejects NaN and +/-infinity, including dict values.
 - All timestamps are timezone-aware and normalised to UTC.
+
+Serialization:
+- `model_dump()` / `model_dump_json()` include computed fields such as Quote.mid.
+  Use this for the dashboard. It does not validate back into the model.
+- `model_dump(round_trip=True)` / `model_dump_json(round_trip=True)` omit computed
+  fields. Use this for storage and replay; it validates back into an equal model.
 """
 
 from __future__ import annotations
@@ -27,6 +36,13 @@ TICKS_PER_UNIT = 200
 MILLI_PER_UNIT = 1000
 MIN_ORDER_TICK = 1  # 0.005
 MAX_ORDER_TICK = 199  # 0.995
+
+# From docs/api/openapi.json, components.schemas.OrderInput / SingleOrderInput.
+MAX_ORDER_QTY = 2_147_483_647  # quantity: integer, exclusiveMinimum 0, maximum 2147483647
+MAX_IDEMPOTENCY_KEY_LEN = 255  # idempotencyKey: minLength 1, maxLength 255
+# exchangeId: pattern ^\d+$. Spelled [0-9] because the spec's \d is ASCII-only
+# (ECMAScript), whereas Pydantic's \d also matches other Unicode digits.
+EXCHANGE_ID_PATTERN = r"^[0-9]+$"
 
 
 def _to_utc(value: datetime) -> datetime:
@@ -45,9 +61,17 @@ OrderTick = Annotated[int, Field(ge=MIN_ORDER_TICK, le=MAX_ORDER_TICK, strict=Tr
 Milli = Annotated[int, Field(ge=0, le=MILLI_PER_UNIT, strict=True)]
 """A YES quote price on the 0.001 grid, in milli (0-1000)."""
 
+PositiveInt = Annotated[int, Field(gt=0, strict=True)]
+"""A whole number above zero. Strict: rejects bools, numeric strings and floats."""
+
+TICKS_NOTE = "Integer ticks: price x 200, so 0.005 -> 1, 0.5 -> 100, 0.995 -> 199."
+MILLI_NOTE = "Milli: price x 1000, so 0.537 -> 537."
+
 
 def _scale(price: Decimal | str | float, units: int, step: str) -> int:
     scaled = Decimal(str(price)) * units
+    if not scaled.is_finite():
+        raise ValueError(f"price {price} is not finite")
     if scaled != scaled.to_integral_value():
         raise ValueError(f"price {price} is not on the {step} step")
     value = int(scaled)
@@ -72,7 +96,7 @@ def price_to_milli(price: Decimal | str | float) -> int:
 
 
 class _Model(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
 
 class Side(StrEnum):
@@ -125,18 +149,27 @@ class MarketMapping(_Model):
 
 
 class Quote(_Model):
-    """Top of book from one venue, YES-denominated, in milli (price x 1000)."""
+    """Top of book from one venue, YES-denominated, in milli (price x 1000).
+
+    `mid` is computed from bid and ask, never accepted as input. A plain dump
+    (for the dashboard) includes it; a `round_trip=True` dump (for storage and
+    replay) omits it so the record validates back into a Quote.
+    """
 
     source: QuoteSource
     exchange_id: str
-    bid: Milli | None
-    ask: Milli | None
+    bid: Milli | None = Field(description=f"Best YES bid. {MILLI_NOTE} Integer 0-1000.")
+    ask: Milli | None = Field(description=f"Best YES ask. {MILLI_NOTE} Integer 0-1000.")
     ts: UtcDatetime
 
-    @computed_field  # type: ignore[prop-decorator]
+    @computed_field(  # type: ignore[prop-decorator]
+        description=(
+            f"Computed (bid + ask) / 2, YES-denominated. {MILLI_NOTE} May fall on a half "
+            "milli. Output only: omitted by round_trip dumps and rejected as input."
+        )
+    )
     @property
     def mid(self) -> float | None:
-        """Mid in milli; may fall on a half milli."""
         if self.bid is None or self.ask is None:
             return None
         return (self.bid + self.ask) / 2
@@ -146,8 +179,12 @@ class FairValue(_Model):
     """Our estimate of one contract's YES value."""
 
     exchange_id: str
-    value: float = Field(ge=0, le=MILLI_PER_UNIT, description="In milli; need not be on grid")
-    inputs: dict[str, float] = Field(description="Weight given to each source")
+    value: float = Field(
+        ge=0,
+        le=MILLI_PER_UNIT,
+        description=f"YES fair value. {MILLI_NOTE} Float 0-1000; need not be on any grid.",
+    )
+    inputs: dict[str, float] = Field(description="Weight given to each source; finite floats")
     model_version: str
     ts: UtcDatetime
 
@@ -159,7 +196,7 @@ class Signal(_Model):
     strategy: str
     side: Side
     edge_cents: float
-    size: int = Field(gt=0)
+    size: PositiveInt
     reason: str = Field(min_length=1, description="Human-readable; shown on the dashboard")
     ts: UtcDatetime
 
@@ -167,16 +204,31 @@ class Signal(_Model):
 class OrderIntent(_Model):
     """An order we want to place. Must pass risk.check() before it is sent.
 
-    Limit orders only: `price` is restricted to 1-199 ticks, so a market order
-    (price 0 or 200, or no price) cannot be expressed.
+    `price` is restricted to 1-199 ticks, so this model cannot carry a market-order
+    price (0, 200 or none). That alone does not guarantee limit-only execution; the
+    order-sending code must still send this price.
+
+    qty, idempotency_key and exchange_id follow the API's OrderInput constraints.
     """
 
-    idempotency_key: str = Field(min_length=1, description="Saved before sending; reused on retry")
-    exchange_id: str
+    idempotency_key: str = Field(
+        min_length=1,
+        max_length=MAX_IDEMPOTENCY_KEY_LEN,
+        description="Saved before sending; reused on retry. 1-255 characters.",
+    )
+    exchange_id: str = Field(
+        pattern=EXCHANGE_ID_PATTERN, description="SIG exchange id: ASCII digits only."
+    )
     side: Side
     action: Action
-    qty: int = Field(gt=0)
-    price: OrderTick
+    qty: PositiveInt = Field(le=MAX_ORDER_QTY, description="Whole shares, 1-2147483647.")
+    price: OrderTick = Field(
+        description=(
+            f"Limit price. {TICKS_NOTE} Integer 1-199. Same denomination as the API's "
+            "order price: per docs/api/openapi.json a NO order is priced in NO terms "
+            "(`sell yes q@p` == `buy no q@(1-p)`)."
+        )
+    )
     reason: str = Field(min_length=1)
 
 
@@ -187,7 +239,11 @@ class Fill(_Model):
     order_id: int | None
     exchange_id: str
     market_id: str
-    price: Tick | None
+    price: Tick | None = Field(
+        description=(
+            f"Execution price, YES-denominated per the API's fill docs. {TICKS_NOTE} Integer 0-200."
+        )
+    )
     quantity: float
     side: Side
     filled_at: UtcDatetime
@@ -247,7 +303,11 @@ class OverrideCommand(_Model):
     """Body of POST /override. Expires after 15 minutes; still passes risk.check()."""
 
     exchange_id: str
-    value: float = Field(ge=0, le=MILLI_PER_UNIT, description="Fair value in milli")
+    value: float = Field(
+        ge=0,
+        le=MILLI_PER_UNIT,
+        description=f"YES fair value set by hand. {MILLI_NOTE} Float 0-1000.",
+    )
 
 
 EXPORTED_MODELS: tuple[type[BaseModel], ...] = (
