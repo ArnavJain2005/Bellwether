@@ -432,12 +432,12 @@
     },
     "Quote": {
       "additionalProperties": false,
-      "description": "Top of book from one venue, YES-denominated, in ticks.",
+      "description": "Top of book from one venue, YES-denominated, in milli (price x 1000).",
       "properties": {
         "ask": {
           "anyOf": [
             {
-              "maximum": 200,
+              "maximum": 1000,
               "minimum": 0,
               "type": "integer"
             },
@@ -450,7 +450,7 @@
         "bid": {
           "anyOf": [
             {
-              "maximum": 200,
+              "maximum": 1000,
               "minimum": 0,
               "type": "integer"
             },
@@ -473,7 +473,7 @@
               "type": "null"
             }
           ],
-          "description": "Mid in ticks; may fall on a half tick.",
+          "description": "Mid in milli; may fall on a half milli.",
           "readOnly": true,
           "title": "Mid"
         },

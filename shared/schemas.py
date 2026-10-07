@@ -6,6 +6,9 @@ dashboard via `python -m shared.export_schema`. Changes need Arnav's approval.
 Units:
 - Prices on SIG's grid are integer ticks: price x 200, so 0.005 -> 1 and 0.995 -> 199.
   Convert only at the API boundary with `price_to_ticks` / `ticks_to_price`.
+- Quotes (from every venue) are integer milli: price x 1000, so 0.537 -> 537.
+  Polymarket moves in 0.001 steps, finer than SIG's tick, so quotes are not rounded.
+  A SIG tick is exactly 5 milli.
 - All prices are YES-denominated. A NO share costs `200 - ticks`.
 - All timestamps are timezone-aware and normalised to UTC.
 """
@@ -20,6 +23,7 @@ from typing import Annotated, Any, Literal
 from pydantic import AfterValidator, AwareDatetime, BaseModel, ConfigDict, Field, computed_field
 
 TICKS_PER_UNIT = 200
+MILLI_PER_UNIT = 1000
 MIN_ORDER_TICK = 1  # 0.005
 MAX_ORDER_TICK = 199  # 0.995
 
@@ -37,21 +41,33 @@ Tick = Annotated[int, Field(ge=0, le=TICKS_PER_UNIT, strict=True)]
 OrderTick = Annotated[int, Field(ge=MIN_ORDER_TICK, le=MAX_ORDER_TICK, strict=True)]
 """A limit price we may send: 1-199 ticks. 0 and 200 would encode market orders."""
 
+Milli = Annotated[int, Field(ge=0, le=MILLI_PER_UNIT, strict=True)]
+"""A YES quote price on the 0.001 grid, in milli (0-1000)."""
+
+
+def _scale(price: Decimal | str | float, units: int, step: str) -> int:
+    scaled = Decimal(str(price)) * units
+    if scaled != scaled.to_integral_value():
+        raise ValueError(f"price {price} is not on the {step} step")
+    value = int(scaled)
+    if not 0 <= value <= units:
+        raise ValueError(f"price {price} is outside [0, 1]")
+    return value
+
 
 def price_to_ticks(price: Decimal | str | float) -> int:
     """Convert a decimal price to ticks, refusing anything off the 0.005 grid."""
-    scaled = Decimal(str(price)) * TICKS_PER_UNIT
-    if scaled != scaled.to_integral_value():
-        raise ValueError(f"price {price} is not on the 0.005 tick")
-    ticks = int(scaled)
-    if not 0 <= ticks <= TICKS_PER_UNIT:
-        raise ValueError(f"price {price} is outside [0, 1]")
-    return ticks
+    return _scale(price, TICKS_PER_UNIT, "0.005")
 
 
 def ticks_to_price(ticks: int) -> Decimal:
     """Convert ticks back to an exact decimal price for the API."""
     return Decimal(ticks) / TICKS_PER_UNIT
+
+
+def price_to_milli(price: Decimal | str | float) -> int:
+    """Convert a decimal quote price to milli, refusing anything off the 0.001 grid."""
+    return _scale(price, MILLI_PER_UNIT, "0.001")
 
 
 class _Model(BaseModel):
@@ -108,18 +124,18 @@ class MarketMapping(_Model):
 
 
 class Quote(_Model):
-    """Top of book from one venue, YES-denominated, in ticks."""
+    """Top of book from one venue, YES-denominated, in milli (price x 1000)."""
 
     source: QuoteSource
     exchange_id: str
-    bid: Tick | None
-    ask: Tick | None
+    bid: Milli | None
+    ask: Milli | None
     ts: UtcDatetime
 
     @computed_field  # type: ignore[prop-decorator]
     @property
     def mid(self) -> float | None:
-        """Mid in ticks; may fall on a half tick."""
+        """Mid in milli; may fall on a half milli."""
         if self.bid is None or self.ask is None:
             return None
         return (self.bid + self.ask) / 2

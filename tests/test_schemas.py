@@ -13,6 +13,7 @@ from shared.schemas import (
     QuoteSource,
     Side,
     Signal,
+    price_to_milli,
     price_to_ticks,
     ticks_to_price,
 )
@@ -47,6 +48,24 @@ def test_price_to_ticks_round_trips(price: object, ticks: int) -> None:
 def test_price_to_ticks_rejects_off_grid_or_out_of_range(price: str) -> None:
     with pytest.raises(ValueError):
         price_to_ticks(price)
+
+
+@pytest.mark.parametrize(("price", "milli"), [("0.537", 537), ("0.005", 5), ("0", 0), ("1", 1000)])
+def test_price_to_milli(price: str, milli: int) -> None:
+    assert price_to_milli(price) == milli
+
+
+@pytest.mark.parametrize("price", ["0.5375", "1.001", "-0.001"])
+def test_price_to_milli_rejects_off_grid_or_out_of_range(price: str) -> None:
+    with pytest.raises(ValueError):
+        price_to_milli(price)
+
+
+def test_quote_keeps_polymarket_precision() -> None:
+    quote = Quote(source=QuoteSource.POLYMARKET, exchange_id="e", bid=537, ask=539, ts=NOW)
+    assert quote.mid == 538
+    with pytest.raises(ValidationError):
+        Quote(source=QuoteSource.POLYMARKET, exchange_id="e", bid=537, ask=1001, ts=NOW)
 
 
 def test_valid_order_intent() -> None:
