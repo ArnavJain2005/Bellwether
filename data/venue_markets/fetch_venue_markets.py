@@ -219,68 +219,65 @@ def classify_race(venue: str, market: dict[str, Any]) -> str:
 
 def is_2026_polymarket_market(item: dict[str, Any]) -> tuple[bool, str]:
     """Verify whether a Polymarket record belongs to the 2026 US midterm election cycle."""
-    # 1. Market active/closed check
-    if item.get("closed") is True:
+    if item.get("closed") is not False:
         return False, "market_closed"
-    if item.get("active") is False:
+    if item.get("active") is not True:
         return False, "market_inactive"
 
-    # 2. Cycle evidence
     q = (item.get("question") or "").lower()
-    slug = (item.get("slug") or "").lower()
-    parent_events = item.get("events") or []
-    parent_title = (parent_events[0].get("title") or "").lower() if parent_events else ""
+    slug = (item.get("market_slug") or "").lower()
     desc = (item.get("description") or "").lower()
-    combined_text = f"{q} {slug} {parent_title} {desc}"
+    combined_text = f"{q} {slug} {desc}"
 
-    # Explicit exclusion for other election years (e.g. 2028 presidential or non-midterm)
-    if "2028" in combined_text and "2026" not in combined_text:
+    # Explicit exclusion for other election years or conflicting years
+    if "2028" in combined_text and "2026" in combined_text:
+        return False, "conflicting_year_evidence"
+    if ("2028" in combined_text or "2024" in combined_text) and "2026" not in combined_text:
         return False, "non_2026_cycle"
 
     # Negative keyword checks for non-midterm/unrelated politics
-    if any(k in q for k in ["steps down", "confirmed as secretary", "confirmed as member"]):
+    if any(k in q for k in ["steps down", "confirmed as secretary", "confirmed as member", "resigns", "resignation"]):
         return False, "unrelated_political_event"
 
-    # Must mention 2026, midterm, or have 2026 end date
-    end_date = item.get("endDate") or ""
-    if "2026" in combined_text or "midterm" in combined_text or end_date.startswith("2026"):
-        return True, "verified_2026"
+    # Affirmative evidence of the relevant 2026 US election contest is required
+    # Year 2026 must be explicitly mentioned in textual content (closing year alone is insufficient)
+    if "2026" not in combined_text and "midterm" not in combined_text:
+        return False, "lacks_2026_cycle_evidence"
 
-    return False, "lacks_2026_cycle_evidence"
+    election_keywords = ["senate", "house", "governor", "election", "midterm", "elections", "gubernatorial", "control"]
+    if not any(k in combined_text for k in election_keywords):
+        return False, "lacks_election_evidence"
+
+    return True, "verified_2026"
 
 
 def is_2026_kalshi_market(m: dict[str, Any], ev: dict[str, Any], is_primary_match: bool) -> tuple[bool, str | None]:
     """Verify whether a Kalshi market belongs to the 2026 US midterm election cycle."""
-    # 1. Market status check (check nested market status, not just event status)
     m_status = (m.get("status") or "").lower()
     if m_status and m_status not in ("open", "active"):
-        return False, None
+        return False, "market_inactive"
 
     m_ticker = (m.get("ticker") or "").upper()
     m_series = (m.get("series_ticker") or ev.get("series_ticker") or "").upper()
     m_title = (m.get("title") or ev.get("title") or "")
     ev_title = (ev.get("title") or "")
-    category = ev.get("category") or ""
     rules_text = (m.get("rules_primary") or "") + " " + (m.get("rules_secondary") or "")
     search_text = f"{m_ticker} {m_series} {m_title} {ev_title} {rules_text}".lower()
 
     # Reject foreign elections or non-election bets
     if any(k in search_text for k in ["uk general", "chancellor of germany", "cabinet leave", "federal reserve board of", "reconciliation bill"]):
-        return False, None
+        return False, "foreign_election"
 
-    # Check for primary series
-    if is_primary_match:
-        # If explicitly marked for another cycle year (e.g. 2024), exclude
-        if "-24" in m_ticker and "-26" not in m_ticker and "2026" not in search_text:
-            return False, None
-        return True, None
+    # Require explicit 2026 evidence for ALL matches (including primary matches)
+    if "2026" not in search_text:
+        return False, "lacks_2026_cycle_evidence"
 
-    # Non-primary: must be in Elections category and explicitly mention 2026 US elections
-    if category == "Elections" and "2026" in search_text:
-        note = f"Included from Elections category mentioning 2026 (series: {m_series})"
-        return True, note
+    if "2028" in search_text and "2026" in search_text:
+        return False, "conflicting_year_evidence"
+    if ("2028" in search_text or "2024" in search_text) and "2026" not in search_text:
+        return False, "non_2026_cycle"
 
-    return False, None
+    return True, None
 
 
 # =====================================================================
@@ -289,31 +286,32 @@ def is_2026_kalshi_market(m: dict[str, Any], ev: dict[str, Any], is_primary_matc
 
 def fetch_polymarket_markets(
     rate_limiter: RateLimiter,
-    base_url: str = "https://gamma-api.polymarket.com",
+    base_url: str = "https://clob.polymarket.com/markets",
     opener: Any = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Fetch active 2026 midterm markets from Polymarket Gamma API."""
+    """Fetch active 2026 midterm markets from Polymarket CLOB API."""
     print("Fetching Polymarket markets...", flush=True)
-    tags = [102289, 100199, 100344]  # midterms, senate, house races
     markets_by_id: dict[str, dict[str, Any]] = {}
     excluded_counts: dict[str, int] = {}
+    seen_cursors: set[str] = set()
 
-    for tag_id in tags:
-        offset = 0
-        limit = 100
-        while True:
-            params = urllib.parse.urlencode({
-                "tag_id": tag_id,
-                "closed": "false",
-                "limit": limit,
-                "offset": offset,
-            })
-            url = f"{base_url}/markets?{params}"
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    next_cursor = ""
+    while next_cursor != "LTE=":
+        if next_cursor in seen_cursors:
+            raise FetchError(f"Polymarket pagination loop detected: repeated cursor {next_cursor}")
+        if next_cursor:
+            seen_cursors.add(next_cursor)
 
-            # Enforce rate limiter before EVERY request attempt
+        params: dict[str, Any] = {"limit": 1000}
+        if next_cursor:
+            params["next_cursor"] = next_cursor
+
+        url = f"{base_url}?{urllib.parse.urlencode(params)}"
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+
+        data = None
+        for attempt in range(5):
             rate_limiter.wait()
-
             try:
                 if opener is not None:
                     resp_obj = opener.open(req)
@@ -322,81 +320,86 @@ def fetch_polymarket_markets(
                     with urllib.request.urlopen(req, timeout=15) as resp:
                         body_bytes = resp.read()
                 data = json.loads(body_bytes.decode("utf-8"))
+                break
             except urllib.error.HTTPError as e:
-                # Gamma API enforces max offset depth of 2000; only 422 at offset >= 2000 is clean EOF
-                if e.code == 422 and offset >= 2000:
-                    break
-                raise FetchError(f"Polymarket HTTP {e.code} for tag {tag_id} offset {offset}: {e}") from e
+                if attempt < 4:
+                    time.sleep((2 ** attempt) + random.uniform(0, 1))
+                else:
+                    raise FetchError(f"Polymarket HTTP {e.code} at cursor {next_cursor}: {e}") from e
             except Exception as e:
-                raise FetchError(f"Polymarket request failed for tag {tag_id} offset {offset}: {e}") from e
+                if attempt < 4:
+                    time.sleep((2 ** attempt) + random.uniform(0, 1))
+                else:
+                    raise FetchError(f"Polymarket request failed at cursor {next_cursor}: {e}") from e
 
-            if not isinstance(data, list):
-                raise FetchError(f"Polymarket malformed response for tag {tag_id} offset {offset}: expected list")
+        if not isinstance(data, dict) or "data" not in data:
+            raise FetchError(f"Polymarket malformed response at cursor {next_cursor}: expected dict with 'data'")
 
-            if not data:
-                break
+        markets = data.get("data") or []
+        for item in markets:
+            m_id = item.get("condition_id")
+            if not isinstance(m_id, str) or not m_id.strip() or m_id == "None":
+                excluded_counts["missing_id"] = excluded_counts.get("missing_id", 0) + 1
+                continue
 
-            for item in data:
-                m_id = str(item.get("id", ""))
-                if not m_id:
-                    excluded_counts["missing_id"] = excluded_counts.get("missing_id", 0) + 1
-                    continue
+            is_eligible, reason = is_2026_polymarket_market(item)
+            if not is_eligible:
+                excluded_counts[reason] = excluded_counts.get(reason, 0) + 1
+                continue
 
-                is_eligible, reason = is_2026_polymarket_market(item)
-                if not is_eligible:
-                    excluded_counts[reason] = excluded_counts.get(reason, 0) + 1
-                    continue
+            tokens = item.get("tokens") or []
+            if not isinstance(tokens, list):
+                excluded_counts["invalid_tokens"] = excluded_counts.get("invalid_tokens", 0) + 1
+                continue
 
-                parent_events = item.get("events") or []
-                parent_event = parent_events[0] if parent_events else {}
+            outcomes = []
+            clob_tokens = []
+            prices = []
+            for t in tokens:
+                outcome = str(t.get("outcome", "")).strip()
+                tid = str(t.get("token_id", "")).strip()
+                if outcome and tid and tid != "None":
+                    outcomes.append(outcome)
+                    clob_tokens.append(tid)
+                    prices.append(_safe_float(t.get("price")))
 
-                outcomes_raw = item.get("outcomes")
-                outcomes = _safe_parse_json(outcomes_raw, default=[]) if isinstance(outcomes_raw, str) else (outcomes_raw or [])
+            if not outcomes or not clob_tokens or len(outcomes) != len(clob_tokens) or len(set(outcomes)) != len(outcomes) or len(set(clob_tokens)) != len(clob_tokens):
+                excluded_counts["invalid_token_mapping"] = excluded_counts.get("invalid_token_mapping", 0) + 1
+                continue
 
-                tokens_raw = item.get("clobTokenIds")
-                clob_tokens = _safe_parse_json(tokens_raw, default=[]) if isinstance(tokens_raw, str) else (tokens_raw or [])
+            outcome_token_map = dict(zip(outcomes, clob_tokens))
 
-                # Validate outcome-to-token pairing
-                if not outcomes or not clob_tokens or len(outcomes) != len(clob_tokens) or any(not str(t).strip() for t in clob_tokens):
-                    excluded_counts["invalid_token_mapping"] = excluded_counts.get("invalid_token_mapping", 0) + 1
-                    continue
+            snapshot_prices = {
+                "is_snapshot": True,
+                "outcome_prices": prices,
+                "best_bid": None,
+                "best_ask": None,
+                "last_trade_price": None,
+            }
 
-                outcome_token_map = {str(o): str(t) for o, t in zip(outcomes, clob_tokens)}
+            market_record = {
+                "venue": "polymarket",
+                "market_id": m_id,
+                "question": item.get("question"),
+                "slug": item.get("market_slug"),
+                "outcomes": outcomes,
+                "clob_token_ids": clob_tokens,
+                "outcome_token_map": outcome_token_map,
+                "snapshot_prices": snapshot_prices,
+                "end_date": item.get("end_date_iso"),
+                "resolution_description": item.get("description"),
+                "event_id": None,
+                "event_title": None,
+                "event_slug": None,
+            }
+            markets_by_id[m_id] = market_record
 
-                prices_raw = item.get("outcomePrices")
-                outcome_prices = _safe_parse_json(prices_raw, default=[]) if isinstance(prices_raw, str) else (prices_raw or [])
-                parsed_prices = [_safe_float(p) for p in outcome_prices] if isinstance(outcome_prices, list) else []
-
-                snapshot_prices = {
-                    "is_snapshot": True,
-                    "outcome_prices": parsed_prices,
-                    "best_bid": _safe_float(item.get("bestBid")),
-                    "best_ask": _safe_float(item.get("bestAsk")),
-                    "last_trade_price": _safe_float(item.get("lastTradePrice")),
-                }
-
-                market_record = {
-                    "venue": "polymarket",
-                    "market_id": m_id,
-                    "question": item.get("question"),
-                    "slug": item.get("slug"),
-                    "outcomes": outcomes,
-                    "clob_token_ids": clob_tokens,
-                    "outcome_token_map": outcome_token_map,
-                    "snapshot_prices": snapshot_prices,
-                    "end_date": item.get("endDate"),
-                    "resolution_description": item.get("description"),
-                    "event_id": str(parent_event.get("id")) if parent_event.get("id") is not None else None,
-                    "event_title": parent_event.get("title"),
-                    "event_slug": parent_event.get("slug"),
-                }
-                markets_by_id[m_id] = market_record
-
-            offset += len(data)
-            if len(data) < limit:
-                break
-
-        print(f"  Tag {tag_id} complete. Total unique Polymarket markets so far: {len(markets_by_id)}", flush=True)
+        returned_cursor = data.get("next_cursor")
+        if not returned_cursor or returned_cursor == next_cursor:
+            if returned_cursor != "LTE=":
+                raise FetchError(f"Polymarket pagination failed to progress. Cursor stuck at: {returned_cursor}")
+            break
+        next_cursor = returned_cursor
 
     return list(markets_by_id.values()), excluded_counts
 

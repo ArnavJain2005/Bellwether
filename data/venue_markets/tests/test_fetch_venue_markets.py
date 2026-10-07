@@ -167,40 +167,49 @@ def test_kalshi_foreign_and_non_election_bets_excluded() -> None:
 def test_polymarket_token_mapping_validation() -> None:
     """Parallel outcomes and CLOB tokens must match in length and be non-empty."""
     class FakeOpener:
-        def __init__(self, items: list[dict]) -> None:
-            self.items = items
+        def __init__(self, data: dict) -> None:
+            self.data = data
 
         def open(self, req: urllib.request.Request) -> io.BytesIO:
-            resp = io.BytesIO(json.dumps(self.items).encode("utf-8"))
+            resp = io.BytesIO(json.dumps(self.data).encode("utf-8"))
             return resp
 
     limiter = RateLimiter(interval=0.0)
 
     # Valid market
-    valid_items = [{
-        "id": "1001",
-        "question": "Will Democrats win Georgia Senate in 2026?",
-        "slug": "democrats-georgia-senate-2026",
-        "closed": False,
-        "active": True,
-        "outcomes": json.dumps(["Yes", "No"]),
-        "clobTokenIds": json.dumps(["tok_yes_123", "tok_no_456"]),
-        "outcomePrices": json.dumps(["0.60", "0.40"]),
-        "endDate": "2026-11-04T00:00:00Z",
-    }]
+    valid_items = {
+        "data": [{
+            "condition_id": "1001",
+            "question": "Will Democrats win Georgia Senate in 2026?",
+            "market_slug": "democrats-georgia-senate-2026",
+            "closed": False,
+            "active": True,
+            "tokens": [
+                {"outcome": "Yes", "token_id": "tok_yes_123", "price": 0.60},
+                {"outcome": "No", "token_id": "tok_no_456", "price": 0.40}
+            ],
+            "end_date_iso": "2026-11-04T00:00:00Z",
+        }],
+        "next_cursor": "LTE="
+    }
     markets, excluded = fetch_polymarket_markets(limiter, opener=FakeOpener(valid_items))
     assert len(markets) == 1
     assert markets[0]["outcome_token_map"] == {"Yes": "tok_yes_123", "No": "tok_no_456"}
 
-    # Invalid token mapping (mismatched length)
-    mismatched_items = [{
-        "id": "1002",
-        "question": "Will Republicans win Georgia Senate in 2026?",
-        "closed": False,
-        "active": True,
-        "outcomes": json.dumps(["Yes", "No"]),
-        "clobTokenIds": json.dumps(["tok_single"]),
-    }]
+    # Invalid token mapping (duplicate outcomes)
+    mismatched_items = {
+        "data": [{
+            "condition_id": "1002",
+            "question": "Will Republicans win Georgia Senate in 2026?",
+            "closed": False,
+            "active": True,
+            "tokens": [
+                {"outcome": "Yes", "token_id": "tok_1"},
+                {"outcome": "Yes", "token_id": "tok_2"}
+            ],
+        }],
+        "next_cursor": "LTE="
+    }
     markets, excluded = fetch_polymarket_markets(limiter, opener=FakeOpener(mismatched_items))
     assert len(markets) == 0
     assert excluded.get("invalid_token_mapping", 0) > 0
@@ -229,7 +238,7 @@ def test_kalshi_pagination_cycle_detection() -> None:
 
 
 def test_polymarket_unexpected_422_raises_fetch_error() -> None:
-    """HTTP 422 before max depth (offset < 2000) must raise FetchError."""
+    """HTTP 422 must raise FetchError."""
     limiter = RateLimiter(interval=0.0)
 
     class FailingOpener:
