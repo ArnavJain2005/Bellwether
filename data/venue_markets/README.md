@@ -18,7 +18,7 @@ python data/venue_markets/fetch_venue_markets.py
 ```
 
 This will:
-- Query Polymarket's Gamma API for open midterm, Senate, and House race markets (`tag_id` 102289, 100199, 100344).
+- Query Polymarket's CLOB API (`https://clob.polymarket.com/markets`) using cursor-based pagination to exhaustively fetch all active 2026 election cycle markets.
 - Query Kalshi's Trade API v2 for open election events and markets (Senate, House, governor, chamber control series).
 - Save results atomically (temporary file + atomic rename) to:
   - `data/venue_markets/output/venue_markets_<YYYY-MM-DD>.json`
@@ -38,7 +38,7 @@ The validation report inspects:
 - Market counts categorized by race type (`senate`, `house`, `governor`, `control`, `other`).
 - ID integrity (checks for duplicate or missing IDs).
 - Presence of chamber control markets (Senate Control and House Control on both venues).
-- Distinct states covered by Senate (33 Class 2 seats regular cycle) and Governor (36 regular seats) markets.
+- Distinct states covered by Senate and Governor markets.
 
 ### 3. Run Offline Regression Tests
 
@@ -58,12 +58,12 @@ The output JSON file contains:
 {
   "fetched_at": "2026-10-07T11:59:00.000000+00:00",
   "kalshi_host": "api.elections.kalshi.com",
-  "polymarket_count": 2100,
+  "polymarket_count": 210,
   "kalshi_count": 676,
   "polymarket": [
     {
       "venue": "polymarket",
-      "market_id": "562793",
+      "market_id": "0x123... (Condition ID)",
       "question": "Will the Democratic Party control the Senate after the 2026 Midterm elections?",
       "slug": "will-the-democratic-party-control-the-senate-after-the-2026-midterm-elections",
       "outcomes": ["Yes", "No"],
@@ -75,15 +75,15 @@ The output JSON file contains:
       "snapshot_prices": {
         "is_snapshot": true,
         "outcome_prices": [0.645, 0.355],
-        "best_bid": 0.64,
-        "best_ask": 0.65,
-        "last_trade_price": 0.65
+        "best_bid": null,
+        "best_ask": null,
+        "last_trade_price": null
       },
       "end_date": "2026-11-04T04:59:00Z",
       "resolution_description": "...",
-      "event_id": "32224",
-      "event_title": "Which party will win the Senate in 2026?",
-      "event_slug": "which-party-will-win-the-senate-in-2026"
+      "event_id": null,
+      "event_title": null,
+      "event_slug": null
     }
   ],
   "kalshi": [
@@ -113,6 +113,11 @@ The output JSON file contains:
   ]
 }
 ```
+
+**Note on Identifiers and Metadata**:
+- **Polymarket IDs**: We strictly use the `condition_id` as the primary `market_id` instead of the legacy numerical Gamma ID. Token IDs are extracted precisely from the CLOB API outcome map to ensure fidelity.
+- **Missing Parent-Event Metadata**: Because the CLOB API flattens markets, parent event bindings (`event_id`, `event_slug`, `event_title`) are completely absent (`null`).
+- **Snapshot Prices**: The prices captured are one-time `snapshot_prices` provided by the API list endpoint. They are NOT live, executable quotes (`best_bid` and `best_ask` are absent).
 
 ## Security & Network Policies
 

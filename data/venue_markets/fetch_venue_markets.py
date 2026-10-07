@@ -167,10 +167,10 @@ def extract_race_state(venue: str, market: dict[str, Any], race_type: str) -> st
     if len(states) > 1:
         return None
 
-    # Check 2-letter abbreviation word boundaries
+    # Check for state full names
     upper_text = text.upper()
     for abbr, full in STATE_ABBRS.items():
-        if re.search(rf"\b{abbr}\b", upper_text):
+        if re.search(rf"\b{full.upper()}\b", upper_text):
             return full
 
     return None
@@ -230,8 +230,6 @@ def is_2026_polymarket_market(item: dict[str, Any]) -> tuple[bool, str]:
     combined_text = f"{q} {slug} {desc}"
 
     # Explicit exclusion for other election years or conflicting years
-    if "2028" in combined_text and "2026" in combined_text:
-        return False, "conflicting_year_evidence"
     if ("2028" in combined_text or "2024" in combined_text) and "2026" not in combined_text:
         return False, "non_2026_cycle"
 
@@ -241,10 +239,10 @@ def is_2026_polymarket_market(item: dict[str, Any]) -> tuple[bool, str]:
 
     # Affirmative evidence of the relevant 2026 US election contest is required
     # Year 2026 must be explicitly mentioned in textual content (closing year alone is insufficient)
-    if "2026" not in combined_text and "midterm" not in combined_text:
+    if "2026" not in combined_text:
         return False, "lacks_2026_cycle_evidence"
 
-    election_keywords = ["senate", "house", "governor", "election", "midterm", "elections", "gubernatorial", "control"]
+    election_keywords = ["senate", "house", "governor", "gubernatorial", "control"]
     if not any(k in combined_text for k in election_keywords):
         return False, "lacks_election_evidence"
 
@@ -254,7 +252,7 @@ def is_2026_polymarket_market(item: dict[str, Any]) -> tuple[bool, str]:
 def is_2026_kalshi_market(m: dict[str, Any], ev: dict[str, Any], is_primary_match: bool) -> tuple[bool, str | None]:
     """Verify whether a Kalshi market belongs to the 2026 US midterm election cycle."""
     m_status = (m.get("status") or "").lower()
-    if m_status and m_status not in ("open", "active"):
+    if m_status not in ("open", "active"):
         return False, "market_inactive"
 
     m_ticker = (m.get("ticker") or "").upper()
@@ -268,14 +266,16 @@ def is_2026_kalshi_market(m: dict[str, Any], ev: dict[str, Any], is_primary_matc
     if any(k in search_text for k in ["uk general", "chancellor of germany", "cabinet leave", "federal reserve board of", "reconciliation bill"]):
         return False, "foreign_election"
 
-    # Require explicit 2026 evidence for ALL matches (including primary matches)
     if "2026" not in search_text:
         return False, "lacks_2026_cycle_evidence"
 
-    if "2028" in search_text and "2026" in search_text:
-        return False, "conflicting_year_evidence"
     if ("2028" in search_text or "2024" in search_text) and "2026" not in search_text:
         return False, "non_2026_cycle"
+
+    if not is_primary_match:
+        election_keywords = ["senate", "house", "governor", "gubernatorial", "control"]
+        if not any(k in search_text for k in election_keywords):
+            return False, "lacks_election_evidence"
 
     return True, None
 
@@ -335,7 +335,10 @@ def fetch_polymarket_markets(
         if not isinstance(data, dict) or "data" not in data:
             raise FetchError(f"Polymarket malformed response at cursor {next_cursor}: expected dict with 'data'")
 
-        markets = data.get("data") or []
+        markets = data.get("data")
+        if not isinstance(markets, list):
+            raise FetchError(f"Polymarket malformed response at cursor {next_cursor}: expected 'data' to be a list")
+
         for item in markets:
             m_id = item.get("condition_id")
             if not isinstance(m_id, str) or not m_id.strip() or m_id == "None":
@@ -347,23 +350,33 @@ def fetch_polymarket_markets(
                 excluded_counts[reason] = excluded_counts.get(reason, 0) + 1
                 continue
 
-            tokens = item.get("tokens") or []
-            if not isinstance(tokens, list):
+            tokens = item.get("tokens")
+            if not isinstance(tokens, list) or len(tokens) == 0:
                 excluded_counts["invalid_tokens"] = excluded_counts.get("invalid_tokens", 0) + 1
                 continue
 
             outcomes = []
             clob_tokens = []
             prices = []
+            malformed = False
             for t in tokens:
-                outcome = str(t.get("outcome", "")).strip()
-                tid = str(t.get("token_id", "")).strip()
-                if outcome and tid and tid != "None":
-                    outcomes.append(outcome)
-                    clob_tokens.append(tid)
-                    prices.append(_safe_float(t.get("price")))
+                if not isinstance(t, dict):
+                    malformed = True
+                    break
+                outcome = t.get("outcome")
+                tid = t.get("token_id")
+                if not isinstance(outcome, str) or not outcome.strip() or outcome.strip() == "None":
+                    malformed = True
+                    break
+                if not isinstance(tid, str) or not tid.strip() or tid.strip() == "None":
+                    malformed = True
+                    break
 
-            if not outcomes or not clob_tokens or len(outcomes) != len(clob_tokens) or len(set(outcomes)) != len(outcomes) or len(set(clob_tokens)) != len(clob_tokens):
+                outcomes.append(outcome.strip())
+                clob_tokens.append(tid.strip())
+                prices.append(_safe_float(t.get("price")))
+
+            if malformed or not outcomes or not clob_tokens or len(outcomes) != len(clob_tokens) or len(set(outcomes)) != len(outcomes) or len(set(clob_tokens)) != len(clob_tokens):
                 excluded_counts["invalid_token_mapping"] = excluded_counts.get("invalid_token_mapping", 0) + 1
                 continue
 
@@ -411,12 +424,8 @@ def fetch_polymarket_markets(
 def _kalshi_request(
     host: str,
     path: str,
-    rate_limiter: RateLimiter | None = None,
     timeout: float = 25.0,
 ) -> tuple[int, bytes]:
-    # Rate limiter applied before EVERY request attempt
-    if rate_limiter:
-        rate_limiter.wait()
 
     ctx = ssl.create_default_context()
     conn = http.client.HTTPSConnection(host, 443, context=ctx, timeout=timeout)
@@ -471,11 +480,12 @@ def fetch_kalshi_markets(
 
         page_data: dict[str, Any] | None = None
         for attempt in range(5):  # 1 initial + up to 4 retries
+            rate_limiter.wait()
             try:
                 if requester is not None:
                     status, body = requester(active_host, path)
                 else:
-                    status, body = _kalshi_request(active_host, path, rate_limiter=rate_limiter)
+                    status, body = _kalshi_request(active_host, path)
 
                 if status == 200:
                     page_data = json.loads(body.decode("utf-8"))
@@ -489,11 +499,12 @@ def fetch_kalshi_markets(
                     active_host = fallback_host
                     actual_serving_host = fallback_host
                     # Immediate attempt on fallback host with rate limiter
+                    rate_limiter.wait()
                     try:
                         if requester is not None:
                             status, body = requester(active_host, path)
                         else:
-                            status, body = _kalshi_request(active_host, path, rate_limiter=rate_limiter)
+                            status, body = _kalshi_request(active_host, path)
                         if status == 200:
                             page_data = json.loads(body.decode("utf-8"))
                             break
@@ -582,10 +593,10 @@ def fetch_kalshi_markets(
                 }
                 markets_by_ticker[m_ticker] = market_record
 
-        if page % 5 == 0 or not new_cursor or not events:
+        if page % 5 == 0 or not new_cursor:
             print(f"  Kalshi page {page}: total kept markets so far: {len(markets_by_ticker)}", flush=True)
 
-        if not new_cursor or not events:
+        if not new_cursor:
             break
         cursor = new_cursor
 
