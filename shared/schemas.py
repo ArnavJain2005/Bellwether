@@ -1,0 +1,250 @@
+"""Shared contracts between the engine and the dashboard.
+
+Defined here once (Pydantic v2) and exported to `shared/schemas.json` for the
+dashboard via `python -m shared.export_schema`. Changes need Arnav's approval.
+
+Units:
+- Prices on SIG's grid are integer ticks: price x 200, so 0.005 -> 1 and 0.995 -> 199.
+  Convert only at the API boundary with `price_to_ticks` / `ticks_to_price`.
+- All prices are YES-denominated. A NO share costs `200 - ticks`.
+- All timestamps are timezone-aware and normalised to UTC.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from decimal import Decimal
+from enum import StrEnum
+from typing import Annotated, Any, Literal
+
+from pydantic import AfterValidator, AwareDatetime, BaseModel, ConfigDict, Field, computed_field
+
+TICKS_PER_UNIT = 200
+MIN_ORDER_TICK = 1  # 0.005
+MAX_ORDER_TICK = 199  # 0.995
+
+
+def _to_utc(value: datetime) -> datetime:
+    return value.astimezone(UTC)
+
+
+UtcDatetime = Annotated[AwareDatetime, AfterValidator(_to_utc)]
+"""A timezone-aware datetime, stored in UTC. Naive datetimes are rejected."""
+
+Tick = Annotated[int, Field(ge=0, le=TICKS_PER_UNIT, strict=True)]
+"""A YES price on the 0.005 grid, in ticks (0-200)."""
+
+OrderTick = Annotated[int, Field(ge=MIN_ORDER_TICK, le=MAX_ORDER_TICK, strict=True)]
+"""A limit price we may send: 1-199 ticks. 0 and 200 would encode market orders."""
+
+
+def price_to_ticks(price: Decimal | str | float) -> int:
+    """Convert a decimal price to ticks, refusing anything off the 0.005 grid."""
+    scaled = Decimal(str(price)) * TICKS_PER_UNIT
+    if scaled != scaled.to_integral_value():
+        raise ValueError(f"price {price} is not on the 0.005 tick")
+    ticks = int(scaled)
+    if not 0 <= ticks <= TICKS_PER_UNIT:
+        raise ValueError(f"price {price} is outside [0, 1]")
+    return ticks
+
+
+def ticks_to_price(ticks: int) -> Decimal:
+    """Convert ticks back to an exact decimal price for the API."""
+    return Decimal(ticks) / TICKS_PER_UNIT
+
+
+class _Model(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+
+class Side(StrEnum):
+    YES = "yes"
+    NO = "no"
+
+
+class Action(StrEnum):
+    BUY = "buy"
+    SELL = "sell"
+
+
+class Lean(StrEnum):
+    D = "D"
+    R = "R"
+    NONE = "none"
+
+
+class QuoteSource(StrEnum):
+    SIG = "sig"
+    POLYMARKET = "polymarket"
+    KALSHI = "kalshi"
+
+
+class Mode(StrEnum):
+    MANUAL = "manual"
+    ELECTION = "election"
+
+
+class Market(_Model):
+    """One SIG market (one candidate's YES/NO contract within a race)."""
+
+    sig_market_id: str
+    title: str
+    exchanges: list[str] = Field(description="SIG exchange ids belonging to this market")
+    is_composite: bool
+    resolution_text: str | None = Field(None, description="Copied from the market's Info tab")
+    settlement_date: UtcDatetime | None = None
+    lean: Lean = Lean.NONE
+
+
+class MarketMapping(_Model):
+    """Links one SIG exchange to the matching Polymarket and Kalshi contracts."""
+
+    sig_exchange_id: str
+    polymarket_token_id: str | None = None
+    kalshi_ticker: str | None = None
+    match_confidence: float = Field(ge=0.0, le=1.0)
+    mismatch_notes: str = ""
+
+
+class Quote(_Model):
+    """Top of book from one venue, YES-denominated, in ticks."""
+
+    source: QuoteSource
+    exchange_id: str
+    bid: Tick | None
+    ask: Tick | None
+    ts: UtcDatetime
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def mid(self) -> float | None:
+        """Mid in ticks; may fall on a half tick."""
+        if self.bid is None or self.ask is None:
+            return None
+        return (self.bid + self.ask) / 2
+
+
+class FairValue(_Model):
+    """Our estimate of one contract's YES value."""
+
+    exchange_id: str
+    value: float = Field(ge=0, le=TICKS_PER_UNIT, description="In ticks; need not be on grid")
+    inputs: dict[str, float] = Field(description="Weight given to each source")
+    model_version: str
+    ts: UtcDatetime
+
+
+class Signal(_Model):
+    """A strategy's suggestion. Logged whether or not it is traded."""
+
+    exchange_id: str
+    strategy: str
+    side: Side
+    edge_cents: float
+    size: int = Field(gt=0)
+    reason: str = Field(min_length=1, description="Human-readable; shown on the dashboard")
+    ts: UtcDatetime
+
+
+class OrderIntent(_Model):
+    """An order we want to place. Must pass risk.check() before it is sent.
+
+    Limit orders only: `price` is restricted to 1-199 ticks, so a market order
+    (price 0 or 200, or no price) cannot be expressed.
+    """
+
+    idempotency_key: str = Field(min_length=1, description="Saved before sending; reused on retry")
+    exchange_id: str
+    side: Side
+    action: Action
+    qty: int = Field(gt=0)
+    price: OrderTick
+    reason: str = Field(min_length=1)
+
+
+class Fill(_Model):
+    """Mirrors the API's Fill. `quantity` is signed: negative means NO shares."""
+
+    id: int
+    order_id: int | None
+    exchange_id: str
+    market_id: str
+    price: Tick | None
+    quantity: float
+    side: Side
+    filled_at: UtcDatetime
+
+
+class Position(_Model):
+    """Mirrors the API's Position. `quantity` is signed: positive YES, negative NO."""
+
+    exchange_id: str
+    market_id: str
+    market_title: str
+    settled: bool
+    quantity: float
+    avg_cost: float
+    current_price: float | None
+    unrealized_pnl: float
+
+
+class RiskLimits(_Model):
+    """Limits for one mode. Values come from config/risk.yaml, never from code."""
+
+    max_race_pct: float = Field(gt=0, le=100)
+    max_order_susqies: float = Field(gt=0)
+    max_scenario_loss_pct: float = Field(gt=0, le=100)
+    fair_value_max_age_s: float = Field(gt=0)
+    min_cash_pct: float = Field(ge=0, le=100)
+
+
+class RiskState(_Model):
+    mode: Mode
+    limits: RiskLimits
+    killed: bool
+    kill_reason: str | None = None
+    ts: UtcDatetime
+
+
+MessageType = Literal[
+    "quote_update", "fair_value", "signal", "order", "fill", "position", "risk", "log", "health"
+]
+
+
+class EngineMessage(_Model):
+    """Envelope for every engine -> dashboard WebSocket message."""
+
+    type: MessageType
+    ts: UtcDatetime
+    data: dict[str, Any]
+
+
+class ModeCommand(_Model):
+    """Body of POST /mode."""
+
+    mode: Mode
+
+
+class OverrideCommand(_Model):
+    """Body of POST /override. Expires after 15 minutes; still passes risk.check()."""
+
+    exchange_id: str
+    value: float = Field(ge=0, le=TICKS_PER_UNIT, description="Fair value in ticks")
+
+
+EXPORTED_MODELS: tuple[type[BaseModel], ...] = (
+    Market,
+    MarketMapping,
+    Quote,
+    FairValue,
+    Signal,
+    OrderIntent,
+    Fill,
+    Position,
+    RiskLimits,
+    RiskState,
+    EngineMessage,
+    ModeCommand,
+    OverrideCommand,
+)
