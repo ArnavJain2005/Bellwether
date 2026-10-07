@@ -378,7 +378,18 @@ def test_exported_schema_describes_price_units(
     description = schema["$defs"][model]["properties"][field]["description"]
     assert unit in description.lower()
     assert scale in description
-    assert ("YES" in description) or (model == "OrderIntent" and "NO" in description)
+    assert "YES-denominated" in description
+    assert "NO terms" not in description
+
+
+@pytest.mark.parametrize(("model", "field"), [("OrderIntent", "price"), ("Fill", "price")])
+def test_internal_tick_prices_are_marked_internal(model: str, field: str) -> None:
+    """Order and fill prices are internal YES ticks, distinct from the API wire price."""
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    description = schema["$defs"][model]["properties"][field]["description"]
+    assert description.startswith("Internal ")
+    assert "YES-denominated for both sides" in description
+    assert "Not the API wire price" in description
 
 
 # 5. Quote serialization: dashboard output vs storage/replay ---------------------

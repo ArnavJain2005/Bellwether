@@ -72,7 +72,7 @@
           "type": "string"
         },
         "value": {
-          "description": "YES fair value. Milli: price x 1000, so 0.537 -> 537. Float 0-1000; need not be on any grid.",
+          "description": "Fair value, YES-denominated. Milli: price x 1000, so 0.537 -> 537. Float 0-1000; may be off-grid.",
           "maximum": 1000,
           "minimum": 0,
           "title": "Value",
@@ -91,7 +91,7 @@
     },
     "Fill": {
       "additionalProperties": false,
-      "description": "Mirrors the API's Fill. `quantity` is signed: negative means NO shares.",
+      "description": "Mirrors the API's Fill. `quantity` is signed: negative means NO shares.\n\n`price` is Bellwether's internal YES-denominated tick price. How REST and\nrealtime fill prices map onto it is decided by the future SIG client.",
       "properties": {
         "exchange_id": {
           "title": "Exchange Id",
@@ -132,7 +132,7 @@
               "type": "null"
             }
           ],
-          "description": "Execution price, YES-denominated per the API's fill docs. Integer ticks: price x 200, so 0.005 -> 1, 0.5 -> 100, 0.995 -> 199. Integer 0-200.",
+          "description": "Internal execution price, YES-denominated for both sides. Integer ticks: price x 200, so 0.005 -> 1, 0.5 -> 100, 0.995 -> 199. Integer 0-200. Not the API wire price; normalised at the API boundary.",
           "title": "Price"
         },
         "quantity": {
@@ -304,7 +304,7 @@
     },
     "OrderIntent": {
       "additionalProperties": false,
-      "description": "An order we want to place. Must pass risk.check() before it is sent.\n\n`price` is restricted to 1-199 ticks, so this model cannot carry a market-order\nprice (0, 200 or none). That alone does not guarantee limit-only execution; the\norder-sending code must still send this price.\n\nqty, idempotency_key and exchange_id follow the API's OrderInput constraints.",
+      "description": "An order we want to place. Must pass risk.check() before it is sent.\n\n`price` is the internal YES-denominated limit price, for YES and NO orders alike.\nIt is not the API request's `price`: the future SIG client must translate it at\nthe boundary, including any NO-side complement the API requires (unresolved).\n\n`price` is restricted to 1-199 ticks, so this model cannot carry a market-order\nprice (0, 200 or none). That alone does not guarantee limit-only execution; the\norder-sending code must still send a limit price derived from it.\n\nqty, idempotency_key and exchange_id follow the API's OrderInput constraints.",
       "properties": {
         "action": {
           "$ref": "#/$defs/Action"
@@ -323,7 +323,7 @@
           "type": "string"
         },
         "price": {
-          "description": "Limit price. Integer ticks: price x 200, so 0.005 -> 1, 0.5 -> 100, 0.995 -> 199. Integer 1-199. Same denomination as the API's order price: per docs/api/openapi.json a NO order is priced in NO terms (`sell yes q@p` == `buy no q@(1-p)`).",
+          "description": "Internal limit price, YES-denominated for both sides. Integer ticks: price x 200, so 0.005 -> 1, 0.5 -> 100, 0.995 -> 199. Integer 1-199. Not the API wire price; converted at the API boundary.",
           "maximum": 199,
           "minimum": 1,
           "title": "Price",
@@ -366,7 +366,7 @@
           "type": "string"
         },
         "value": {
-          "description": "YES fair value set by hand. Milli: price x 1000, so 0.537 -> 537. Float 0-1000.",
+          "description": "Fair value set by hand, YES-denominated. Milli: price x 1000, so 0.537 -> 537. Float 0-1000.",
           "maximum": 1000,
           "minimum": 0,
           "title": "Value",
@@ -452,7 +452,7 @@
               "type": "null"
             }
           ],
-          "description": "Best YES ask. Milli: price x 1000, so 0.537 -> 537. Integer 0-1000.",
+          "description": "Best ask, YES-denominated. Milli: price x 1000, so 0.537 -> 537. Integer 0-1000.",
           "title": "Ask"
         },
         "bid": {
@@ -466,7 +466,7 @@
               "type": "null"
             }
           ],
-          "description": "Best YES bid. Milli: price x 1000, so 0.537 -> 537. Integer 0-1000.",
+          "description": "Best bid, YES-denominated. Milli: price x 1000, so 0.537 -> 537. Integer 0-1000.",
           "title": "Bid"
         },
         "exchange_id": {

@@ -10,10 +10,14 @@ Units:
   Polymarket moves in 0.001 steps, finer than SIG's tick, so quotes are not rounded.
   Fair values and overrides are also in milli (as floats), so everything compared
   against SIG shares one unit. A SIG tick is exactly 5 milli.
-- Quotes, fair values, overrides and fills are YES-denominated: a NO share is worth
-  `1000 - milli` or `200 - ticks`. OrderIntent.price follows the API's order `price`,
-  which for a NO order is the NO price (see OrderIntent.price).
-- Every float rejects NaN and +/-infinity, including dict values.
+- Every internal price is YES-denominated, whatever the side: quotes, fair values,
+  overrides, OrderIntent.price and Fill.price. A NO share is worth `1000 - milli` or
+  `200 - ticks`.
+- These are Bellwether's internal representations, not SIG's wire format. Translating
+  to and from API requests and responses (including any NO-side price complement
+  the API needs) belongs at the API boundary; it is not implemented here.
+- Typed float fields, and the float values of typed float dicts, reject NaN and
+  +/-infinity. Untyped contents (EngineMessage.data) are not checked.
 - All timestamps are timezone-aware and normalised to UTC.
 
 Serialization:
@@ -158,8 +162,12 @@ class Quote(_Model):
 
     source: QuoteSource
     exchange_id: str
-    bid: Milli | None = Field(description=f"Best YES bid. {MILLI_NOTE} Integer 0-1000.")
-    ask: Milli | None = Field(description=f"Best YES ask. {MILLI_NOTE} Integer 0-1000.")
+    bid: Milli | None = Field(
+        description=f"Best bid, YES-denominated. {MILLI_NOTE} Integer 0-1000."
+    )
+    ask: Milli | None = Field(
+        description=f"Best ask, YES-denominated. {MILLI_NOTE} Integer 0-1000."
+    )
     ts: UtcDatetime
 
     @computed_field(  # type: ignore[prop-decorator]
@@ -182,7 +190,7 @@ class FairValue(_Model):
     value: float = Field(
         ge=0,
         le=MILLI_PER_UNIT,
-        description=f"YES fair value. {MILLI_NOTE} Float 0-1000; need not be on any grid.",
+        description=f"Fair value, YES-denominated. {MILLI_NOTE} Float 0-1000; may be off-grid.",
     )
     inputs: dict[str, float] = Field(description="Weight given to each source; finite floats")
     model_version: str
@@ -204,9 +212,13 @@ class Signal(_Model):
 class OrderIntent(_Model):
     """An order we want to place. Must pass risk.check() before it is sent.
 
+    `price` is the internal YES-denominated limit price, for YES and NO orders alike.
+    It is not the API request's `price`: the future SIG client must translate it at
+    the boundary, including any NO-side complement the API requires (unresolved).
+
     `price` is restricted to 1-199 ticks, so this model cannot carry a market-order
     price (0, 200 or none). That alone does not guarantee limit-only execution; the
-    order-sending code must still send this price.
+    order-sending code must still send a limit price derived from it.
 
     qty, idempotency_key and exchange_id follow the API's OrderInput constraints.
     """
@@ -224,16 +236,19 @@ class OrderIntent(_Model):
     qty: PositiveInt = Field(le=MAX_ORDER_QTY, description="Whole shares, 1-2147483647.")
     price: OrderTick = Field(
         description=(
-            f"Limit price. {TICKS_NOTE} Integer 1-199. Same denomination as the API's "
-            "order price: per docs/api/openapi.json a NO order is priced in NO terms "
-            "(`sell yes q@p` == `buy no q@(1-p)`)."
+            f"Internal limit price, YES-denominated for both sides. {TICKS_NOTE} "
+            "Integer 1-199. Not the API wire price; converted at the API boundary."
         )
     )
     reason: str = Field(min_length=1)
 
 
 class Fill(_Model):
-    """Mirrors the API's Fill. `quantity` is signed: negative means NO shares."""
+    """Mirrors the API's Fill. `quantity` is signed: negative means NO shares.
+
+    `price` is Bellwether's internal YES-denominated tick price. How REST and
+    realtime fill prices map onto it is decided by the future SIG client.
+    """
 
     id: int
     order_id: int | None
@@ -241,7 +256,8 @@ class Fill(_Model):
     market_id: str
     price: Tick | None = Field(
         description=(
-            f"Execution price, YES-denominated per the API's fill docs. {TICKS_NOTE} Integer 0-200."
+            f"Internal execution price, YES-denominated for both sides. {TICKS_NOTE} "
+            "Integer 0-200. Not the API wire price; normalised at the API boundary."
         )
     )
     quantity: float
@@ -306,7 +322,7 @@ class OverrideCommand(_Model):
     value: float = Field(
         ge=0,
         le=MILLI_PER_UNIT,
-        description=f"YES fair value set by hand. {MILLI_NOTE} Float 0-1000.",
+        description=f"Fair value set by hand, YES-denominated. {MILLI_NOTE} Float 0-1000.",
     )
 
 
