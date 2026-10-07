@@ -8,7 +8,9 @@ from shared.export_schema import SCHEMA_PATH, build_schema
 from shared.schemas import (
     Action,
     EngineMessage,
+    FairValue,
     OrderIntent,
+    OverrideCommand,
     Quote,
     QuoteSource,
     Side,
@@ -66,6 +68,18 @@ def test_quote_keeps_polymarket_precision() -> None:
     assert quote.mid == 538
     with pytest.raises(ValidationError):
         Quote(source=QuoteSource.POLYMARKET, exchange_id="e", bid=537, ask=1001, ts=NOW)
+
+
+def test_fair_value_and_override_use_milli() -> None:
+    fv = FairValue(
+        exchange_id="e", value=537.4, inputs={"polymarket": 1.0}, model_version="v1", ts=NOW
+    )
+    assert fv.value == 537.4
+    assert OverrideCommand(exchange_id="e", value=1000).value == 1000
+    with pytest.raises(ValidationError):
+        FairValue(exchange_id="e", value=1000.1, inputs={}, model_version="v1", ts=NOW)
+    with pytest.raises(ValidationError):
+        OverrideCommand(exchange_id="e", value=-1)
 
 
 def test_valid_order_intent() -> None:

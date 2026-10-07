@@ -8,7 +8,8 @@ Units:
   Convert only at the API boundary with `price_to_ticks` / `ticks_to_price`.
 - Quotes (from every venue) are integer milli: price x 1000, so 0.537 -> 537.
   Polymarket moves in 0.001 steps, finer than SIG's tick, so quotes are not rounded.
-  A SIG tick is exactly 5 milli.
+  Fair values and overrides are also in milli (as floats), so everything compared
+  against SIG shares one unit. A SIG tick is exactly 5 milli.
 - All prices are YES-denominated. A NO share costs `200 - ticks`.
 - All timestamps are timezone-aware and normalised to UTC.
 """
@@ -145,7 +146,7 @@ class FairValue(_Model):
     """Our estimate of one contract's YES value."""
 
     exchange_id: str
-    value: float = Field(ge=0, le=TICKS_PER_UNIT, description="In ticks; need not be on grid")
+    value: float = Field(ge=0, le=MILLI_PER_UNIT, description="In milli; need not be on grid")
     inputs: dict[str, float] = Field(description="Weight given to each source")
     model_version: str
     ts: UtcDatetime
@@ -246,7 +247,7 @@ class OverrideCommand(_Model):
     """Body of POST /override. Expires after 15 minutes; still passes risk.check()."""
 
     exchange_id: str
-    value: float = Field(ge=0, le=TICKS_PER_UNIT, description="Fair value in ticks")
+    value: float = Field(ge=0, le=MILLI_PER_UNIT, description="Fair value in milli")
 
 
 EXPORTED_MODELS: tuple[type[BaseModel], ...] = (

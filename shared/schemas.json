@@ -72,8 +72,8 @@
           "type": "string"
         },
         "value": {
-          "description": "In ticks; need not be on grid",
-          "maximum": 200,
+          "description": "In milli; need not be on grid",
+          "maximum": 1000,
           "minimum": 0,
           "title": "Value",
           "type": "number"
@@ -359,8 +359,8 @@
           "type": "string"
         },
         "value": {
-          "description": "Fair value in ticks",
-          "maximum": 200,
+          "description": "Fair value in milli",
+          "maximum": 1000,
           "minimum": 0,
           "title": "Value",
           "type": "number"
