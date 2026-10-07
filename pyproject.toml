@@ -10,8 +10,14 @@ dependencies = [
     "ruff",
 ]
 
+[tool.setuptools]
+# Several top-level folders (engine, models, shared, ...): disable auto-discovery.
+# Installing the project only pulls in dependencies; code is imported from the repo root.
+packages = []
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 
 [tool.ruff]
 target-version = "py311"
