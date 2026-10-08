@@ -1,0 +1,18 @@
+{
+  "provenance": "synthetic, spec-derived: codes and envelope shape from the Error Responses table; messages are placeholders",
+  "openapi": [
+    "#/info/description",
+    "#/components/schemas/Error",
+    "#/components/schemas/ExchangeValidationError"
+  ],
+  "body": {
+    "RATE_LIMITED": {"error": {"code": "RATE_LIMITED", "message": "Rate limit exceeded."}},
+    "SERVICE_UNAVAILABLE": {"error": {"code": "SERVICE_UNAVAILABLE", "message": "Authoritative reporting is temporarily unavailable."}},
+    "TX_CONFLICT": {"error": {"code": "TX_CONFLICT", "message": "Serializable transaction conflict."}},
+    "VALIDATION_ERROR": {"error": {"code": "VALIDATION_ERROR", "message": "Invalid query parameters.", "details": {"depth": ["must be at most 200"]}}},
+    "INVALID_API_KEY": {"error": {"code": "INVALID_API_KEY", "message": "Key not recognised."}},
+    "INSUFFICIENT_SCOPES": {"error": {"code": "INSUFFICIENT_SCOPES", "message": "Key lacks a required scope."}},
+    "NOT_FOUND": {"error": {"code": "NOT_FOUND", "message": "Exchange not found."}},
+    "INTERNAL_ERROR": {"error": {"code": "INTERNAL_ERROR", "message": "Unexpected server-side failure."}}
+  }
+}

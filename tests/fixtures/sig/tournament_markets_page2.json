@@ -1,0 +1,28 @@
+{
+  "provenance": "synthetic, spec-derived: shape from the schema; values are placeholders",
+  "openapi": [
+    "#/paths/~1tournaments~1{slug}~1markets/get/responses/200/content/application~1json/schema",
+    "#/components/schemas/TournamentMarket"
+  ],
+  "body": {
+    "data": [
+      {
+        "id": "27",
+        "title": "Placeholder market B",
+        "status": "settled",
+        "createdAt": null,
+        "settlementDate": "2025-07-01T00:00:00.000Z",
+        "settledWith": "YES",
+        "settledOn": "2025-07-01T00:00:00.000Z",
+        "categories": [],
+        "isComposite": false,
+        "isMultiOutcome": false,
+        "exchanges": [
+          {"id": "37", "option": null, "latestPrice": null, "initialPrice": null}
+        ],
+        "creator": null
+      }
+    ],
+    "pagination": {"total": 2, "limit": 1, "hasMore": false, "nextCursor": null}
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "provenance": "synthetic, spec-derived: exchange 36 and missingIds from examples; exchange 37 is a placeholder with null prices",
+  "openapi": [
+    "#/paths/~1exchanges~1prices/get/responses/200/content/application~1json/schema",
+    "#/components/schemas/BulkExchangePrice"
+  ],
+  "body": {
+    "data": [
+      {"exchangeId": "36", "marketId": "26", "option": "YES", "latestPrice": 0.42, "bestBid": 0.41, "bestAsk": 0.55, "spread": 0.14},
+      {"exchangeId": "37", "marketId": "27", "option": null, "latestPrice": null, "bestBid": null, "bestAsk": null, "spread": null}
+    ],
+    "missingIds": ["999999999"]
+  }
+}
