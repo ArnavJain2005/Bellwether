@@ -381,7 +381,7 @@ def test_out_of_range_arguments_send_nothing(call: Any) -> None:
 
     with pytest.raises(SigArgumentError):
         run(scenario(client))
-    assert all(path == "/tournaments/alpha-tournament" for path in router.paths())
+    assert router.requests == []  # rejected before tournament verification too
 
 
 def test_documented_maximums_are_accepted() -> None:

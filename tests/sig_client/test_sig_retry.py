@@ -15,8 +15,8 @@ from sig_testkit import (
 from engine.sig_client.errors import (
     SigAuthError,
     SigBadRequestError,
+    SigDeadlineExceededError,
     SigNotFoundError,
-    SigRateBudgetError,
     SigRateLimitedError,
     SigRetryExhaustedError,
     SigServerError,
@@ -57,7 +57,7 @@ def test_attempt_limit_raises_with_last_error() -> None:
     with pytest.raises(SigRetryExhaustedError) as info:
         run(client.get_exchange_orderbook("36"))
     error = info.value
-    assert error.attempts == 4 and "attempt limit" in error.reason
+    assert error.attempts == 4 and "attempt limit" in str(error)
     assert isinstance(error.last_error, SigServiceUnavailableError)
     assert error.last_error.code == "SERVICE_UNAVAILABLE"
     assert book_requests(router) == 4
@@ -67,8 +67,10 @@ def test_attempt_limit_raises_with_last_error() -> None:
 def test_time_budget_stops_retries_before_sleeping_past_it() -> None:
     retry = ReadRetryPolicy(max_attempts=10, total_budget_s=1.0)
     client, router, clock = make_client(Router({BOOK: [unavailable()]}), retry=retry)
-    with pytest.raises(SigRetryExhaustedError, match="time budget"):
+    with pytest.raises(SigDeadlineExceededError) as info:
         run(client.get_exchange_orderbook("36"))
+    assert info.value.phase == "retry wait" and info.value.attempts == 3
+    assert isinstance(info.value.last_error, SigServiceUnavailableError)
     assert book_requests(router) == 3  # sleeps 0.25 + 0.5, then 1.0 would overrun
     assert sum(clock.sleeps) <= 1.0
 
@@ -110,14 +112,16 @@ def test_429_beyond_the_budget_fails_fast_and_keeps_the_cooldown() -> None:
     client, router, clock = make_client(router)
 
     async def scenario() -> None:
-        with pytest.raises(SigRetryExhaustedError) as info:
+        with pytest.raises(SigDeadlineExceededError) as info:
             await client.get_exchange_orderbook("36")
+        assert info.value.phase == "retry wait"
         assert isinstance(info.value.last_error, SigRateLimitedError)
         assert info.value.last_error.retry_after == 60.0
         assert clock.sleeps == []
         # The shared cooldown now makes the next read wait out the instructed minute.
-        with pytest.raises(SigRateBudgetError):
+        with pytest.raises(SigDeadlineExceededError) as info:
             await client.get_exchange_orderbook("36")
+        assert info.value.phase == "rate admission" and info.value.attempts == 0
 
     run(scenario())
     assert book_requests(router) == 1
@@ -136,10 +140,11 @@ def test_cooldown_is_shared_with_other_clients_of_the_account() -> None:
     second, router2, _ = make_client(clock=clock, limiter=shared)
 
     async def scenario() -> None:
-        with pytest.raises(SigRetryExhaustedError):
+        with pytest.raises(SigDeadlineExceededError):
             await first.get_exchange_orderbook("36")
-        with pytest.raises(SigRateBudgetError):
+        with pytest.raises(SigDeadlineExceededError) as info:
             await second.get_exchange_orderbook("36")
+        assert info.value.phase == "rate admission"
 
     run(scenario())
     assert router2.requests == []
@@ -160,7 +165,7 @@ def test_429_with_unparseable_retry_after_still_cools_down_reads() -> None:
     async def scenario() -> None:
         with pytest.raises(SigRateLimitedError):
             await client.get_exchange_orderbook("36")
-        with pytest.raises(SigRateBudgetError):
+        with pytest.raises(SigDeadlineExceededError, match="rate admission"):
             await client.get_exchange_orderbook("36")
 
     run(scenario())
@@ -230,12 +235,15 @@ def test_502_is_not_a_documented_read_failure_and_is_not_retried() -> None:
     assert book_requests(router) == 1
 
 
-def test_unknown_error_code_and_status_are_kept_safely() -> None:
+def test_unknown_error_code_is_flagged_but_not_kept() -> None:
     body = {"error": {"code": "BRAND_NEW_CODE", "message": "something new"}}
     client, _, _ = make_client(Router({BOOK: json_response(418, body)}))
     with pytest.raises(SigUnexpectedStatusError) as info:
         run(client.get_exchange_orderbook("36"))
-    assert info.value.code == "BRAND_NEW_CODE" and info.value.status == 418
+    assert info.value.status == 418
+    assert info.value.code is None and info.value.unrecognized_code is True
+    assert "BRAND_NEW_CODE" not in str(info.value)
+    assert "something new" not in str(info.value)
 
 
 def test_unknown_code_on_503_is_still_retried() -> None:
@@ -250,8 +258,8 @@ def test_unknown_code_on_503_is_still_retried() -> None:
     [
         (b"<html>502 Bad Gateway</html>", "non-JSON error body"),
         (b'{"error": "flat string"}', "error body without an error object"),
-        (b'{"error": {"code": 42, "message": ["x"]}}', "no message"),
-        (b'{"error": {"code": "lower case <script>", "message": "m"}}', "m"),
+        (b'{"error": {"code": 42, "message": ["x"]}}', "error envelope"),
+        (b'{"error": {"code": "lower case <script>", "message": "m"}}', "error envelope"),
     ],
 )
 def test_malformed_error_bodies_are_handled(content: bytes, message: str) -> None:
@@ -259,7 +267,7 @@ def test_malformed_error_bodies_are_handled(content: bytes, message: str) -> Non
     with pytest.raises(SigNotFoundError) as info:
         run(client.get_exchange_orderbook("36"))
     assert info.value.code is None
-    assert info.value.message == message
+    assert info.value.detail == message
     assert "<html>" not in str(info.value) and "<script>" not in str(info.value)
 
 
@@ -276,8 +284,9 @@ def test_limiter_wait_beyond_the_budget_is_a_clear_error() -> None:
     clock = FakeClock()
     tight = RateLimiter(read_limit=1, clock=clock, sleep=clock.sleep)
     client, router, _ = make_client(clock=clock, limiter=tight)
-    with pytest.raises(SigRateBudgetError, match="deadline"):
+    with pytest.raises(SigDeadlineExceededError) as info:
         run(client.get_exchange_orderbook("36"))  # tournament check took the only slot
+    assert info.value.phase == "rate admission" and info.value.attempts == 0
     assert [r.url.path for r in router.requests] == [f"{API}/tournaments/alpha-tournament"]
 
 

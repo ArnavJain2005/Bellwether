@@ -11,8 +11,8 @@ to an organization's default trading context when `tournamentId` is omitted.
 
 from __future__ import annotations
 
+import math
 import re
-import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -21,12 +21,16 @@ import httpx
 API_KEY_ENV_VAR = "SUSQ_API_KEY"
 SIG_BASE_URL = "https://www.thesuper.market/api/v1"
 
-# Per-attempt HTTP timeouts. The read retry policy adds an overall budget on top.
+# Per-phase HTTP timeouts for one attempt. They do not bound a whole read; the read
+# retry policy's overall deadline does (engine/sig_client/rest.py).
 DEFAULT_TIMEOUT = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)
 
-_SLUG_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+# Every pattern is applied with fullmatch(): `$` with match() would accept a trailing "\n".
+_SLUG_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 # Visible ASCII only: anything else could break or inject into the Authorization header.
-_API_KEY_PATTERN = re.compile(r"^[\x21-\x7e]+$")
+_API_KEY_PATTERN = re.compile(r"[\x21-\x7e]+")
+_CANONICAL_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+_URL_PATTERN = re.compile(r"[\x21-\x7e]+")
 
 
 class ConfigError(ValueError):
@@ -42,7 +46,7 @@ class ApiKey:
     __slots__ = ("_value",)
 
     def __init__(self, value: str) -> None:
-        if not isinstance(value, str) or not _API_KEY_PATTERN.match(value):
+        if not isinstance(value, str) or not _API_KEY_PATTERN.fullmatch(value):
             raise ConfigError("API key must be non-empty visible ASCII without whitespace")
         self._value = value
 
@@ -63,14 +67,11 @@ class TournamentRef:
     id: str
 
     def __post_init__(self) -> None:
-        if not _SLUG_PATTERN.match(self.slug):
-            raise ConfigError(f"invalid tournament slug {self.slug!r}")
-        try:
-            parsed = uuid.UUID(self.id)
-        except (ValueError, AttributeError, TypeError):
-            raise ConfigError(f"tournament id {self.id!r} is not a UUID") from None
-        if str(parsed) != self.id:
-            raise ConfigError(f"tournament id {self.id!r} is not in canonical lowercase form")
+        # Invalid values are not echoed: a misplaced secret must not reach the message.
+        if not isinstance(self.slug, str) or not _SLUG_PATTERN.fullmatch(self.slug):
+            raise ConfigError("tournament slug must be ASCII letters, digits, '-' or '_'")
+        if not isinstance(self.id, str) or not _CANONICAL_UUID.fullmatch(self.id):
+            raise ConfigError("tournament id must be a canonical lowercase UUID")
 
 
 # From CLAUDE.md (Platform facts). Pass it explicitly; nothing uses it by default.
@@ -80,6 +81,8 @@ MIDTERM_ELECTIONS = TournamentRef(
 
 
 def _check_base_url(base_url: str) -> str:
+    if not isinstance(base_url, str) or not _URL_PATTERN.fullmatch(base_url):
+        raise ConfigError("SIG base URL must be visible ASCII without whitespace")
     url = httpx.URL(base_url)
     if url.scheme != "https" or not url.host:
         raise ConfigError("SIG base URL must be an absolute https URL")
@@ -88,8 +91,29 @@ def _check_base_url(base_url: str) -> str:
     return base_url.rstrip("/")
 
 
+def _check_timeout(timeout: object) -> None:
+    """Every httpx phase timeout must be set, finite and positive."""
+    if not isinstance(timeout, httpx.Timeout):
+        raise ConfigError("timeout must be an httpx.Timeout")
+    for phase in ("connect", "read", "write", "pool"):
+        value = getattr(timeout, phase)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ConfigError(f"timeout.{phase} must be a finite number of seconds above 0")
+
+
 @dataclass(frozen=True)
 class SigConfig:
+    """SIG client settings.
+
+    `timeout` bounds each httpx phase (connect, read, write, pool) of one attempt. It
+    does not bound a whole logical read; the client's ReadRetryPolicy deadline does.
+    """
+
     api_key: ApiKey
     tournament: TournamentRef
     base_url: str = SIG_BASE_URL
@@ -101,6 +125,7 @@ class SigConfig:
         if not isinstance(self.tournament, TournamentRef):
             raise ConfigError("tournament must be a TournamentRef")
         object.__setattr__(self, "base_url", _check_base_url(self.base_url))
+        _check_timeout(self.timeout)
 
 
 def load_sig_config(
