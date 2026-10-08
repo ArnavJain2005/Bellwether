@@ -14,6 +14,8 @@ from engine.sig_client.rate_limiter import (
 
 READ = RequestKind.READ
 WRITE = RequestKind.WRITE
+# A deadline just ahead of "now": admits only if a slot is free without waiting.
+NOW_ONLY = 0.001
 
 
 def limiter(clock: FakeClock, **kwargs: int) -> RateLimiter:
@@ -63,9 +65,9 @@ def test_rolling_window_boundary_is_half_open() -> None:
         await admit_times(lim, clock, READ, 4)
         clock.now = 1059.999
         with pytest.raises(SigRateBudgetError):
-            await lim.acquire(READ, deadline=clock())
+            await lim.acquire(READ, deadline=clock() + NOW_ONLY)
         clock.now = 1060.0
-        await lim.acquire(READ, deadline=clock())
+        await lim.acquire(READ, deadline=clock() + NOW_ONLY)
 
     run(scenario())
 
@@ -108,7 +110,7 @@ def test_concurrent_admission_is_atomic() -> None:
 
     async def one() -> bool:
         try:
-            await lim.acquire(READ, deadline=clock())
+            await lim.acquire(READ, deadline=clock() + NOW_ONLY)
         except SigRateBudgetError:
             return False
         return True
@@ -146,9 +148,9 @@ def test_reads_and_writes_have_separate_budgets() -> None:
         await admit_times(lim, clock, READ, 80)
         await admit_times(lim, clock, WRITE, 25)
         with pytest.raises(SigRateBudgetError):
-            await lim.acquire(WRITE, deadline=clock())
+            await lim.acquire(WRITE, deadline=clock() + NOW_ONLY)
         with pytest.raises(SigRateBudgetError):
-            await lim.acquire(READ, deadline=clock())
+            await lim.acquire(READ, deadline=clock() + NOW_ONLY)
 
     run(scenario())
     assert clock.now == 1000.0
@@ -161,7 +163,7 @@ def test_cooldown_blocks_only_its_budget_and_never_shortens() -> None:
     async def scenario() -> None:
         lim.impose_cooldown(READ, 30)
         lim.impose_cooldown(READ, 5)  # must not shorten the 30 s cooldown
-        await lim.acquire(WRITE, deadline=clock())
+        await lim.acquire(WRITE, deadline=clock() + NOW_ONLY)
         with pytest.raises(SigRateBudgetError):
             await lim.acquire(READ, deadline=clock() + 29)
         await lim.acquire(READ)

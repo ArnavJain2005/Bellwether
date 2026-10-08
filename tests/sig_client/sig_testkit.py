@@ -123,10 +123,11 @@ def make_client(
     limiter: RateLimiter | None = None,
     jitter: Callable[[float], float] = lambda delay: delay,
     tournament: TournamentRef = TOURNAMENT,
+    api_key: str = SENTINEL_KEY,
 ) -> tuple[SigRestClient, Router, FakeClock]:
     router = router or Router()
     clock = clock or FakeClock()
-    config = SigConfig(api_key=ApiKey(SENTINEL_KEY), tournament=tournament, base_url=BASE_URL)
+    config = SigConfig(api_key=ApiKey(api_key), tournament=tournament, base_url=BASE_URL)
     http = httpx.AsyncClient(transport=httpx.MockTransport(router))
     client = SigRestClient(
         config,
@@ -146,3 +147,36 @@ def run(coro: Awaitable[Any]) -> Any:
         return await coro
 
     return asyncio.run(main())
+
+
+def secret_leaks(error: BaseException, secret: str) -> list[str]:
+    """Every place in an exception (text, attributes, chained errors) holding `secret`."""
+    found: list[str] = []
+    seen: set[int] = set()
+
+    def visit(value: object, where: str) -> None:
+        if id(value) in seen:
+            return
+        seen.add(id(value))
+        if isinstance(value, BaseException):
+            for label, text in (("str", str(value)), ("repr", repr(value))):
+                if secret in text:
+                    found.append(f"{where}.{label}")
+            for name, attr in vars(value).items():
+                visit(attr, f"{where}.{name}")
+            if value.__cause__ is not None:
+                visit(value.__cause__, f"{where}.__cause__")
+            if value.__context__ is not None and not value.__suppress_context__:
+                visit(value.__context__, f"{where}.__context__")
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            for i, item in enumerate(value):
+                visit(item, f"{where}[{i}]")
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                visit(key, f"{where}<key>")
+                visit(item, f"{where}[{key!r}]")
+        elif secret in repr(value):
+            found.append(where)
+
+    visit(error, "error")
+    return found

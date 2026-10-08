@@ -48,9 +48,9 @@ def test_key_never_reaches_logs_errors_or_reprs(caplog: pytest.LogCaptureFixture
         run(client.get_exchange_orderbook("36"))
     error = info.value
     texts = [str(error), repr(error), repr(client), caplog.text]
-    texts += [str(getattr(error, "message", "")), str(error.__cause__), str(error.__context__)]
+    texts += [str(error.__cause__), str(error.__context__)]
     assert all(SENTINEL_KEY not in text for text in texts)
-    assert "<redacted>" in str(error)
+    assert "bad key" not in str(error)  # SIG's free-form message is never kept
     assert "SIG read retry" in caplog.text  # the retries were logged, sanitized
 
 

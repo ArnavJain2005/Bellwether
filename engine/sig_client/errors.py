@@ -1,35 +1,56 @@
 """Errors raised by the SIG client.
 
-Every message is built from sanitized pieces: the HTTP method, the request path (no
-query string, no headers), the status, SIG's stable error `code`, and a truncated copy of
-SIG's free-form `message` with the API key redacted. Request objects, headers and
-response bodies are never attached to these exceptions.
+Every message and attribute is built from trusted pieces only:
+- the HTTP method and the request path, which the client builds from configuration and
+  validated arguments (no query string, no headers);
+- the HTTP status and numeric Retry-After;
+- SIG's error `code`, but only when it is one of the documented codes below;
+- fixed, client-written descriptions.
+
+Nothing taken from a response body is copied into an error or a log line: not SIG's
+free-form `message`, not unknown codes, not echoed tournament ids or slugs, not item ids.
+Any of those could contain a credential or other text we must not re-emit. Request
+objects, headers and response bodies are never attached to these exceptions.
 """
 
 from __future__ import annotations
 
-import re
-from collections.abc import Iterable
+# The codes in the "Error Responses" table of #/info/description, plus
+# TERMS_NOT_ACKNOWLEDGED from the order endpoints' 403 schema.
+KNOWN_ERROR_CODES = frozenset(
+    {
+        "MISSING_API_KEY",
+        "INVALID_API_KEY",
+        "API_KEY_REVOKED",
+        "API_KEY_EXPIRED",
+        "UNAUTHORIZED",
+        "INSUFFICIENT_SCOPES",
+        "ACCOUNT_BANNED",
+        "RESIDENCE_UPDATE_REQUIRED",
+        "ADMIN_REQUIRED",
+        "FORBIDDEN",
+        "RATE_LIMITED",
+        "INVALID_JSON",
+        "INVALID_ID",
+        "INVALID_CURSOR",
+        "VALIDATION_ERROR",
+        "NOT_FOUND",
+        "CONFLICT",
+        "REQUEST_IN_FLIGHT",
+        "RELATIONSHIP_VIOLATION",
+        "DATABASE_ERROR",
+        "INTERNAL_ERROR",
+        "ORDER_STATUS_UNKNOWN",
+        "TX_CONFLICT",
+        "SERVICE_UNAVAILABLE",
+        "TERMS_NOT_ACKNOWLEDGED",
+    }
+)
 
-_MAX_TEXT = 200
-_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
-
-def sanitize_text(text: str, secrets: Iterable[str] = ()) -> str:
-    """Redact secrets, drop control characters and truncate free-form text."""
-    for secret in secrets:
-        if secret:
-            text = text.replace(secret, "<redacted>")
-    text = _CONTROL.sub(" ", text)
-    if len(text) > _MAX_TEXT:
-        text = text[:_MAX_TEXT] + "..."
-    return text
-
-
-def sanitize_code(code: object) -> str | None:
-    """Keep SIG's error code only if it looks like one (e.g. RATE_LIMITED)."""
-    if isinstance(code, str) and _CODE_PATTERN.match(code):
+def known_code(code: object) -> str | None:
+    """SIG's error code if it is a documented one, else None (never echoed)."""
+    if isinstance(code, str) and code in KNOWN_ERROR_CODES:
         return code
     return None
 
@@ -47,7 +68,12 @@ class SigClientClosedError(SigClientError):
 
 
 class SigApiError(SigClientError):
-    """SIG answered with a non-success HTTP status."""
+    """SIG answered with a non-success HTTP status.
+
+    `code` is a documented SIG code or None. `unrecognized_code` is True when the body
+    carried some other code; its value is deliberately not kept. `detail` is a fixed
+    client-written description of the body's shape, never SIG's text.
+    """
 
     def __init__(
         self,
@@ -56,16 +82,19 @@ class SigApiError(SigClientError):
         path: str,
         status: int,
         code: str | None,
-        message: str,
+        unrecognized_code: bool,
+        detail: str,
         retry_after: float | None = None,
     ) -> None:
         self.method = method
         self.path = path
         self.status = status
         self.code = code
-        self.message = message
+        self.unrecognized_code = unrecognized_code
+        self.detail = detail
         self.retry_after = retry_after
-        super().__init__(f"{method} {path} -> HTTP {status} {code or '-'}: {message}")
+        shown = code or ("<unrecognized code>" if unrecognized_code else "-")
+        super().__init__(f"{method} {path} -> HTTP {status} {shown}: {detail}")
 
 
 class SigBadRequestError(SigApiError):
@@ -101,7 +130,10 @@ class SigUnexpectedStatusError(SigApiError):
 
 
 class SigTransportError(SigClientError):
-    """The request failed below HTTP (connect, timeout, protocol)."""
+    """The request failed below HTTP (connect, timeout, protocol).
+
+    Only the httpx exception's class name is kept, never its text.
+    """
 
     def __init__(self, *, method: str, path: str, kind: str) -> None:
         self.method = method
@@ -111,23 +143,53 @@ class SigTransportError(SigClientError):
 
 
 class SigRetryExhaustedError(SigClientError):
-    """A read failed transiently and could not be retried within the policy."""
+    """A read kept failing transiently until the attempt limit was reached."""
 
-    def __init__(
-        self, *, reason: str, attempts: int, last_error: SigApiError | SigTransportError
-    ) -> None:
-        self.reason = reason
+    def __init__(self, *, attempts: int, last_error: SigApiError | SigTransportError) -> None:
         self.attempts = attempts
         self.last_error = last_error
-        super().__init__(f"{reason} after {attempts} attempt(s); last error: {last_error}")
+        super().__init__(f"attempt limit reached after {attempts} attempt(s); last: {last_error}")
+
+
+class SigDeadlineExceededError(SigClientError):
+    """A logical read's overall deadline passed, or would pass before the next step.
+
+    `phase` is where it ran out: "rate admission", "request" (sending, waiting for and
+    reading the response) or "retry wait". `last_error` is the previous attempt's
+    failure, if any. No response that arrives after the deadline is returned.
+    """
+
+    def __init__(
+        self,
+        *,
+        method: str,
+        path: str,
+        phase: str,
+        attempts: int,
+        last_error: SigApiError | SigTransportError | None = None,
+    ) -> None:
+        self.method = method
+        self.path = path
+        self.phase = phase
+        self.attempts = attempts
+        self.last_error = last_error
+        text = (
+            f"{method} {path} -> read deadline exceeded during {phase} after {attempts} attempt(s)"
+        )
+        if last_error is not None:
+            text += f"; last: {last_error}"
+        super().__init__(text)
 
 
 class SigRateBudgetError(SigClientError):
-    """Waiting for local rate budget would exceed the caller's deadline."""
+    """RateLimiter.acquire: the deadline has passed, or the wait would end after it."""
 
 
 class SigResponseError(SigClientError):
-    """A success response that is not valid JSON or does not match the documented shape."""
+    """A success response that is not valid JSON or does not match the documented shape.
+
+    `reason` is client-written and names fields, never their values.
+    """
 
     def __init__(self, *, method: str, path: str, reason: str) -> None:
         self.method = method

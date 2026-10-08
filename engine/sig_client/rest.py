@@ -12,22 +12,38 @@ orderbook's echoed context is checked as well.
 Transport and credentials:
 - The caller injects an `httpx.AsyncClient`. The SIG client closes it only when it was
   created with `owns_http=True` (as `SigRestClient.create` does).
-- Every request carries the configured per-attempt timeout and `follow_redirects=False`;
+- Every request carries the configured per-phase timeouts and `follow_redirects=False`;
   a redirect is returned as SigUnexpectedStatusError and never followed, so the key is
   never forwarded to another host.
 - The key is added per request in the Authorization header. It is never put in a URL,
-  log line, exception message or repr. An injected client with its own auth or
-  credential headers is refused.
+  log line, exception or repr. An injected client with its own auth or credential
+  headers is refused. Errors and logs carry no text taken from a response body (see
+  errors.py).
 
-Read retries (ReadRetryPolicy):
+Deadlines and retries (ReadRetryPolicy):
+- One logical read (one public page or object request) has one overall deadline,
+  `total_budget_s` from its start on the injected clock. It covers rate admission, every
+  attempt (sending, waiting, reading the body) and every retry wait. Per-phase httpx
+  timeouts alone would not bound the whole read. A response that completes at or after
+  the deadline is not returned. SigDeadlineExceededError names the phase that ran out.
+- Separate budgets: the one-time tournament verification is its own logical read, and
+  so is every page of a collection. There is no collection-wide deadline: a full
+  collection may take up to `max_pages` budgets, plus one for verification.
+- The request phase is bounded with `asyncio.timeout` for the time remaining on the
+  injected clock. In production the injected clock is `time.monotonic`, the same clock
+  the event loop uses.
 - Retried: HTTP 429 and 503 (documented transient), and the transport failures in
   RETRYABLE_TRANSPORT_ERRORS. Everything else is raised at once.
-- A finite attempt limit and an overall time budget apply. Each attempt consumes read
-  budget. The delay is the larger of Retry-After and a jittered exponential backoff, so
-  a retry never comes earlier than SIG instructed. If that delay would exceed the time
-  budget, SigRetryExhaustedError is raised. An unparseable Retry-After is not retried.
-- A 429 also imposes a shared read cooldown on the rate limiter.
+- Each attempt consumes read budget. The delay is the larger of Retry-After and a
+  jittered exponential backoff, so a retry never comes earlier than SIG instructed.
+  Retry-After values above `max_retry_after_s` are capped there, so nothing infinite
+  reaches a sleep or cooldown. An unparseable Retry-After is not retried.
+- A 429 also imposes a read cooldown on the rate limiter, which every client sharing
+  that limiter observes.
 These rules are for reads only. They say nothing about retrying orders or cancels.
+
+Response checks are labelled in the code as [documented] when the spec states the
+property, or [client policy] when it is an extra consistency check of ours.
 """
 
 from __future__ import annotations
@@ -36,13 +52,13 @@ import asyncio
 import itertools
 import json
 import logging
+import math
 import random
 import re
 import time
-import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol, Self, TypeVar
 from urllib.parse import quote
 
@@ -58,8 +74,10 @@ from engine.sig_client.errors import (
     SigClientClosedError,
     SigConflictError,
     SigContextMismatchError,
+    SigDeadlineExceededError,
     SigNotFoundError,
     SigPaginationError,
+    SigRateBudgetError,
     SigRateLimitedError,
     SigResponseError,
     SigRetryExhaustedError,
@@ -67,10 +85,16 @@ from engine.sig_client.errors import (
     SigServiceUnavailableError,
     SigTransportError,
     SigUnexpectedStatusError,
-    sanitize_code,
-    sanitize_text,
+    known_code,
 )
-from engine.sig_client.rate_limiter import Clock, RateLimiter, RequestKind, Sleep
+from engine.sig_client.rate_limiter import (
+    Clock,
+    RateLimiter,
+    RequestKind,
+    Sleep,
+    check_positive_int,
+    check_positive_seconds,
+)
 from engine.sig_client.wire import (
     BulkExchangePrices,
     CombinedMarketOrderbook,
@@ -96,8 +120,13 @@ MARKET_STATUSES = frozenset({"open", "closed", "settled", "any"})  # "resolved" 
 ORDER_STATUSES = frozenset({"open", "closed", "expired", "all"})
 DEFAULT_MAX_PAGES = 50
 
-_NUMERIC_ID = re.compile(r"^[0-9]+$")
-_RETRY_AFTER = re.compile(r"^[0-9]+(\.[0-9]+)?$")
+# All token patterns are applied with fullmatch(); `$` with match() accepts a final "\n".
+_NUMERIC_ID = re.compile(r"[0-9]+")
+_RETRY_AFTER = re.compile(r"[0-9]{1,32}(\.[0-9]{1,32})?")
+_UUID_TEXT = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+_LOC_PART = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
 
 # Read transport failures that are safe to retry: the request either never reached SIG
 # or a GET's response was lost. Proxy, protocol-usage and unsupported-scheme errors are
@@ -123,21 +152,35 @@ def equal_jitter(delay: float) -> float:
 
 @dataclass(frozen=True)
 class ReadRetryPolicy:
+    """Limits for one logical read. Every value is validated; none may be infinite."""
+
     max_attempts: int = 4
     total_budget_s: float = 30.0
     base_backoff_s: float = 0.25
     max_backoff_s: float = 4.0
-    # Used when a 429 carries no Retry-After; the spec documents `Retry-After: 60`.
+    # Used when a 429 carries no usable Retry-After; the spec documents `Retry-After: 60`.
     rate_limited_default_wait_s: float = 60.0
+    # Ceiling for any Retry-After honoured as a wait or cooldown.
+    max_retry_after_s: float = 3600.0
 
     def __post_init__(self) -> None:
-        if self.max_attempts < 1:
-            raise ValueError("max_attempts must be at least 1")
-        if min(self.total_budget_s, self.base_backoff_s, self.max_backoff_s) <= 0:
-            raise ValueError("time values must be positive")
+        check_positive_int("max_attempts", self.max_attempts)
+        for name in (
+            "total_budget_s",
+            "base_backoff_s",
+            "max_backoff_s",
+            "rate_limited_default_wait_s",
+            "max_retry_after_s",
+        ):
+            check_positive_seconds(name, getattr(self, name))
+        if self.base_backoff_s > self.max_backoff_s:
+            raise ValueError("base_backoff_s must not exceed max_backoff_s")
+        if self.rate_limited_default_wait_s > self.max_retry_after_s:
+            raise ValueError("rate_limited_default_wait_s must not exceed max_retry_after_s")
 
     def backoff(self, attempt: int) -> float:
-        return min(self.max_backoff_s, self.base_backoff_s * 2 ** (attempt - 1))
+        # The exponent is capped so a large attempt number cannot overflow.
+        return min(self.max_backoff_s, self.base_backoff_s * 2 ** min(attempt - 1, 60))
 
 
 class _Page(Protocol):
@@ -166,14 +209,22 @@ def _reject_constant(name: str) -> None:
     raise ValueError(f"non-finite JSON constant {name}")
 
 
-def _parse_retry_after(value: str | None) -> tuple[bool, float | None]:
-    """(valid, seconds). Only delta-seconds is accepted; an HTTP-date is not."""
+def _parse_retry_after(value: str | None, cap: float) -> tuple[bool, float | None]:
+    """(valid, seconds). Only delta-seconds is accepted, not an HTTP-date.
+
+    Parsed exactly with Decimal and capped at `cap`, so an enormous value can never
+    become an infinite float.
+    """
     if value is None:
         return True, None
     value = value.strip()
-    if not _RETRY_AFTER.match(value):
+    if not _RETRY_AFTER.fullmatch(value):
         return False, None
-    return True, float(value)
+    try:
+        seconds = Decimal(value)
+    except InvalidOperation:  # pragma: no cover - the pattern already guarantees digits
+        return False, None
+    return True, float(min(seconds, Decimal(str(cap))))
 
 
 def _check_int(name: str, value: object, low: int, high: int) -> int:
@@ -183,9 +234,13 @@ def _check_int(name: str, value: object, low: int, high: int) -> int:
 
 
 def _check_numeric_id(name: str, value: object) -> str:
-    if not isinstance(value, str) or not _NUMERIC_ID.match(value):
+    if not isinstance(value, str) or not _NUMERIC_ID.fullmatch(value):
         raise SigArgumentError(f"{name} must be a string of ASCII digits")
     return value
+
+
+def _check_optional_id(name: str, value: object) -> str | None:
+    return None if value is None else _check_numeric_id(name, value)
 
 
 def _check_choice(name: str, value: object, choices: frozenset[str]) -> str:
@@ -204,8 +259,33 @@ def _segment(value: str) -> str:
     return quote(value, safe="")
 
 
+def _same_uuid(reported: str, expected: str) -> bool | None:
+    """True/False for a canonical UUID string (any case); None if it is not one."""
+    if not _UUID_TEXT.fullmatch(reported):
+        return None
+    return reported.lower() == expected
+
+
+def _validation_summary(exc: ValidationError) -> str:
+    """Field locations and error types only; never input values or response keys."""
+    parts = []
+    for error in exc.errors(include_input=False, include_url=False)[:5]:
+        loc = ".".join(
+            str(part)
+            if isinstance(part, int) or (isinstance(part, str) and _LOC_PART.fullmatch(part))
+            else "<?>"
+            for part in error["loc"]
+        )
+        parts.append(f"{loc or '<root>'}: {error['type']}")
+    return "; ".join(parts)
+
+
 class SigRestClient:
-    """Read-only client for one SIG account and one configured tournament."""
+    """Read-only client for one SIG account and one configured tournament.
+
+    Pass the account's shared RateLimiter as `limiter`. Without one, this client gets a
+    private limiter that does not coordinate with any other client of the account.
+    """
 
     def __init__(
         self,
@@ -281,7 +361,7 @@ class SigRestClient:
     # --- tournament ---------------------------------------------------------------------
 
     async def get_tournament(self) -> Tournament:
-        """GET /tournaments/{slug}, checking the echoed slug and UUID."""
+        """GET /tournaments/{slug}, checking the echoed slug and UUID [client policy]."""
         if self._mismatch is not None:
             raise self._mismatch
         path = f"/tournaments/{_segment(self._config.tournament.slug)}"
@@ -291,7 +371,7 @@ class SigRestClient:
         return tournament
 
     async def verify_tournament(self) -> Tournament:
-        """Verify the slug/UUID pair once; later calls reuse the result."""
+        """Verify the slug/UUID pair once (its own logical read); later calls reuse it."""
         if self._mismatch is not None:
             raise self._mismatch
         async with self._verify_lock:
@@ -301,19 +381,24 @@ class SigRestClient:
 
     def _check_tournament(self, path: str, tournament: Tournament) -> None:
         expected = self._config.tournament
-        try:
-            reported_id = uuid.UUID(tournament.id)
-        except ValueError:
+        same_id = _same_uuid(tournament.id, expected.id)
+        if same_id is None:
             raise SigResponseError(
-                method="GET", path=path, reason="tournament id is not a UUID"
-            ) from None
-        if tournament.slug != expected.slug or reported_id != uuid.UUID(expected.id):
+                method="GET", path=path, reason="tournament id is not a canonical UUID"
+            )
+        # The reported slug and id are response data and are not repeated in the error.
+        problems = []
+        if tournament.slug != expected.slug:
+            problems.append("slug")
+        if not same_id:
+            problems.append("id")
+        if problems:
             self._mismatch = SigContextMismatchError(
                 method="GET",
                 path=path,
                 reason=(
-                    f"SIG reports tournament {tournament.slug!r} / {tournament.id!r}; "
-                    f"configured {expected.slug!r} / {expected.id!r}"
+                    f"SIG reports a different tournament {' and '.join(problems)} than "
+                    f"configured ({expected.slug} / {expected.id})"
                 ),
             )
             raise self._mismatch
@@ -353,7 +438,10 @@ class SigRestClient:
         page_limit: int = MARKETS_PAGE_MAX,
         max_pages: int = DEFAULT_MAX_PAGES,
     ) -> list[TournamentMarket]:
-        """Every market in the tournament, or SigPaginationError. Never a partial list."""
+        """Every market in the tournament, or an error. Never a partial list.
+
+        Each page has its own read deadline; there is no deadline for the whole list.
+        """
         path = f"/tournaments/{_segment(self._config.tournament.slug)}/markets"
         return await self._collect(
             path,
@@ -373,6 +461,7 @@ class SigRestClient:
         ids = [_check_numeric_id("exchange id", value) for value in exchange_ids]
         if not 1 <= len(ids) <= BULK_PRICE_IDS_MAX:
             raise SigArgumentError(f"exchange_ids must hold 1 to {BULK_PRICE_IDS_MAX} ids")
+        # [client policy] duplicates would make the response ambiguous.
         if len(set(ids)) != len(ids):
             raise SigArgumentError("exchange_ids must not contain duplicates")
         await self.verify_tournament()
@@ -383,6 +472,9 @@ class SigRestClient:
         return prices
 
     def _check_bulk_prices(self, path: str, ids: list[str], prices: BulkExchangePrices) -> None:
+        # [documented] data preserves request order; ids outside the context are listed
+        # in missingIds. [client policy] no duplicates, no unrequested ids, every id
+        # accounted for exactly once.
         def bad(reason: str) -> SigResponseError:
             return SigResponseError(method="GET", path=path, reason=reason)
 
@@ -412,6 +504,7 @@ class SigRestClient:
         path = f"/exchanges/{_segment(exchange_id)}/orderbook"
         params = {"depth": depth, "tournamentId": self._config.tournament.id}
         book = await self._get_model(path, params, ExchangeOrderbook)
+        # [client policy] the echoed exchange id must be the one requested.
         if book.exchangeId != exchange_id:
             raise SigResponseError(
                 method="GET", path=path, reason="orderbook is for a different exchange"
@@ -435,6 +528,9 @@ class SigRestClient:
         return book
 
     def _check_market_context(self, path: str, book: MarketOrderbook) -> None:
+        # [documented] "Pass tournamentId for one explicit context."
+        # [client policy] that context must name the configured slug and UUID.
+        # Reported ids and slugs are response data and are not repeated in errors.
         expected = self._config.tournament
         if len(book.contexts) != 1:
             raise SigContextMismatchError(
@@ -448,19 +544,18 @@ class SigRestClient:
             raise SigContextMismatchError(
                 method="GET", path=path, reason="context is not a tournament context"
             )
-        try:
-            reported_id = uuid.UUID(tournament.id)
-        except ValueError:
+        same_id = _same_uuid(tournament.id, expected.id)
+        if same_id is None:
             raise SigResponseError(
-                method="GET", path=path, reason="context tournament id is not a UUID"
-            ) from None
-        if reported_id != uuid.UUID(expected.id) or tournament.slug != expected.slug:
+                method="GET", path=path, reason="context tournament id is not a canonical UUID"
+            )
+        if not same_id or tournament.slug != expected.slug:
             raise SigContextMismatchError(
                 method="GET",
                 path=path,
                 reason=(
-                    f"context is tournament {tournament.slug!r} / {tournament.id!r}; "
-                    f"configured {expected.slug!r} / {expected.id!r}"
+                    "context names a different tournament than configured "
+                    f"({expected.slug} / {expected.id})"
                 ),
             )
 
@@ -472,7 +567,7 @@ class SigRestClient:
     def _check_levels(
         path: str, bids: list[OrderbookLevel], asks: list[OrderbookLevel], depth: int
     ) -> None:
-        # Documented: at most `depth` levels per side; bids descending, asks ascending.
+        # [documented] at most `depth` levels per side; bids descending, asks ascending.
         def bad(reason: str) -> SigResponseError:
             return SigResponseError(method="GET", path=path, reason=reason)
 
@@ -498,9 +593,12 @@ class SigRestClient:
 
         The Order schema carries no tournament id, so the scope cannot be echo-checked.
         """
+        # Every argument is validated before verification, so bad input sends nothing.
         status = _check_choice("status", status, ORDER_STATUSES)
         limit = _check_int("limit", limit, 1, ORDERS_PAGE_MAX)
         cursor = _check_cursor(cursor)
+        exchange_id = _check_optional_id("exchange_id", exchange_id)
+        market_id = _check_optional_id("market_id", market_id)
         await self.verify_tournament()
         path = "/orders"
         params: dict[str, str | int] = {
@@ -509,13 +607,14 @@ class SigRestClient:
             "tournamentId": self._config.tournament.id,
         }
         if exchange_id is not None:
-            params["exchangeId"] = _check_numeric_id("exchange_id", exchange_id)
+            params["exchangeId"] = exchange_id
         if market_id is not None:
-            params["marketId"] = _check_numeric_id("market_id", market_id)
+            params["marketId"] = market_id
         if cursor is not None:
             params["cursor"] = cursor
         page = await self._get_model(path, params, OrdersPage)
         self._check_page_size(path, len(page.data), limit)
+        # [client policy] an exchange filter must be honoured.
         if exchange_id is not None and any(o.exchangeId != exchange_id for o in page.data):
             raise SigResponseError(
                 method="GET", path=path, reason="orders from another exchange were returned"
@@ -531,7 +630,10 @@ class SigRestClient:
         page_limit: int = ORDERS_PAGE_MAX,
         max_pages: int = DEFAULT_MAX_PAGES,
     ) -> list[Order]:
-        """Every matching order, or SigPaginationError. Never a partial list."""
+        """Every matching order, or an error. Never a partial list.
+
+        Each page has its own read deadline; there is no deadline for the whole list.
+        """
         return await self._collect(
             "/orders",
             lambda cursor: self.list_orders_page(
@@ -549,6 +651,7 @@ class SigRestClient:
 
     @staticmethod
     def _check_page_size(path: str, count: int, limit: int) -> None:
+        # [documented] every response is a bounded page.
         if count > limit:
             raise SigResponseError(
                 method="GET", path=path, reason=f"page has {count} items, limit was {limit}"
@@ -562,6 +665,8 @@ class SigRestClient:
         max_pages: int,
         key: Callable[[Any], object],
     ) -> list[Any]:
+        # [documented] follow nextCursor while hasMore. [client policy] fail on a
+        # repeated cursor, a cursor on the last page, a duplicate item or the page cap.
         max_pages = _check_int("max_pages", max_pages, 1, 10_000)
 
         def fail(reason: str) -> SigPaginationError:
@@ -576,7 +681,8 @@ class SigRestClient:
             for item in page.data:
                 item_key = key(item)
                 if item_key in keys:
-                    raise fail(f"item {item_key!r} appeared on more than one page")
+                    # The item id is response data and is not repeated in the error.
+                    raise fail("an item appeared on more than one page")
                 keys.add(item_key)
                 items.append(item)
             has_more = page.pagination.hasMore
@@ -602,34 +708,54 @@ class SigRestClient:
         try:
             return model.model_validate(data)
         except ValidationError as exc:
-            problems = "; ".join(
-                f"{'.'.join(str(part) for part in error['loc']) or '<root>'}: {error['type']}"
-                for error in exc.errors(include_input=False, include_url=False)[:5]
-            )
-            raise SigResponseError(method="GET", path=path, reason=problems) from None
+            raise SigResponseError(
+                method="GET", path=path, reason=_validation_summary(exc)
+            ) from None
 
     async def _get_json(self, path: str, params: Mapping[str, str | int] | None) -> object:
-        """GET with read budgeting and the read retry policy. Private by design."""
+        """One logical GET under one overall deadline. Private by design."""
         method = "GET"
         deadline = self._clock() + self._retry.total_budget_s
-        attempt = 0
+        attempts = 0
+        last_error: SigApiError | SigTransportError | None = None
+
+        def expired(phase: str) -> SigDeadlineExceededError:
+            return SigDeadlineExceededError(
+                method=method, path=path, phase=phase, attempts=attempts, last_error=last_error
+            )
+
         while True:
             if self._closed:
                 raise SigClientClosedError("the SIG client is closed")
-            attempt += 1
-            await self._limiter.acquire(RequestKind.READ, deadline=deadline)
+            try:
+                await self._limiter.acquire(RequestKind.READ, deadline=deadline)
+            except SigRateBudgetError:
+                raise expired("rate admission") from None
+            attempts += 1
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                raise expired("request")
             error: SigApiError | SigTransportError
             wait_floor = 0.0
             try:
-                response = await self._send(method, path, params)
+                # Bounds sending, waiting and reading the body. External cancellation
+                # still propagates as CancelledError; only our own timeout is converted.
+                async with asyncio.timeout(remaining):
+                    response = await self._send(method, path, params)
+            except TimeoutError:
+                raise expired("request") from None
             except RETRYABLE_TRANSPORT_ERRORS as exc:
                 error = SigTransportError(method=method, path=path, kind=type(exc).__name__)
             except httpx.TransportError as exc:
                 raise SigTransportError(method=method, path=path, kind=type(exc).__name__) from None
             else:
+                if self._clock() >= deadline:
+                    raise expired("request")  # a late response is not returned
                 if 200 <= response.status_code < 300:
                     return self._decode(method, path, response)
-                valid, retry_after = _parse_retry_after(response.headers.get("Retry-After"))
+                valid, retry_after = _parse_retry_after(
+                    response.headers.get("Retry-After"), self._retry.max_retry_after_s
+                )
                 error = self._api_error(method, path, response, retry_after)
                 if not isinstance(error, (SigRateLimitedError, SigServiceUnavailableError)):
                     raise error
@@ -647,25 +773,30 @@ class SigRestClient:
                     logger.warning("SIG read not retried: unparseable Retry-After; %s", error)
                     raise error
 
-            if attempt >= self._retry.max_attempts:
-                raise SigRetryExhaustedError(
-                    reason="attempt limit reached", attempts=attempt, last_error=error
-                )
-            delay = max(wait_floor, self._jitter(self._retry.backoff(attempt)))
-            if self._clock() + delay > deadline:
-                raise SigRetryExhaustedError(
-                    reason=f"next retry in {delay:.2f}s would exceed the time budget",
-                    attempts=attempt,
-                    last_error=error,
-                )
+            last_error = error
+            if attempts >= self._retry.max_attempts:
+                raise SigRetryExhaustedError(attempts=attempts, last_error=error)
+            jittered = self._jitter(self._retry.backoff(attempts))
+            if (
+                isinstance(jittered, bool)
+                or not isinstance(jittered, (int, float))
+                or not math.isfinite(jittered)
+                or jittered < 0
+            ):
+                raise ValueError("jitter must return a finite, non-negative delay")
+            delay = max(wait_floor, float(jittered))
+            if self._clock() + delay >= deadline:
+                raise expired("retry wait")
             logger.warning(
                 "SIG read retry %d/%d in %.2fs: %s",
-                attempt,
+                attempts,
                 self._retry.max_attempts,
                 delay,
                 error,
             )
             await self._sleep(delay)
+            if self._clock() >= deadline:
+                raise expired("retry wait")  # the sleep overran the deadline
 
     async def _send(
         self, method: str, path: str, params: Mapping[str, str | int] | None
@@ -682,22 +813,27 @@ class SigRestClient:
         )
         return await self._http.send(request, follow_redirects=False)
 
+    @staticmethod
     def _api_error(
-        self, method: str, path: str, response: httpx.Response, retry_after: float | None
+        method: str, path: str, response: httpx.Response, retry_after: float | None
     ) -> SigApiError:
+        # Only the status, a documented code and a fixed description are kept. SIG's
+        # free-form message and any unknown code are response text and are dropped.
         status = response.status_code
         code: str | None = None
-        message = "non-JSON error body"
+        unrecognized = False
+        detail = "non-JSON error body"
         try:
             body = json.loads(response.content)
         except ValueError:
             body = None
         if isinstance(body, dict) and isinstance(body.get("error"), dict):
-            code = sanitize_code(body["error"].get("code"))
-            raw_message = body["error"].get("message")
-            message = raw_message if isinstance(raw_message, str) else "no message"
+            raw_code = body["error"].get("code")
+            code = known_code(raw_code)
+            unrecognized = code is None and raw_code is not None
+            detail = "error envelope"
         elif body is not None:
-            message = "error body without an error object"
+            detail = "error body without an error object"
         cls = _STATUS_ERRORS.get(status)
         if cls is None:
             cls = SigServerError if 500 <= status < 600 else SigUnexpectedStatusError
@@ -706,7 +842,8 @@ class SigRestClient:
             path=path,
             status=status,
             code=code,
-            message=sanitize_text(message, [self._config.api_key.reveal()]),
+            unrecognized_code=unrecognized,
+            detail=detail,
             retry_after=retry_after,
         )
 

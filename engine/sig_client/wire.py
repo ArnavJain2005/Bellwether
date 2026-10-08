@@ -46,6 +46,19 @@ WireNumber = Annotated[Decimal, BeforeValidator(_json_number)]
 WirePrice = Annotated[Decimal, BeforeValidator(_json_number), Field(ge=0, le=1)]
 """A price the spec documents as YES-normalized / within [0, 1], exactly as sent."""
 
+WirePositiveNumber = Annotated[Decimal, BeforeValidator(_json_number), Field(gt=0)]
+"""A finite JSON number strictly above 0, exactly as sent (fractions allowed)."""
+
+
+def _json_true(value: object) -> bool:
+    # Only the JSON literal `true` (Python True). Literal[True] alone would accept 1.
+    if value is not True:
+        raise PydanticCustomError("json_true", "expected the JSON boolean true")
+    return value
+
+
+JsonTrue = Annotated[bool, BeforeValidator(_json_true)]
+
 
 class WireModel(BaseModel):
     model_config = ConfigDict(strict=True, frozen=True, extra="ignore")
@@ -232,7 +245,8 @@ class Order(WireModel):
     exchangeId: str
     side: Literal["yes", "no"]
     action: Literal["buy", "sell"]
-    quantity: WireNumber
+    # "Always positive" (#/components/schemas/Order/properties/quantity); may be fractional.
+    quantity: WirePositiveNumber
     priceLimit: WireNumber | None
     open: bool
     createdAt: str
@@ -246,7 +260,7 @@ class OrderPagination(WireModel):
 
 
 class OrderCoverage(WireModel):
-    complete: Literal[True]
+    complete: JsonTrue  # documented as enum [true]
     projectedThroughSequence: int | None
 
 
