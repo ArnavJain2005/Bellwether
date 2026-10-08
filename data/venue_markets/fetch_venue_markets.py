@@ -9,6 +9,7 @@ Standard library only (Python 3.11+).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.client
 import json
 import os
@@ -294,6 +295,7 @@ def fetch_polymarket_markets(
     markets_by_id: dict[str, dict[str, Any]] = {}
     excluded_counts: dict[str, int] = {}
     seen_cursors: set[str] = set()
+    seen_pages: set[str] = set()
 
     next_cursor = ""
     while next_cursor != "LTE=":
@@ -338,6 +340,19 @@ def fetch_polymarket_markets(
         markets = data.get("data")
         if not isinstance(markets, list):
             raise FetchError(f"Polymarket malformed response at cursor {next_cursor}: expected 'data' to be a list")
+
+        # An entire non-empty page repeated under a different cursor means the server is not
+        # advancing; silently deduplicating would claim a complete retrieval that is not.
+        # (Ordinary overlap of some records between distinct pages is still accepted.)
+        if markets:
+            page_digest = hashlib.sha256(
+                json.dumps(markets, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()
+            if page_digest in seen_pages:
+                raise FetchError(
+                    f"Polymarket repeated page content served under different cursor {next_cursor!r}"
+                )
+            seen_pages.add(page_digest)
 
         for item in markets:
             m_id = item.get("condition_id")
@@ -407,11 +422,18 @@ def fetch_polymarket_markets(
             }
             markets_by_id[m_id] = market_record
 
-        returned_cursor = data.get("next_cursor")
-        if not returned_cursor or returned_cursor == next_cursor:
-            if returned_cursor != "LTE=":
-                raise FetchError(f"Polymarket pagination failed to progress. Cursor stuck at: {returned_cursor}")
+        if "next_cursor" not in data:
+            raise FetchError(f"Polymarket malformed response at cursor {next_cursor!r}: missing 'next_cursor'")
+        returned_cursor = data["next_cursor"]
+        if not isinstance(returned_cursor, str) or not returned_cursor:
+            raise FetchError(
+                f"Polymarket malformed response at cursor {next_cursor!r}: "
+                f"'next_cursor' must be a non-empty string, got {returned_cursor!r}"
+            )
+        if returned_cursor == "LTE=":
             break
+        if returned_cursor == next_cursor:
+            raise FetchError(f"Polymarket pagination failed to progress. Cursor stuck at: {returned_cursor}")
         next_cursor = returned_cursor
 
     return list(markets_by_id.values()), excluded_counts
@@ -519,12 +541,21 @@ def fetch_kalshi_markets(
 
         if page_data is None:
             raise FetchError(f"Failed to retrieve Kalshi page {page + 1} after retries")
+        if not isinstance(page_data, dict):
+            raise FetchError(f"Kalshi malformed response on page {page + 1}: expected JSON object")
 
         events = page_data.get("events")
         if not isinstance(events, list):
             raise FetchError(f"Kalshi malformed response on page {page + 1}: expected 'events' list")
 
-        new_cursor = page_data.get("cursor") or ""
+        if "cursor" not in page_data:
+            raise FetchError(f"Kalshi malformed response on page {page + 1}: missing 'cursor'")
+        new_cursor = page_data["cursor"]
+        if not isinstance(new_cursor, str):
+            raise FetchError(
+                f"Kalshi malformed response on page {page + 1}: "
+                f"'cursor' must be a string, got {type(new_cursor).__name__}"
+            )
         page += 1
 
         for ev in events:
