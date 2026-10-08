@@ -1,0 +1,19 @@
+{
+  "provenance": "synthetic, spec-derived: property examples; description/startDate/endDate are placeholders",
+  "openapi": ["#/paths/~1tournaments~1{slug}/get/responses/200/content/application~1json/schema"],
+  "body": {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "slug": "alpha-tournament",
+    "name": "Alpha Tournament",
+    "description": null,
+    "status": "active",
+    "startDate": "2026-10-01T16:00:00.000Z",
+    "endDate": null,
+    "initialBalance": 1000,
+    "currencyName": "coins",
+    "memberCount": 12,
+    "marketCount": 5,
+    "myBalance": 847.5,
+    "isPendingEnrolment": false
+  }
+}

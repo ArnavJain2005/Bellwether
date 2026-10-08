@@ -1,0 +1,19 @@
+{
+  "provenance": "synthetic, spec-derived: ids, depth, asOf and level examples; levels 0.405/0.535 and the matching bestAsk/spread are placeholders",
+  "openapi": [
+    "#/paths/~1exchanges~1{id}~1orderbook/get/responses/200/content/application~1json/schema",
+    "#/components/schemas/BookVersion",
+    "#/components/schemas/ExchangeOrderbookLevel"
+  ],
+  "body": {
+    "exchangeId": "36",
+    "marketId": "26",
+    "asOf": {"sequence": 4817, "at": "2026-09-28T09:15:02.125+00:00"},
+    "depth": 20,
+    "bids": [{"price": 0.41, "quantity": 300}, {"price": 0.405, "quantity": 12.5}],
+    "asks": [{"price": 0.535, "quantity": 300}, {"price": 0.55, "quantity": 600}],
+    "bestBid": 0.41,
+    "bestAsk": 0.535,
+    "spread": 0.125
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "provenance": "synthetic, spec-derived: order 1001 and coverage from examples; order 1002 is a placeholder with null priceLimit and an expirationDate",
+  "openapi": [
+    "#/paths/~1orders/get/responses/200/content/application~1json/schema",
+    "#/components/schemas/Order",
+    "#/components/schemas/OrderPagination"
+  ],
+  "body": {
+    "data": [
+      {"id": 1001, "exchangeId": "36", "side": "yes", "action": "buy", "quantity": 100, "priceLimit": 0.42, "open": true, "createdAt": "2025-06-14T12:00:00.000Z", "expirationDate": null},
+      {"id": 1002, "exchangeId": "36", "side": "no", "action": "sell", "quantity": 7.5, "priceLimit": null, "open": false, "createdAt": "2025-06-14T12:01:00.000Z", "expirationDate": "2025-06-15T00:00:00.000Z"}
+    ],
+    "pagination": {"limit": 200, "hasMore": false, "nextCursor": null},
+    "coverage": {"complete": true, "projectedThroughSequence": 184233}
+  }
+}

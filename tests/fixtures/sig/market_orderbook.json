@@ -1,0 +1,50 @@
+{
+  "provenance": "synthetic, spec-derived: exchange, level, overround, asOf and tournament-context examples; the context id/slug are set to match tournament.json",
+  "openapi": [
+    "#/paths/~1markets~1{id}~1orderbook/get/responses/200/content/application~1json/schema",
+    "#/components/schemas/CombinedMarketOrderbook",
+    "#/components/schemas/CombinedOrderbookExchange",
+    "#/components/schemas/MarketOrderbookContext",
+    "#/components/schemas/MarketTournamentContext"
+  ],
+  "body": {
+    "exchanges": [
+      {
+        "exchangeId": "36",
+        "option": "YES",
+        "asOf": {"sequence": 4817, "at": "2026-09-28T09:15:02.125+00:00"},
+        "impliedProbability": 0.55,
+        "bids": [{"price": 0.41, "quantity": 300}],
+        "asks": [{"price": 0.55, "quantity": 600}]
+      }
+    ],
+    "overround": 1.05,
+    "hasArbitrageOpportunity": false,
+    "contexts": [
+      {
+        "type": "tournament",
+        "tournament": {
+          "id": "550e8400-e29b-41d4-a716-446655440000",
+          "slug": "alpha-tournament",
+          "name": "SIG Quarterly Season",
+          "currencyName": "SIG Coins",
+          "isOngoingPlay": false
+        },
+        "orderbook": {
+          "exchanges": [
+            {
+              "exchangeId": "36",
+              "option": "YES",
+              "asOf": null,
+              "impliedProbability": 0.55,
+              "bids": [{"price": 0.41, "quantity": 300}],
+              "asks": [{"price": 0.55, "quantity": 600}]
+            }
+          ],
+          "overround": null,
+          "hasArbitrageOpportunity": false
+        }
+      }
+    ]
+  }
+}
