@@ -9,7 +9,6 @@ Standard library only (Python 3.11+).
 from __future__ import annotations
 
 import argparse
-import hashlib
 import http.client
 import json
 import os
@@ -285,6 +284,27 @@ def is_2026_kalshi_market(m: dict[str, Any], ev: dict[str, Any], is_primary_matc
 # Polymarket Fetcher
 # =====================================================================
 
+def _page_identity_signature(markets: list[Any]) -> tuple[Any, ...] | None:
+    """Canonical signature of a raw Polymarket page, independent of order, prices and metadata.
+
+    Built from the stable ``condition_id`` of every record on the page, before any eligibility
+    filtering. The number of records without a usable id is included so pages that differ only
+    in unidentifiable records stay distinct. Returns None when no record carries an id, since
+    such a page has no identity to compare.
+    """
+    ids: list[str] = []
+    unidentified = 0
+    for item in markets:
+        m_id = item.get("condition_id") if isinstance(item, dict) else None
+        if isinstance(m_id, str) and m_id.strip() and m_id != "None":
+            ids.append(m_id)
+        else:
+            unidentified += 1
+    if not ids:
+        return None
+    return (tuple(sorted(ids)), unidentified)
+
+
 def fetch_polymarket_markets(
     rate_limiter: RateLimiter,
     base_url: str = "https://clob.polymarket.com/markets",
@@ -295,7 +315,7 @@ def fetch_polymarket_markets(
     markets_by_id: dict[str, dict[str, Any]] = {}
     excluded_counts: dict[str, int] = {}
     seen_cursors: set[str] = set()
-    seen_pages: set[str] = set()
+    seen_pages: set[tuple[Any, ...]] = set()
 
     next_cursor = ""
     while next_cursor != "LTE=":
@@ -343,16 +363,16 @@ def fetch_polymarket_markets(
 
         # An entire non-empty page repeated under a different cursor means the server is not
         # advancing; silently deduplicating would claim a complete retrieval that is not.
-        # (Ordinary overlap of some records between distinct pages is still accepted.)
-        if markets:
-            page_digest = hashlib.sha256(
-                json.dumps(markets, sort_keys=True, default=str).encode("utf-8")
-            ).hexdigest()
-            if page_digest in seen_pages:
+        # Identity is the set of raw condition_ids, so reordering or changed prices/metadata
+        # cannot hide a replay. (Ordinary overlap of some records between distinct pages is
+        # still accepted.)
+        page_signature = _page_identity_signature(markets)
+        if page_signature is not None:
+            if page_signature in seen_pages:
                 raise FetchError(
                     f"Polymarket repeated page content served under different cursor {next_cursor!r}"
                 )
-            seen_pages.add(page_digest)
+            seen_pages.add(page_signature)
 
         for item in markets:
             m_id = item.get("condition_id")

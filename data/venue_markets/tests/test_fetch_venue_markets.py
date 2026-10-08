@@ -609,6 +609,44 @@ def _poly_repeated_page_later(poly: dict, _k: dict) -> None:
     poly["c3"] = {"data": copy.deepcopy(poly[""]["data"]), "next_cursor": "LTE="}
 
 
+def _reversed_records(records: list[dict]) -> list[dict]:
+    return list(reversed(records))
+
+
+def _repriced_records(records: list[dict]) -> list[dict]:
+    records[0]["tokens"][0]["price"] = 0.99
+    return records
+
+
+def _remetadata_records(records: list[dict]) -> list[dict]:
+    for record in records:
+        record["description"] = "edited resolution text"
+        record["end_date_iso"] = "2026-12-31T00:00:00Z"
+    return records
+
+
+def _reordered_and_repriced_records(records: list[dict]) -> list[dict]:
+    return _repriced_records(_reversed_records(records))
+
+
+def _poly_replay_adjacent(transform):
+    """c2 replays the first page (same condition_ids) after `transform`."""
+    def mutate(poly: dict, _k: dict) -> None:
+        poly["c2"]["data"] = transform(copy.deepcopy(poly[""]["data"]))
+    return mutate
+
+
+def _poly_replay_non_adjacent(transform):
+    """c2 stays distinct; c3 replays the first page after `transform` and ends with LTE=."""
+    def mutate(poly: dict, _k: dict) -> None:
+        poly["c2"]["next_cursor"] = "c3"
+        poly["c3"] = {
+            "data": transform(copy.deepcopy(poly[""]["data"])),
+            "next_cursor": "LTE=",
+        }
+    return mutate
+
+
 POLY_FAILURES = [
     pytest.param(_poly_pop("c2", "next_cursor"), [None, "c2"], "missing 'next_cursor'", id="missing-cursor"),
     pytest.param(_poly_set("", "next_cursor", None), [None], "'next_cursor' must be a non-empty string", id="null-cursor-first-page"),
@@ -624,6 +662,13 @@ POLY_FAILURES = [
     pytest.param(_poly_cycle, [None, "c2", "c3"], "pagination loop detected: repeated cursor c2", id="nonconsecutive-cursor-cycle"),
     pytest.param(_poly_repeated_page_adjacent, [None, "c2"], "repeated page content", id="whole-page-repeated-under-new-cursor"),
     pytest.param(_poly_repeated_page_later, [None, "c2", "c3"], "repeated page content", id="whole-page-repeated-non-adjacent"),
+    pytest.param(_poly_replay_adjacent(_reversed_records), [None, "c2"], "repeated page content", id="reordered-replay-adjacent"),
+    pytest.param(_poly_replay_adjacent(_repriced_records), [None, "c2"], "repeated page content", id="changed-price-replay-adjacent"),
+    pytest.param(_poly_replay_adjacent(_remetadata_records), [None, "c2"], "repeated page content", id="changed-metadata-replay-adjacent"),
+    pytest.param(_poly_replay_non_adjacent(_reversed_records), [None, "c2", "c3"], "repeated page content", id="reordered-replay-non-adjacent"),
+    pytest.param(_poly_replay_non_adjacent(_repriced_records), [None, "c2", "c3"], "repeated page content", id="changed-price-replay-non-adjacent"),
+    pytest.param(_poly_replay_non_adjacent(_remetadata_records), [None, "c2", "c3"], "repeated page content", id="changed-metadata-replay-non-adjacent"),
+    pytest.param(_poly_replay_non_adjacent(_reordered_and_repriced_records), [None, "c2", "c3"], "repeated page content", id="reordered-and-repriced-replay-non-adjacent"),
 ]
 
 
@@ -665,6 +710,52 @@ def test_main_polymarket_empty_terminal_page_succeeds(
     poly = _valid_poly()
     poly["c2"]["next_cursor"] = "c3"
     poly["c3"] = {"data": [], "next_cursor": "LTE="}
+    env = _install(tmp_path, monkeypatch, poly, _valid_kalshi())
+    code, _out, _err = _run_main(capsys)
+
+    assert env.poly_cursors == [None, "c2", "c3"]
+    _assert_success(env, code, POLY_IDS, KALSHI_IDS)
+
+
+def test_main_polymarket_reordered_partial_overlap_on_later_page_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Half of an earlier page re-served (reordered) alongside new records is ordinary overlap."""
+    poly = _valid_poly()
+    poly["c2"]["next_cursor"] = "c3"
+    poly["c3"] = {
+        "data": _reversed_records(copy.deepcopy(poly[""]["data"][:30])) + _poly_seats(120, 5),
+        "next_cursor": "LTE=",
+    }
+    env = _install(tmp_path, monkeypatch, poly, _valid_kalshi())
+    code, _out, _err = _run_main(capsys)
+
+    assert env.poly_cursors == [None, "c2", "c3"]
+    _assert_success(env, code, POLY_IDS | {f"poly-seat-{i}" for i in range(120, 125)}, KALSHI_IDS)
+
+
+def _poly_closed(start: int, count: int) -> list[dict]:
+    records = _poly_seats(start, count)
+    for record in records:
+        record["condition_id"] = record["condition_id"].replace("seat", "closed")
+        record["closed"] = True
+    return records
+
+
+def test_main_polymarket_distinct_raw_pages_with_identical_eligible_records_succeed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Identity is taken from the raw page, before eligibility filtering.
+
+    Pages 1 and 2 differ only in their (ineligible, closed) records, so they are NOT a repeated
+    page even though their eligible records are identical.
+    """
+    eligible = _poly_controls() + _poly_seats(0, 60)
+    poly = {
+        "": {"data": copy.deepcopy(eligible) + _poly_closed(900, 3), "next_cursor": "c2"},
+        "c2": {"data": copy.deepcopy(eligible) + _poly_closed(903, 3), "next_cursor": "c3"},
+        "c3": {"data": _poly_seats(60, 60), "next_cursor": "LTE="},
+    }
     env = _install(tmp_path, monkeypatch, poly, _valid_kalshi())
     code, _out, _err = _run_main(capsys)
 
