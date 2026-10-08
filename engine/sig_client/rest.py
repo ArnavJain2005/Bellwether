@@ -29,17 +29,23 @@ Deadlines and retries (ReadRetryPolicy):
 - Separate budgets: the one-time tournament verification is its own logical read, and
   so is every page of a collection. There is no collection-wide deadline: a full
   collection may take up to `max_pages` budgets, plus one for verification.
-- The request phase is bounded with `asyncio.timeout` for the time remaining on the
-  injected clock. In production the injected clock is `time.monotonic`, the same clock
-  the event loop uses.
+- Every await in a logical read (rate admission, the request, each retry sleep) runs
+  under `asyncio.timeout` for the time remaining on the injected clock, so a wait that
+  never returns is still cut off. Clock checks after each await stay as a second line
+  of defence. In production the injected clock is `time.monotonic`, the clock the event
+  loop's timers use.
 - Retried: HTTP 429 and 503 (documented transient), and the transport failures in
   RETRYABLE_TRANSPORT_ERRORS. Everything else is raised at once.
 - Each attempt consumes read budget. The delay is the larger of Retry-After and a
   jittered exponential backoff, so a retry never comes earlier than SIG instructed.
-  Retry-After values above `max_retry_after_s` are capped there, so nothing infinite
-  reaches a sleep or cooldown. An unparseable Retry-After is not retried.
-- A 429 also imposes a read cooldown on the rate limiter, which every client sharing
-  that limiter observes.
+  Retry-After is never shortened: it is parsed exactly and rounded up to a float. A wait
+  that does not fit in the remaining budget ends the read; it is not trimmed.
+- A 429 imposes its full Retry-After as a cooldown on the rate limiter. The cooldown
+  outlives the call and applies to every client sharing that limiter. A 429 with no
+  Retry-After, or an unparseable one, uses the documented 60 s. A valid number too
+  large to hold safely (above MAX_COOLDOWN_SECONDS) blocks automatic read admission
+  until RateLimiter.clear_block(); it never becomes infinity or a shorter wait.
+- An unparseable or oversized Retry-After is never retried automatically.
 These rules are for reads only. They say nothing about retrying orders or cancels.
 
 Response checks are labelled in the code as [documented] when the spec states the
@@ -49,6 +55,7 @@ property, or [client policy] when it is an extra consistency check of ours.
 from __future__ import annotations
 
 import asyncio
+import functools
 import itertools
 import json
 import logging
@@ -58,7 +65,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any, Protocol, Self, TypeVar
 from urllib.parse import quote
 
@@ -88,6 +95,7 @@ from engine.sig_client.errors import (
     known_code,
 )
 from engine.sig_client.rate_limiter import (
+    MAX_COOLDOWN_SECONDS,
     Clock,
     RateLimiter,
     RequestKind,
@@ -122,7 +130,7 @@ DEFAULT_MAX_PAGES = 50
 
 # All token patterns are applied with fullmatch(); `$` with match() accepts a final "\n".
 _NUMERIC_ID = re.compile(r"[0-9]+")
-_RETRY_AFTER = re.compile(r"[0-9]{1,32}(\.[0-9]{1,32})?")
+_RETRY_AFTER = re.compile(r"[0-9]+(\.[0-9]+)?")
 _UUID_TEXT = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
@@ -158,10 +166,9 @@ class ReadRetryPolicy:
     total_budget_s: float = 30.0
     base_backoff_s: float = 0.25
     max_backoff_s: float = 4.0
-    # Used when a 429 carries no usable Retry-After; the spec documents `Retry-After: 60`.
+    # Cooldown for a 429 with no Retry-After or an unparseable one; the spec documents
+    # `Retry-After: 60`. A valid server value is always used as sent, never this.
     rate_limited_default_wait_s: float = 60.0
-    # Ceiling for any Retry-After honoured as a wait or cooldown.
-    max_retry_after_s: float = 3600.0
 
     def __post_init__(self) -> None:
         check_positive_int("max_attempts", self.max_attempts)
@@ -170,13 +177,12 @@ class ReadRetryPolicy:
             "base_backoff_s",
             "max_backoff_s",
             "rate_limited_default_wait_s",
-            "max_retry_after_s",
         ):
             check_positive_seconds(name, getattr(self, name))
         if self.base_backoff_s > self.max_backoff_s:
             raise ValueError("base_backoff_s must not exceed max_backoff_s")
-        if self.rate_limited_default_wait_s > self.max_retry_after_s:
-            raise ValueError("rate_limited_default_wait_s must not exceed max_retry_after_s")
+        if self.rate_limited_default_wait_s > MAX_COOLDOWN_SECONDS:
+            raise ValueError("rate_limited_default_wait_s must not exceed MAX_COOLDOWN_SECONDS")
 
     def backoff(self, attempt: int) -> float:
         # The exponent is capped so a large attempt number cannot overflow.
@@ -193,6 +199,7 @@ class _Page(Protocol):
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 PageT = TypeVar("PageT", bound=_Page)
+T = TypeVar("T")
 
 _STATUS_ERRORS: dict[int, type[SigApiError]] = {
     400: SigBadRequestError,
@@ -209,22 +216,44 @@ def _reject_constant(name: str) -> None:
     raise ValueError(f"non-finite JSON constant {name}")
 
 
-def _parse_retry_after(value: str | None, cap: float) -> tuple[bool, float | None]:
-    """(valid, seconds). Only delta-seconds is accepted, not an HTTP-date.
+@dataclass(frozen=True)
+class _RetryAfter:
+    """A parsed Retry-After header. All flags False and `seconds` None means absent."""
 
-    Parsed exactly with Decimal and capped at `cap`, so an enormous value can never
-    become an infinite float.
+    seconds: float | None = None
+    malformed: bool = False
+    oversized: bool = False
+
+
+_MAX_COOLDOWN_DIGITS = len(str(int(MAX_COOLDOWN_SECONDS)))
+
+
+def _not_shorter(seconds: Decimal) -> float:
+    """The nearest float that is not below `seconds` (float() alone may round down)."""
+    value = float(seconds)
+    if Decimal(value) < seconds:
+        value = math.nextafter(value, math.inf)
+    return value
+
+
+def _parse_retry_after(value: str | None) -> _RetryAfter:
+    """Delta-seconds only (no HTTP-date support). Never shortens the server's wait.
+
+    A valid number above MAX_COOLDOWN_SECONDS is reported as oversized. It is not
+    clamped, not converted to infinity, and not replaced with a default.
     """
     if value is None:
-        return True, None
-    value = value.strip()
-    if not _RETRY_AFTER.fullmatch(value):
-        return False, None
-    try:
-        seconds = Decimal(value)
-    except InvalidOperation:  # pragma: no cover - the pattern already guarantees digits
-        return False, None
-    return True, float(min(seconds, Decimal(str(cap))))
+        return _RetryAfter()
+    text = value.strip()
+    if not _RETRY_AFTER.fullmatch(text):
+        return _RetryAfter(malformed=True)
+    # Cheap length test first, so a huge digit string is never converted at all.
+    if len(text.partition(".")[0].lstrip("0")) > _MAX_COOLDOWN_DIGITS:
+        return _RetryAfter(oversized=True)
+    seconds = Decimal(text)
+    if seconds > Decimal(int(MAX_COOLDOWN_SECONDS)):
+        return _RetryAfter(oversized=True)
+    return _RetryAfter(seconds=_not_shorter(seconds))
 
 
 def _check_int(name: str, value: object, low: int, high: int) -> int:
@@ -724,26 +753,43 @@ class SigRestClient:
                 method=method, path=path, phase=phase, attempts=attempts, last_error=last_error
             )
 
+        async def within_deadline(phase: str, start: Callable[[], Awaitable[T]]) -> T:
+            # Actively bounds one await by the time left on the injected clock, so an
+            # await that never returns is still cut off. Only this scope's own timeout
+            # becomes a deadline error; external cancellation propagates unchanged, and
+            # a TimeoutError raised by the awaited code itself is re-raised as is.
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                raise expired(phase)
+            scope = asyncio.timeout(remaining)
+            try:
+                async with scope:
+                    return await start()
+            except TimeoutError:
+                if scope.expired():
+                    raise expired(phase) from None
+                raise
+
         while True:
             if self._closed:
                 raise SigClientClosedError("the SIG client is closed")
             try:
-                await self._limiter.acquire(RequestKind.READ, deadline=deadline)
+                # A cancelled admission consumes no token: the limiter admits only in a
+                # synchronous step after its wait, and keeps no queue of waiters.
+                await within_deadline(
+                    "rate admission",
+                    functools.partial(self._limiter.acquire, RequestKind.READ, deadline=deadline),
+                )
             except SigRateBudgetError:
                 raise expired("rate admission") from None
             attempts += 1
-            remaining = deadline - self._clock()
-            if remaining <= 0:
-                raise expired("request")
             error: SigApiError | SigTransportError
             wait_floor = 0.0
             try:
-                # Bounds sending, waiting and reading the body. External cancellation
-                # still propagates as CancelledError; only our own timeout is converted.
-                async with asyncio.timeout(remaining):
-                    response = await self._send(method, path, params)
-            except TimeoutError:
-                raise expired("request") from None
+                # Covers sending, waiting for and reading the whole body.
+                response = await within_deadline(
+                    "request", functools.partial(self._send, method, path, params)
+                )
             except RETRYABLE_TRANSPORT_ERRORS as exc:
                 error = SigTransportError(method=method, path=path, kind=type(exc).__name__)
             except httpx.TransportError as exc:
@@ -753,24 +799,28 @@ class SigRestClient:
                     raise expired("request")  # a late response is not returned
                 if 200 <= response.status_code < 300:
                     return self._decode(method, path, response)
-                valid, retry_after = _parse_retry_after(
-                    response.headers.get("Retry-After"), self._retry.max_retry_after_s
-                )
+                retry_after = _parse_retry_after(response.headers.get("Retry-After"))
                 error = self._api_error(method, path, response, retry_after)
                 if not isinstance(error, (SigRateLimitedError, SigServiceUnavailableError)):
                     raise error
                 if isinstance(error, SigRateLimitedError):
-                    # A missing or unreadable Retry-After falls back to the documented 60 s.
-                    wait_floor = (
-                        retry_after
-                        if retry_after is not None
-                        else self._retry.rate_limited_default_wait_s
-                    )
-                    self._limiter.impose_cooldown(RequestKind.READ, wait_floor)
-                elif retry_after is not None:
-                    wait_floor = retry_after
-                if not valid:
-                    logger.warning("SIG read not retried: unparseable Retry-After; %s", error)
+                    if retry_after.oversized:
+                        # Too long to hold as a deadline: stop, never resume early.
+                        self._limiter.block(RequestKind.READ)
+                    else:
+                        # The server's value as sent; the documented 60 s only when the
+                        # header is missing or unparseable.
+                        wait_floor = (
+                            retry_after.seconds
+                            if retry_after.seconds is not None
+                            else self._retry.rate_limited_default_wait_s
+                        )
+                        self._limiter.impose_cooldown(RequestKind.READ, wait_floor)
+                elif retry_after.seconds is not None:
+                    wait_floor = retry_after.seconds
+                if retry_after.malformed or retry_after.oversized:
+                    kind = "oversized" if retry_after.oversized else "unparseable"
+                    logger.warning("SIG read not retried: %s Retry-After; %s", kind, error)
                     raise error
 
             last_error = error
@@ -794,7 +844,7 @@ class SigRestClient:
                 delay,
                 error,
             )
-            await self._sleep(delay)
+            await within_deadline("retry wait", functools.partial(self._sleep, delay))
             if self._clock() >= deadline:
                 raise expired("retry wait")  # the sleep overran the deadline
 
@@ -815,7 +865,7 @@ class SigRestClient:
 
     @staticmethod
     def _api_error(
-        method: str, path: str, response: httpx.Response, retry_after: float | None
+        method: str, path: str, response: httpx.Response, retry_after: _RetryAfter
     ) -> SigApiError:
         # Only the status, a documented code and a fixed description are kept. SIG's
         # free-form message and any unknown code are response text and are dropped.
@@ -844,7 +894,8 @@ class SigRestClient:
             code=code,
             unrecognized_code=unrecognized,
             detail=detail,
-            retry_after=retry_after,
+            retry_after=retry_after.seconds,
+            retry_after_oversized=retry_after.oversized,
         )
 
     @staticmethod

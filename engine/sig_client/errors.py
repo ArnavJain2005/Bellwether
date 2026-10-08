@@ -73,6 +73,10 @@ class SigApiError(SigClientError):
     `code` is a documented SIG code or None. `unrecognized_code` is True when the body
     carried some other code; its value is deliberately not kept. `detail` is a fixed
     client-written description of the body's shape, never SIG's text.
+
+    `retry_after` is the server's numeric Retry-After in seconds, never rounded down, or
+    None. `retry_after_oversized` is True when the header was a valid number too large
+    to hold safely (above MAX_COOLDOWN_SECONDS); `retry_after` is then None.
     """
 
     def __init__(
@@ -85,6 +89,7 @@ class SigApiError(SigClientError):
         unrecognized_code: bool,
         detail: str,
         retry_after: float | None = None,
+        retry_after_oversized: bool = False,
     ) -> None:
         self.method = method
         self.path = path
@@ -93,6 +98,7 @@ class SigApiError(SigClientError):
         self.unrecognized_code = unrecognized_code
         self.detail = detail
         self.retry_after = retry_after
+        self.retry_after_oversized = retry_after_oversized
         shown = code or ("<unrecognized code>" if unrecognized_code else "-")
         super().__init__(f"{method} {path} -> HTTP {status} {shown}: {detail}")
 
