@@ -40,6 +40,11 @@ WINDOW_SECONDS = 60.0
 # hair short of the instant a slot frees up. Deadline checks include it.
 SLEEP_PAD = 1e-6
 
+# The longest cooldown held as a clock offset (about 31.7 years). A server wait longer
+# than this cannot be represented safely as a float deadline, so callers use block()
+# instead: automatic admission then stops until clear_block() is called.
+MAX_COOLDOWN_SECONDS = 1e9
+
 Clock = Callable[[], float]
 Sleep = Callable[[float], Awaitable[None]]
 
@@ -82,6 +87,7 @@ class _Budget:
         self._refilled_at: float | None = None
         self._admitted: deque[float] = deque()
         self.cooldown_until = float("-inf")
+        self.blocked = False
 
     def wait_time(self, now: float) -> float:
         """Seconds until one admission is allowed; 0 if allowed now. Updates state."""
@@ -157,6 +163,10 @@ class RateLimiter:
             raise ValueError("deadline must be a finite clock value or None")
         budget = self._budgets[kind]
         while True:
+            if budget.blocked:
+                raise SigRateBudgetError(
+                    f"{kind} admission is blocked until clear_block() is called"
+                )
             now = self._clock()
             if deadline is not None and now >= deadline:
                 raise SigRateBudgetError(f"{kind} admission deadline has passed")
@@ -171,16 +181,37 @@ class RateLimiter:
             await self._sleep(wait + SLEEP_PAD)
 
     def impose_cooldown(self, kind: RequestKind, seconds: float) -> None:
-        """Block every `kind` admission for `seconds` (after a 429). Never shortens one."""
+        """Hold every `kind` admission for `seconds` (after a 429). Never shortens one.
+
+        The cooldown lives in the limiter, so it outlasts the call that imposed it and
+        applies to every client sharing this limiter. `seconds` must be finite, at least
+        0 and at most MAX_COOLDOWN_SECONDS; use block() for anything longer.
+        """
         if (
             isinstance(seconds, bool)
             or not isinstance(seconds, (int, float))
             or not math.isfinite(seconds)
-            or seconds < 0
+            or not 0 <= seconds <= MAX_COOLDOWN_SECONDS
         ):
-            raise ValueError("cooldown must be a finite number of seconds, at least 0")
+            raise ValueError(
+                "cooldown must be a finite number of seconds from 0 to MAX_COOLDOWN_SECONDS"
+            )
         budget = self._budgets[kind]
         budget.cooldown_until = max(budget.cooldown_until, self._clock() + seconds)
+
+    def block(self, kind: RequestKind) -> None:
+        """Stop all automatic `kind` admission until clear_block() (oversized server wait).
+
+        Every acquire() then raises SigRateBudgetError at once, whatever its deadline.
+        """
+        self._budgets[kind].blocked = True
+
+    def clear_block(self, kind: RequestKind) -> None:
+        """Resume `kind` admission after a block(). Any cooldown still applies."""
+        self._budgets[kind].blocked = False
+
+    def is_blocked(self, kind: RequestKind) -> bool:
+        return self._budgets[kind].blocked
 
     def used(self, kind: RequestKind) -> int:
         """Admissions of `kind` inside the current rolling window."""

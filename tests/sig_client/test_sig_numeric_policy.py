@@ -20,12 +20,11 @@ from sig_testkit import (
 
 from engine.config import ApiKey, ConfigError, SigConfig
 from engine.sig_client.errors import (
-    SigDeadlineExceededError,
-    SigRateLimitedError,
     SigRetryExhaustedError,
     SigServiceUnavailableError,
 )
 from engine.sig_client.rate_limiter import (
+    MAX_COOLDOWN_SECONDS,
     READ_LIMIT_PER_MINUTE,
     WRITE_LIMIT_PER_MINUTE,
     RateLimiter,
@@ -111,13 +110,7 @@ def test_max_attempts_must_be_a_positive_integer(value: Any) -> None:
 
 @pytest.mark.parametrize(
     "name",
-    [
-        "total_budget_s",
-        "base_backoff_s",
-        "max_backoff_s",
-        "rate_limited_default_wait_s",
-        "max_retry_after_s",
-    ],
+    ["total_budget_s", "base_backoff_s", "max_backoff_s", "rate_limited_default_wait_s"],
 )
 @pytest.mark.parametrize("value", BAD_SECONDS)
 def test_policy_times_must_be_finite_and_positive(name: str, value: Any) -> None:
@@ -129,7 +122,12 @@ def test_policy_cross_field_rules() -> None:
     with pytest.raises(ValueError, match="base_backoff_s"):
         ReadRetryPolicy(base_backoff_s=5.0, max_backoff_s=4.0)
     with pytest.raises(ValueError, match="rate_limited_default_wait_s"):
-        ReadRetryPolicy(rate_limited_default_wait_s=120.0, max_retry_after_s=60.0)
+        ReadRetryPolicy(rate_limited_default_wait_s=MAX_COOLDOWN_SECONDS * 2)
+
+
+def test_policy_no_longer_has_a_retry_after_cap() -> None:
+    with pytest.raises(TypeError):
+        ReadRetryPolicy(max_retry_after_s=3600.0)  # type: ignore[call-arg]
 
 
 def test_backoff_cannot_overflow() -> None:
@@ -157,47 +155,16 @@ def test_invalid_jitter_output_never_reaches_sleep(value: Any) -> None:
     assert clock.sleeps == []
 
 
-# --- Retry-After overflow -----------------------------------------------------------
+# --- malformed Retry-After (oversized values: test_sig_retry_after.py) --------------
 
 
-def test_huge_retry_after_on_429_is_capped_for_the_cooldown() -> None:
-    huge = "9" * 32
-    client, _, clock = make_client(
-        Router({BOOK: [json_response(429, error_body("RATE_LIMITED"), {"Retry-After": huge}), OK]})
-    )
-
-    async def scenario() -> None:
-        with pytest.raises(SigDeadlineExceededError) as info:
-            await client.get_exchange_orderbook("36")
-        last = info.value.last_error
-        assert isinstance(last, SigRateLimitedError)
-        assert last.retry_after == 3600.0 and math.isfinite(last.retry_after)
-        cooldown = client._limiter._budgets[RequestKind.READ].cooldown_until
-        assert math.isfinite(cooldown) and cooldown == pytest.approx(clock() + 3600.0)
-        assert clock.sleeps == []
-        clock.now += 3600.0  # once the capped cooldown has passed, reads resume
-        assert (await client.get_exchange_orderbook("36")).exchangeId == "36"
-
-    run(scenario())
-
-
-def test_huge_retry_after_on_503_is_capped_and_not_slept() -> None:
-    body = json_response(503, error_body("SERVICE_UNAVAILABLE"), {"Retry-After": "9" * 32})
-    client, _, clock = make_client(Router({BOOK: [body, OK]}))
-    with pytest.raises(SigDeadlineExceededError) as info:
-        run(client.get_exchange_orderbook("36"))
-    assert info.value.phase == "retry wait"
-    assert info.value.last_error.retry_after == 3600.0
-    assert clock.sleeps == []
-
-
-@pytest.mark.parametrize("value", ["9" * 33, "1e999", "inf", "nan", "1.5e3", "-0", "5s"])
+@pytest.mark.parametrize("value", ["1e999", "inf", "nan", "1.5e3", "-0", "5s", ".5", "5."])
 def test_out_of_format_retry_after_is_not_retried(value: str) -> None:
     body = json_response(503, error_body("SERVICE_UNAVAILABLE"), {"Retry-After": value})
     client, router, clock = make_client(Router({BOOK: [body, OK]}))
     with pytest.raises(SigServiceUnavailableError) as info:
         run(client.get_exchange_orderbook("36"))
-    assert info.value.retry_after is None
+    assert info.value.retry_after is None and info.value.retry_after_oversized is False
     assert router.count("/exchanges/36/orderbook") == 1 and clock.sleeps == []
 
 
