@@ -1,0 +1,336 @@
+{
+  "format": "bellwether.sig-capture/1",
+  "provenance": {
+    "kind": "recorded",
+    "detail": "genuine responses recorded from SIG by this recorder; unreviewed"
+  },
+  "run": {
+    "id": "20261009T122244Z-fa008a",
+    "status": "succeeded",
+    "stop_reason": null,
+    "started_at": "2026-10-09T12:22:44.457Z",
+    "finished_at": "2026-10-09T12:23:01.003Z"
+  },
+  "code": {
+    "recorder_version": "1",
+    "git_commit": "a42cfb46afaa9a78debef1e6470c2dec17148355",
+    "git_dirty": false
+  },
+  "spec": {
+    "path": "docs/api/openapi.json",
+    "sha256": "7c69b360539b50ea3f996734b1f231a14cdaee899bce8e5c868827e479f053f3",
+    "version": "1.0.0"
+  },
+  "target": {
+    "base_url": "https://www.thesuper.market/api/v1",
+    "tournament": {
+      "slug": "midterm-elections",
+      "id": "bda92870-621e-47b0-bc3c-3602c5c26f55"
+    }
+  },
+  "selection": {
+    "exchange_ids": [
+      "947"
+    ],
+    "market_ids": [
+      "258"
+    ],
+    "markets_status": "any",
+    "markets_page_limit": 10,
+    "markets_max_pages": 1,
+    "include_orders": false,
+    "orders_status": "open",
+    "orders_page_limit": 10,
+    "orders_max_pages": 1,
+    "depth": 5
+  },
+  "limits": {
+    "recorder_read_limit_per_minute": 15,
+    "recorder_read_burst": 1,
+    "max_body_bytes": 8388608
+  },
+  "plan": [
+    {
+      "name": "tournament",
+      "route": "GET /tournaments/{slug}",
+      "path": "/tournaments/midterm-elections",
+      "params": {},
+      "max_pages": 1
+    },
+    {
+      "name": "tournament-markets",
+      "route": "GET /tournaments/{slug}/markets",
+      "path": "/tournaments/midterm-elections/markets",
+      "params": {
+        "limit": "10",
+        "status": "any"
+      },
+      "max_pages": 1
+    },
+    {
+      "name": "exchange-prices",
+      "route": "GET /exchanges/prices",
+      "path": "/exchanges/prices",
+      "params": {
+        "ids": "947",
+        "tournamentId": "bda92870-621e-47b0-bc3c-3602c5c26f55"
+      },
+      "max_pages": 1
+    },
+    {
+      "name": "exchange-orderbook-947",
+      "route": "GET /exchanges/{id}/orderbook",
+      "path": "/exchanges/947/orderbook",
+      "params": {
+        "depth": "5",
+        "tournamentId": "bda92870-621e-47b0-bc3c-3602c5c26f55"
+      },
+      "max_pages": 1
+    },
+    {
+      "name": "market-orderbook-258",
+      "route": "GET /markets/{id}/orderbook",
+      "path": "/markets/258/orderbook",
+      "params": {
+        "depth": "5",
+        "tournamentId": "bda92870-621e-47b0-bc3c-3602c5c26f55"
+      },
+      "max_pages": 1
+    }
+  ],
+  "steps": [
+    {
+      "index": 1,
+      "name": "tournament",
+      "route": "GET /tournaments/{slug}",
+      "path": "/tournaments/midterm-elections",
+      "params": {},
+      "started_at": "2026-10-09T12:22:44.466Z",
+      "finished_at": "2026-10-09T12:22:45.453Z",
+      "outcome": "passed",
+      "client_validation_passed": true,
+      "error": null,
+      "page": null,
+      "attempts": [
+        {
+          "attempt": 1,
+          "path": "/tournaments/midterm-elections",
+          "params": {},
+          "omitted_params": 0,
+          "started_at": "2026-10-09T12:22:44.466Z",
+          "outcome": "response",
+          "http_status": 200,
+          "headers": {
+            "content-type": "application/json"
+          },
+          "body": {
+            "recorded": true,
+            "bytes": 398,
+            "file": "bodies/01-tournament-a1.json",
+            "sha256": "d4b15fb0458fb69f195782c3cd63455fe8e77875596e14eb40f54ce5e7c6f908"
+          },
+          "error_body": null
+        }
+      ]
+    },
+    {
+      "index": 2,
+      "name": "tournament-markets-p1",
+      "route": "GET /tournaments/{slug}/markets",
+      "path": "/tournaments/midterm-elections/markets",
+      "params": {
+        "limit": "10",
+        "status": "any"
+      },
+      "started_at": "2026-10-09T12:22:45.461Z",
+      "finished_at": "2026-10-09T12:22:48.926Z",
+      "outcome": "passed",
+      "client_validation_passed": true,
+      "error": null,
+      "page": {
+        "items": 10,
+        "has_more": true,
+        "next_cursor_present": true
+      },
+      "attempts": [
+        {
+          "attempt": 1,
+          "path": "/tournaments/midterm-elections/markets",
+          "params": {
+            "limit": "10",
+            "status": "any"
+          },
+          "omitted_params": 0,
+          "started_at": "2026-10-09T12:22:48.480Z",
+          "outcome": "response",
+          "http_status": 200,
+          "headers": {
+            "content-type": "application/json"
+          },
+          "body": {
+            "recorded": true,
+            "bytes": 6145,
+            "file": "bodies/02-tournament-markets-p1-a1.json",
+            "sha256": "8cc0b52c137f662e1d795bec65606061e88a6bbca13810858f6e41f36a6fcc24"
+          },
+          "error_body": null
+        }
+      ]
+    },
+    {
+      "index": 3,
+      "name": "exchange-prices",
+      "route": "GET /exchanges/prices",
+      "path": "/exchanges/prices",
+      "params": {
+        "ids": "947",
+        "tournamentId": "bda92870-621e-47b0-bc3c-3602c5c26f55"
+      },
+      "started_at": "2026-10-09T12:22:48.935Z",
+      "finished_at": "2026-10-09T12:22:52.935Z",
+      "outcome": "passed",
+      "client_validation_passed": true,
+      "error": null,
+      "page": null,
+      "attempts": [
+        {
+          "attempt": 1,
+          "path": "/exchanges/prices",
+          "params": {
+            "ids": "947",
+            "tournamentId": "bda92870-621e-47b0-bc3c-3602c5c26f55"
+          },
+          "omitted_params": 0,
+          "started_at": "2026-10-09T12:22:52.491Z",
+          "outcome": "response",
+          "http_status": 200,
+          "headers": {
+            "content-type": "application/json"
+          },
+          "body": {
+            "recorded": true,
+            "bytes": 144,
+            "file": "bodies/03-exchange-prices-a1.json",
+            "sha256": "505937a7dcaa7091a8e4134388e18af959d4328e25a0adeae57ac41d724488d5"
+          },
+          "error_body": null
+        }
+      ]
+    },
+    {
+      "index": 4,
+      "name": "exchange-orderbook-947",
+      "route": "GET /exchanges/{id}/orderbook",
+      "path": "/exchanges/947/orderbook",
+      "params": {
+        "depth": "5",
+        "tournamentId": "bda92870-621e-47b0-bc3c-3602c5c26f55"
+      },
+      "started_at": "2026-10-09T12:22:52.954Z",
+      "finished_at": "2026-10-09T12:22:56.918Z",
+      "outcome": "passed",
+      "client_validation_passed": true,
+      "error": null,
+      "page": null,
+      "attempts": [
+        {
+          "attempt": 1,
+          "path": "/exchanges/947/orderbook",
+          "params": {
+            "depth": "5",
+            "tournamentId": "bda92870-621e-47b0-bc3c-3602c5c26f55"
+          },
+          "omitted_params": 0,
+          "started_at": "2026-10-09T12:22:56.503Z",
+          "outcome": "response",
+          "http_status": 200,
+          "headers": {
+            "content-type": "application/json"
+          },
+          "body": {
+            "recorded": true,
+            "bytes": 504,
+            "file": "bodies/04-exchange-orderbook-947-a1.json",
+            "sha256": "2dc8bda7269edf5f98ef1e95233058016352fcf8f7c80e0a7b8bebec8dc598ef"
+          },
+          "error_body": null
+        }
+      ]
+    },
+    {
+      "index": 5,
+      "name": "market-orderbook-258",
+      "route": "GET /markets/{id}/orderbook",
+      "path": "/markets/258/orderbook",
+      "params": {
+        "depth": "5",
+        "tournamentId": "bda92870-621e-47b0-bc3c-3602c5c26f55"
+      },
+      "started_at": "2026-10-09T12:22:56.944Z",
+      "finished_at": "2026-10-09T12:23:00.977Z",
+      "outcome": "passed",
+      "client_validation_passed": true,
+      "error": null,
+      "page": null,
+      "attempts": [
+        {
+          "attempt": 1,
+          "path": "/markets/258/orderbook",
+          "params": {
+            "depth": "5",
+            "tournamentId": "bda92870-621e-47b0-bc3c-3602c5c26f55"
+          },
+          "omitted_params": 0,
+          "started_at": "2026-10-09T12:23:00.511Z",
+          "outcome": "response",
+          "http_status": 200,
+          "headers": {
+            "content-type": "application/json"
+          },
+          "body": {
+            "recorded": true,
+            "bytes": 1282,
+            "file": "bodies/05-market-orderbook-258-a1.json",
+            "sha256": "20890c2145937c47d49d2686e7183ebd7866e82ae91fbf70ab09a7bcc67f92e0"
+          },
+          "error_body": null
+        }
+      ]
+    }
+  ],
+  "not_run": [],
+  "collections": {
+    "tournament_markets": {
+      "max_pages": 1,
+      "pages_fetched": 1,
+      "complete": false,
+      "truncated": true,
+      "note": "stopped at the page cap while hasMore was true: a sample, not the full collection"
+    }
+  },
+  "anomalies": [],
+  "refused_requests": 0,
+  "refused_after_429": 0,
+  "credential_detected": false,
+  "transformations": [
+    "2xx response bodies are stored byte-for-byte after HTTP content decoding (for example gzip); they are never parsed and re-serialised, so numbers, nulls and key order are exactly as SIG sent them.",
+    "2xx bodies that are not valid JSON under the client's decoding rules are not stored; only their size is.",
+    "every response body is read decoded up to a size limit (limits.max_body_bytes); a larger one is closed unread past the limit and its step is body_too_large.",
+    "nothing derived from a response holding the active API credential is written (no body, hash or temporary file); its step is credential_detected and the run stops. Manifest strings matching it are replaced with a fixed marker.",
+    "non-2xx response bodies are never stored: only the HTTP status, the body's shape and a documented SIG error code (if any) are kept.",
+    "response headers other than the media type and a delta-seconds Retry-After are omitted (no Set-Cookie, no Location, no server or tracing headers).",
+    "request headers are never read or recorded: no Authorization header, API key or cookie, and no complete request objects.",
+    "query parameters outside an allowlist are omitted and only counted.",
+    "error and exception text is never recorded: only client error classes, documented codes, fixed client-written descriptions and client-written validation summaries."
+  ],
+  "review": {
+    "sanitized": false,
+    "required_before_commit": true,
+    "notes": [
+      "Not sanitised. Removing credentials does not make a capture safe to publish.",
+      "The tournament body carries the account's balance (myBalance) and orders bodies carry the account's own orders. Review them before any capture becomes a committed fixture.",
+      "A committed fixture must keep this manifest's provenance and be reviewed by Arnav."
+    ]
+  },
+  "withheld_fields": 0
+}
