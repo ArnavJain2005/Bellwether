@@ -10,18 +10,30 @@ capture format and the review required before any capture becomes a committed fi
 
 How responses are observed. rest.py is not modified. The recorder builds the httpx
 client with the same settings as SigRestClient.create (per-phase timeout,
-follow_redirects=False, trust_env=False) and adds two httpx event hooks:
+follow_redirects=False, trust_env=False), wraps its transport, and adds two hooks:
+- _BoundedTransport wraps the transport httpx would use anyway. It reads each response
+  body to the end, decoded, and refuses one larger than the limit, closing the stream
+  in every case. It sends nothing itself and adds no retries; it exists because a
+  response hook cannot bound a decoded read (aread() reads everything first). It runs
+  inside the client's send(), so the read stays under the client's read deadline.
 - The request hook runs before anything is sent. It refuses every request that is not a
-  GET to one of the planned paths under the configured base URL, and every scoped read
-  whose `tournamentId` is not the configured tournament. It reads the method and URL
-  only, never headers.
-- The response hook reads the body. httpx would read it next anyway, inside the same
-  `send()` call, so the read stays under the client's read deadline and the client then
-  decodes the same cached bytes. The hook keeps the status, allowlisted headers and (for
-  2xx only) the decoded body bytes in memory. Bodies are written after the client call
-  returns or fails, and only then is the step's validation outcome known.
+  GET to one of the planned paths under the configured base URL, every scoped read whose
+  `tournamentId` is not the configured tournament, any URL holding the active
+  credential, and every request at all once SIG has answered 429 in this run. It reads
+  the method and URL only, never headers.
+- The response hook keeps the status, allowlisted headers and (for 2xx only) the
+  already bounded, decoded body bytes in memory, and notes any 429. Bodies are written
+  after the client call returns or fails, and only after the credential check.
 Request building, retries, deadlines, rate admission and validation are the client's
-own; the recorder adds no HTTP or retry logic.
+own. After a 429 the client still imposes its cooldown or block before the request
+hook refuses its retry.
+
+Credential safety. On the capture path only, _CredentialGuard compares response-derived
+content with the active API key in memory; ApiKey.reveal() is used for that comparison
+and nothing else here. A body, kept header, cursor or URL holding the key, as raw bytes
+or in any decoded JSON key or string (so escaped forms count), is never written. The
+step fails with a fixed message and the run stops with a nonzero result. Every manifest
+string is checked again before it is written.
 """
 
 from __future__ import annotations
@@ -51,6 +63,7 @@ import httpx
 from engine.config import (
     API_KEY_ENV_VAR,
     SIG_BASE_URL,
+    ApiKey,
     ConfigError,
     SigConfig,
     TournamentRef,
@@ -94,26 +107,32 @@ ORDERS_LIMIT_MAX = 50
 DEFAULT_ORDERS_LIMIT = 10
 DEPTH_MAX = 20
 DEFAULT_DEPTH = 5
-# The recorder runs in its own process and cannot share the bot's limiter, so it takes a
-# small read budget of its own: 15 + the bot's 80 stays under SIG's 100 per minute.
-# A burst of 1 spaces reads evenly (one every 4 s). With a full burst, the 16th quick
-# read would wait about a minute for the rolling window, longer than the client's read
-# deadline, and a large plan would fail part-way.
+# The recorder's limiter is its own: it cannot see the bot or any other client of the
+# same account and coordinates nothing with them. Capture standalone, with every other
+# same-account client stopped. A burst of 1 spaces reads evenly (one every 4 s); with a
+# full burst the 16th quick read would wait about a minute for the rolling window,
+# longer than the client's read deadline.
 RECORDER_READ_LIMIT = 15
 RECORDER_READ_BURST = 1
+# Decoded size limit for every response body (any status), enforced while reading.
 MAX_BODY_BYTES = 8 * 1024 * 1024
 # Error bodies larger than this are not even parsed for their code.
 MAX_ERROR_BODY_INSPECT = 64 * 1024
 
 BLOCKED_REASON = (
     "the rate limiter has blocked read admission (SIG sent a Retry-After too long to "
-    "hold); recording stopped. The recorder never clears a block: wait out SIG's limit "
-    "and start a new run."
+    "hold); recording stopped and the block was left in place. Do not start another "
+    "capture to get around it."
 )
 RATE_LIMITED_REASON = (
-    "SIG rate-limited the account (HTTP 429); recording stopped to protect the read "
-    "budget shared with the trading bot."
+    "SIG rate-limited the account (HTTP 429); recording stopped and no further request "
+    "was sent. Do not start another capture to get around the limit."
 )
+CREDENTIAL_REASON = (
+    "a response contained the active API credential; it was not written and recording "
+    "stopped. Treat the key as exposed and review the run before anything else."
+)
+WITHHELD = "<withheld: matched the active credential>"
 
 _NUMERIC_ID = re.compile(r"[0-9]{1,20}")
 _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
@@ -138,6 +157,63 @@ class RecorderOutputError(RuntimeError):
 
 class RecorderSafetyError(RuntimeError):
     """The request hook refused a request that is outside the recording plan."""
+
+
+class RecorderRateLimitStop(RuntimeError):
+    """The request hook refused a request because SIG answered 429 earlier in the run."""
+
+
+class RecorderBodyLimitError(RuntimeError):
+    """A response body exceeded the decoded size limit. It was closed and not kept."""
+
+
+class _CredentialGuard:
+    """Finds the active API key in response-derived content. Never shows the key.
+
+    The key is held only for an in-memory comparison. It is never written, logged,
+    returned or put in an exception, and repr() is redacted.
+    """
+
+    __slots__ = ("_raw", "_text")
+
+    def __init__(self, api_key: ApiKey) -> None:
+        self._text = api_key.reveal()
+        self._raw = self._text.encode("ascii")
+
+    def __repr__(self) -> str:
+        return "_CredentialGuard(<redacted>)"
+
+    __str__ = __repr__
+
+    def in_text(self, value: str) -> bool:
+        return self._text in value
+
+    def in_body(self, content: bytes) -> bool:
+        """The key as raw bytes, or in any decoded JSON key or string.
+
+        Decoding covers every JSON escape (a \\u escape, an escaped solidus) and
+        UTF-16/32 bodies, which a raw byte search alone would miss.
+        """
+        if self._raw in content:
+            return True
+        try:
+            decoded = json.loads(content, parse_float=Decimal, parse_constant=_reject_constant)
+        except (ValueError, RecursionError):
+            return False  # not JSON: such a body is never stored
+        pending: list[object] = [decoded]
+        while pending:
+            value = pending.pop()
+            if isinstance(value, str):
+                if self._text in value:
+                    return True
+            elif isinstance(value, dict):
+                for key, item in value.items():
+                    if self._text in key:
+                        return True
+                    pending.append(item)
+            elif isinstance(value, list):
+                pending.extend(value)
+        return False
 
 
 def utc_now() -> datetime:
@@ -320,9 +396,11 @@ def render_preview(plan: CapturePlan, *, base_url: str = SIG_BASE_URL) -> str:
             f"({ReadRetryPolicy().max_attempts} per read, client retry policy)."
         ),
         (
-            f"Recorder read budget: {RECORDER_READ_LIMIT} reads/minute on its own limiter, "
-            f"one every {60 / RECORDER_READ_LIMIT:g} s."
+            f"Recorder read budget: {RECORDER_READ_LIMIT} requests/minute on its own "
+            f"limiter, one every {60 / RECORDER_READ_LIMIT:g} s."
         ),
+        "That limiter cannot see other clients of the same account: capture only while",
+        "the bot and every other same-account client are stopped. Any 429 ends the run.",
         "",
         "Output (created only with --capture):",
         f"  root:          {root}",
@@ -398,6 +476,71 @@ def _is_client_json(content: bytes) -> bool:
     return True
 
 
+# Describe the encoded body; they no longer apply once the body is read and decoded.
+_CONSUMED_HEADERS = frozenset({"content-encoding", "content-length", "transfer-encoding"})
+
+
+class _BoundedTransport(httpx.AsyncBaseTransport):
+    """Reads every response body, decoded, up to `max_bytes`; refuses a larger one.
+
+    A decorator over the transport httpx would use anyway: the inner transport sends the
+    request; this class adds no retries, redirects or request handling. The decoded
+    body is handed on in memory, so the client decodes exactly these bytes. The stream
+    is closed whether the read completes, overflows, fails or is cancelled.
+    """
+
+    def __init__(
+        self,
+        inner: httpx.AsyncBaseTransport,
+        max_bytes: int,
+        on_status: Callable[[int], None],
+        on_limit: Callable[[], None],
+    ) -> None:
+        self._inner = inner
+        self._max_bytes = max_bytes
+        self._on_status = on_status
+        self._on_limit = on_limit
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        response = await self._inner.handle_async_request(request)
+        self._on_status(response.status_code)
+        reader = httpx.Response(
+            response.status_code,
+            headers=response.headers,
+            stream=response.stream,
+            request=request,
+            extensions=response.extensions,
+        )
+        chunks: list[bytes] = []
+        size = 0
+        try:
+            async for chunk in reader.aiter_bytes():
+                size += len(chunk)
+                if size > self._max_bytes:
+                    self._on_limit()
+                    raise RecorderBodyLimitError(
+                        f"response body is larger than the {self._max_bytes}-byte limit"
+                    )
+                chunks.append(chunk)
+        finally:
+            await reader.aclose()
+        headers = [
+            (name, value)
+            for name, value in response.headers.multi_items()
+            if name.lower() not in _CONSUMED_HEADERS
+        ]
+        return httpx.Response(
+            response.status_code,
+            headers=headers,
+            content=b"".join(chunks),
+            request=request,
+            extensions=response.extensions,
+        )
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
 @dataclass
 class _Attempt:
     number: int
@@ -407,6 +550,8 @@ class _Attempt:
     started_at: str
     http_status: int | None = None
     body_read: bool = False
+    body_limit_exceeded: bool = False
+    credential_in_headers: bool = False
     headers: dict[str, str] = field(default_factory=dict)
     error_body: dict[str, Any] | None = None
     body_info: dict[str, Any] | None = None
@@ -423,7 +568,11 @@ class _Attempt:
             "outcome": (
                 "no_response"
                 if self.http_status is None
-                else "response" if self.body_read else "body_not_read"
+                else "body_too_large"
+                if self.body_limit_exceeded
+                else "response"
+                if self.body_read
+                else "body_not_read"
             ),
             "http_status": self.http_status,
             "headers": self.headers,
@@ -465,17 +614,30 @@ class _Step:
 
 
 class _Observer:
-    """httpx event hooks. Never reads request headers; never raises for planned reads."""
+    """httpx event hooks. Never reads request headers.
 
-    def __init__(self, config: SigConfig, reads: Sequence[PlannedRead], now: Now) -> None:
+    Raises only to refuse a request before it is sent: one outside the plan, one whose
+    URL holds the active credential, or any request after SIG answered 429.
+    """
+
+    def __init__(
+        self,
+        config: SigConfig,
+        reads: Sequence[PlannedRead],
+        now: Now,
+        guard: _CredentialGuard,
+    ) -> None:
         base = httpx.URL(config.base_url)
         self._origin = (base.scheme, base.host, base.port)
         self._prefix = base.path.rstrip("/")
         self._tournament_id = config.tournament.id
         self._paths = {read.path: "tournamentId" in read.params for read in reads}
         self._now = now
+        self._guard = guard
         self.current: _Step | None = None
         self.refused = 0
+        self.rate_limited = False
+        self.refused_after_429 = 0
 
     def _refuse(self, reason: str) -> RecorderSafetyError:
         self.refused += 1
@@ -483,6 +645,14 @@ class _Observer:
 
     async def on_request(self, request: httpx.Request) -> None:
         url = request.url
+        if self.rate_limited:
+            # Documented stop policy: nothing more is sent after a 429, not even the
+            # client's own retry (its cooldown or block has already been imposed).
+            self.refused_after_429 += 1
+            raise RecorderRateLimitStop("SIG answered 429 earlier in this run")
+        decoded = [url.path, *(value for _, value in url.params.multi_items())]
+        if any(self._guard.in_text(part) for part in [str(url), *decoded]):
+            raise self._refuse("request URL holds the active credential")
         if (url.scheme, url.host, url.port) != self._origin:
             raise self._refuse("request is not for the configured SIG base URL")
         if not url.path.startswith(self._prefix + "/"):
@@ -508,14 +678,37 @@ class _Observer:
             )
         )
 
-    async def on_response(self, response: httpx.Response) -> None:
+    def _attempt(self) -> _Attempt | None:
         step = self.current
-        if step is None or not step.attempts:
+        return step.attempts[-1] if step is not None and step.attempts else None
+
+    def on_status(self, status: int) -> None:
+        """Called by _BoundedTransport once the status is known, before the body."""
+        if status == 429:
+            self.rate_limited = True
+        attempt = self._attempt()
+        if attempt is not None:
+            attempt.http_status = status
+
+    def on_body_limit(self) -> None:
+        attempt = self._attempt()
+        if attempt is not None:
+            attempt.body_limit_exceeded = True
+
+    async def on_response(self, response: httpx.Response) -> None:
+        attempt = self._attempt()
+        if attempt is None:
             return  # unreachable: on_request refused the request
-        attempt = step.attempts[-1]
+        if response.status_code == 429:
+            self.rate_limited = True
         attempt.http_status = response.status_code
-        attempt.headers = _safe_headers(response.headers)
-        await response.aread()
+        headers = _safe_headers(response.headers)
+        for name, value in headers.items():
+            if self._guard.in_text(value):
+                headers[name] = WITHHELD
+                attempt.credential_in_headers = True
+        attempt.headers = headers
+        await response.aread()  # already in memory: _BoundedTransport read it
         attempt.body_read = True
         if 200 <= response.status_code < 300:
             attempt.pending_body = response.content
@@ -546,8 +739,29 @@ def _api_error_info(error: SigApiError) -> dict[str, Any]:
     }
 
 
-def _classify(exc: SigClientError | RecorderSafetyError, limiter: RateLimiter) -> _Failure:
-    """Turn a client error, or a refused request, into a step outcome."""
+_RecorderStepError = (
+    SigClientError,
+    RecorderSafetyError,
+    RecorderRateLimitStop,
+    RecorderBodyLimitError,
+)
+
+
+def _classify(exc: Exception, limiter: RateLimiter, rate_limited: bool) -> _Failure:
+    """Turn a client error, or a recorder refusal, into a step outcome.
+
+    `rate_limited` is True once any 429 was observed in this run: the run then stops,
+    whatever the client went on to do with it.
+    """
+    if isinstance(exc, RecorderBodyLimitError):
+        # A recorder limit, not SIG's error: the evidence is incomplete; carry on.
+        return _Failure("body_too_large", {"class": type(exc).__name__}, None)
+    if isinstance(exc, RecorderRateLimitStop):
+        return _Failure(
+            "rate_limited",
+            {"class": type(exc).__name__, "detail": "the retry after HTTP 429 was not sent"},
+            RATE_LIMITED_REASON,
+        )
     if isinstance(exc, SigContextMismatchError):
         return _Failure(
             "context_mismatch",
@@ -580,7 +794,7 @@ def _classify(exc: SigClientError | RecorderSafetyError, limiter: RateLimiter) -
 
     if limiter.is_blocked(RequestKind.READ):
         return _Failure("blocked", error, BLOCKED_REASON)
-    if isinstance(root, SigRateLimitedError):
+    if rate_limited or isinstance(root, SigRateLimitedError):
         return _Failure("rate_limited", error, RATE_LIMITED_REASON)
     if isinstance(exc, (SigNotFoundError, SigBadRequestError)):
         # Specific to the selected id or parameters: record it and carry on.
@@ -674,8 +888,17 @@ _TRANSFORMATIONS = [
         "key order are exactly as SIG sent them."
     ),
     (
-        "2xx bodies that are not valid JSON under the client's decoding rules, or larger "
-        f"than {MAX_BODY_BYTES} bytes, are not stored; their size and SHA-256 are."
+        "2xx bodies that are not valid JSON under the client's decoding rules are not "
+        "stored; only their size is."
+    ),
+    (
+        "every response body is read decoded up to a size limit (limits.max_body_bytes); "
+        "a larger one is closed unread past the limit and its step is body_too_large."
+    ),
+    (
+        "nothing derived from a response holding the active API credential is written "
+        "(no body, hash or temporary file); its step is credential_detected and the run "
+        "stops. Manifest strings matching it are replaced with a fixed marker."
     ),
     (
         "non-2xx response bodies are never stored: only the HTTP status, the body's shape "
@@ -729,9 +952,14 @@ class _Recorder:
         sleep: Sleep,
         now: Now,
         build: Mapping[str, Any],
+        max_body_bytes: int = MAX_BODY_BYTES,
     ) -> None:
         self._plan = plan
         self._config = config
+        self._max_body_bytes = max_body_bytes
+        self._guard = _CredentialGuard(config.api_key)
+        self._credential_found = False
+        self._withheld = 0
         self._reads = planned_reads(plan)
         self._run_dir = plan.output_root / run_id
         self._run_id = run_id
@@ -739,10 +967,15 @@ class _Recorder:
         self._limiter = limiter
         self._now = now
         self._build = build
-        self._observer = _Observer(config, self._reads, now)
-        # Same settings as SigRestClient.create, plus the observation hooks.
+        self._observer = _Observer(config, self._reads, now, self._guard)
+        # The transport httpx itself would build for these settings, then bounded.
+        inner = transport if transport is not None else httpx.AsyncHTTPTransport(trust_env=False)
+        bounded = _BoundedTransport(
+            inner, max_body_bytes, self._observer.on_status, self._observer.on_body_limit
+        )
+        # Same settings as SigRestClient.create, plus the bounded transport and hooks.
         http = httpx.AsyncClient(
-            transport=transport,
+            transport=bounded,
             timeout=config.timeout,
             follow_redirects=False,
             trust_env=False,
@@ -824,7 +1057,7 @@ class _Recorder:
             "limits": {
                 "recorder_read_limit_per_minute": RECORDER_READ_LIMIT,
                 "recorder_read_burst": RECORDER_READ_BURST,
-                "max_body_bytes": MAX_BODY_BYTES,
+                "max_body_bytes": self._max_body_bytes,
             },
             "plan": [read.as_manifest() for read in self._reads],
             "steps": [step.as_manifest() for step in self._steps],
@@ -832,6 +1065,8 @@ class _Recorder:
             "collections": self._collections,
             "anomalies": self._anomalies,
             "refused_requests": self._observer.refused,
+            "refused_after_429": self._observer.refused_after_429,
+            "credential_detected": self._credential_found,
             "transformations": _TRANSFORMATIONS,
             "review": {
                 "sanitized": False,
@@ -840,8 +1075,28 @@ class _Recorder:
             },
         }
 
+    def _scrub(self, value: Any) -> Any:
+        """A copy with every key or string holding the active credential withheld.
+
+        The last line of defence: entry points already refuse such content. Counts the
+        fields it withheld, and any withheld field makes the run fail.
+        """
+        if isinstance(value, str):
+            if self._guard.in_text(value):
+                self._withheld += 1
+                return WITHHELD
+            return value
+        if isinstance(value, dict):
+            return {self._scrub(key): self._scrub(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._scrub(item) for item in value]
+        return value
+
     def _write_manifest(self) -> None:
-        data = json.dumps(self._manifest(), indent=2, ensure_ascii=False, allow_nan=False)
+        self._withheld = 0
+        manifest = self._scrub(self._manifest())
+        manifest["withheld_fields"] = self._withheld
+        data = json.dumps(manifest, indent=2, ensure_ascii=False, allow_nan=False)
         _atomic_write(self._run_dir / MANIFEST_NAME, (data + "\n").encode("utf-8"))
 
     def _store_bodies(self, step: _Step) -> None:
@@ -849,14 +1104,11 @@ class _Recorder:
             content = attempt.pending_body
             if content is None:
                 continue
-            info: dict[str, Any] = {
-                "recorded": False,
-                "bytes": len(content),
-                "sha256": hashlib.sha256(content).hexdigest(),
-            }
-            if len(content) > MAX_BODY_BYTES:
-                info["omitted"] = "larger than the recorder's size cap"
-            elif not _is_client_json(content):
+            # Callers ran _credential_check first; this is a second, independent test.
+            if self._guard.in_body(content):
+                raise RecorderSafetyError("a body holding the credential reached storage")
+            info: dict[str, Any] = {"recorded": False, "bytes": len(content)}
+            if not _is_client_json(content):
                 info["omitted"] = "not valid JSON under the client's rules (may be any text)"
             else:
                 relative = f"{BODIES_DIR}/{step.index:02d}-{step.name}-a{attempt.number}.json"
@@ -864,7 +1116,9 @@ class _Recorder:
                 if target.exists():
                     raise RecorderOutputError("a body file already exists; refusing to replace")
                 _atomic_write(target, content)
-                info.update(recorded=True, file=relative)
+                info.update(
+                    recorded=True, file=relative, sha256=hashlib.sha256(content).hexdigest()
+                )
             attempt.body_info = info
             # Cleared only now: if the write failed, _discard_bodies records why.
             attempt.pending_body = None
@@ -878,9 +1132,34 @@ class _Recorder:
 
     # -- steps --
 
+    def _credential_check(self, step: _Step) -> bool:
+        """True if any response-derived part of the step holds the active credential.
+
+        Runs before anything from the step is written. Offending bodies are dropped
+        from memory with a fixed note; nothing derived from them is kept.
+        """
+        found = False
+        for attempt in step.attempts:
+            if attempt.credential_in_headers:
+                found = True
+            if attempt.pending_body is not None and self._guard.in_body(attempt.pending_body):
+                found = True
+                attempt.body_info = {
+                    "recorded": False,
+                    "omitted": "held the active credential; not written",
+                }
+                attempt.pending_body = None
+        if found:
+            self._credential_found = True
+        return found
+
     def _check_blocked(self) -> None:
         if self._limiter.is_blocked(RequestKind.READ):
             raise _StopRun(BLOCKED_REASON)
+        if self._observer.rate_limited:
+            raise _StopRun(RATE_LIMITED_REASON)
+        if self._credential_found:
+            raise _StopRun(CREDENTIAL_REASON)
 
     async def _step(
         self,
@@ -913,9 +1192,9 @@ class _Recorder:
             step.finished_at = _stamp(self._now())
             self._discard_bodies(step, "the run was interrupted before this read finished")
             raise
-        except (SigClientError, RecorderSafetyError) as exc:
+        except _RecorderStepError as exc:
             # Anything else is a recorder bug: it ends the run with status "error".
-            failure = _classify(exc, self._limiter)
+            failure = _classify(exc, self._limiter, self._observer.rate_limited)
             step.outcome = failure.outcome
             step.error = failure.error
         else:
@@ -924,6 +1203,14 @@ class _Recorder:
             if describe is not None:
                 step.page = describe(result)
         step.finished_at = _stamp(self._now())
+        if self._credential_check(step):
+            # Overrides any other outcome: nothing from this step is kept or replayable.
+            result = None
+            step.outcome = "credential_detected"
+            step.client_validation_passed = False
+            step.page = None
+            step.error = {"class": "CredentialDetected", "detail": "nothing from it was written"}
+            failure = _Failure(step.outcome, step.error, CREDENTIAL_REASON)
         try:
             self._store_bodies(step)
         except BaseException:
@@ -991,6 +1278,11 @@ class _Recorder:
             if not has_more:
                 summary["complete"] = True
                 return
+            if self._guard.in_text(next_cursor):
+                # Never sent onward (the URL would carry it into logs) and never kept.
+                self._credential_found = True
+                summary["note"] = "the next cursor held the active credential: not sent"
+                raise _StopRun(CREDENTIAL_REASON)
             seen.add(next_cursor)
             cursor = next_cursor
         summary["truncated"] = True
@@ -1053,7 +1345,8 @@ class _Recorder:
         incomplete = self._manifest()["not_run"]
         return "partial" if failed or incomplete or self._anomalies else "succeeded"
 
-    def _finish(self, status: str, stop_reason: str | None) -> None:
+    def _finish(self, status: str, stop_reason: str | None) -> str:
+        """Write the final manifest; returns the final status."""
         self._status = status
         self._stop_reason = stop_reason
         self._finished_at = _stamp(self._now())
@@ -1062,6 +1355,14 @@ class _Recorder:
                 step.outcome = "recorder_error"
                 self._discard_bodies(step, "the recorder failed before this read finished")
         self._write_manifest()
+        if self._withheld and self._status == "succeeded":
+            # A withheld manifest field means the evidence is not what SIG sent.
+            self._status = "partial"
+            self._stop_reason = (
+                "some manifest fields matched the active credential and were withheld"
+            )
+            self._write_manifest()
+        return self._status
 
     async def run(self) -> RunResult:
         try:
@@ -1087,8 +1388,10 @@ class _Recorder:
             status, reason = self._final_status(), None
         finally:
             await self._client.aclose()
-        self._finish(status, reason)
-        return RunResult(status, 0 if status == "succeeded" else 1, self._run_dir, reason)
+        status = self._finish(status, reason)
+        return RunResult(
+            status, 0 if status == "succeeded" else 1, self._run_dir, self._stop_reason
+        )
 
 
 def _new_run_id(now: Now) -> str:
@@ -1106,15 +1409,18 @@ async def record(
     sleep: Sleep = asyncio.sleep,
     now: Now = utc_now,
     build: Mapping[str, Any] | None = None,
+    max_body_bytes: int = MAX_BODY_BYTES,
 ) -> RunResult:
     """Record one bounded sample into a new run directory under `plan.output_root`.
 
     With `transport` left as None the run talks to `config.base_url` and is labelled a
     genuine recording. Any injected transport makes the run "synthetic", whatever it
     serves, so a test can never produce a capture labelled as recorded.
+    `max_body_bytes` may only lower the decoded body limit.
     """
     if plan.tournament != config.tournament:
         raise RecorderArgumentError("the plan and the config name different tournaments")
+    _check_int("max_body_bytes", max_body_bytes, 1, MAX_BODY_BYTES)
     if run_id is None:
         run_id = _new_run_id(now)
     elif not isinstance(run_id, str) or not _RUN_ID.fullmatch(run_id):
@@ -1138,6 +1444,7 @@ async def record(
         sleep=sleep,
         now=now,
         build=describe_build() if build is None else build,
+        max_body_bytes=max_body_bytes,
     )
     return await recorder.run()
 

@@ -49,7 +49,7 @@ from sig_testkit import (
     run,
 )
 
-from engine.config import TournamentRef
+from engine.config import ApiKey, TournamentRef
 from engine.sig_client import record_fixtures as rf
 from engine.sig_client.rate_limiter import RateLimiter, RequestKind
 from engine.sig_client.rest import SigRestClient
@@ -408,6 +408,11 @@ def test_unlisted_query_parameters_and_odd_headers_are_dropped() -> None:
 # --- the request guard ------------------------------------------------------------------
 
 
+def observer_for(tmp_path: Path) -> rf._Observer:
+    guard = rf._CredentialGuard(ApiKey(SENTINEL_KEY))
+    return rf._Observer(config(), rf.planned_reads(plan(tmp_path)), fixed_now, guard)
+
+
 @pytest.mark.parametrize(
     ("method", "url"),
     [
@@ -427,7 +432,7 @@ def test_unlisted_query_parameters_and_odd_headers_are_dropped() -> None:
 def test_request_guard_refuses_anything_outside_the_plan(
     method: str, url: str, tmp_path: Path
 ) -> None:
-    observer = rf._Observer(config(), rf.planned_reads(plan(tmp_path)), fixed_now)
+    observer = observer_for(tmp_path)
     observer.current = rf._Step(1, "x", "r", "/p", {}, "t")
     with pytest.raises(rf.RecorderSafetyError):
         run(observer.on_request(httpx.Request(method, url)))
@@ -436,7 +441,7 @@ def test_request_guard_refuses_anything_outside_the_plan(
 
 
 def test_request_guard_refuses_requests_outside_a_step(tmp_path: Path) -> None:
-    observer = rf._Observer(config(), rf.planned_reads(plan(tmp_path)), fixed_now)
+    observer = observer_for(tmp_path)
     with pytest.raises(rf.RecorderSafetyError):
         run(observer.on_request(httpx.Request("GET", f"{BASE_URL}/orders?tournamentId={TID}")))
 

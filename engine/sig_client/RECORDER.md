@@ -47,24 +47,59 @@ In order, each through the existing client and its retries, deadlines and valida
 
 No POST or DELETE, no orders, cancels, fills, positions or realtime tokens. A request
 hook refuses, before sending, anything that is not a GET to a planned path under the
-configured base URL, or a scoped read without exactly the configured `tournamentId`.
+configured base URL, a scoped read without exactly the configured `tournamentId`, and
+any URL that holds the active credential.
 
-**Rate budget.** The recorder runs in its own process, so it cannot share the bot's
-limiter. It uses one `RateLimiter` of its own for every read: 15 reads a minute, burst
-1 (one read every 4 s), so it and the bot's 80 stay under SIG's 100. The largest
-possible plan is 28 reads, about two minutes. Any HTTP 429 stops the run. A blocked
-limiter (a Retry-After too long to hold) stops the run with an explanation; the
-recorder never calls `clear_block()`.
+**Logical reads and HTTP attempts.** A logical read is one page or object request
+above. The largest plan is 28 logical reads (1 tournament, 3 market pages, prices, 10
+exchange books, 10 market books, 3 order pages). Each read may take up to 4 HTTP
+attempts under the client's retry policy (for 503 and transient transport failures),
+so a run sends at most 112 HTTP requests. The preview prints both numbers for the
+chosen options. At one admission every 4 s, 28 reads take about two minutes, and
+retries add to that.
+
+**Rate budget: capture standalone.** The recorder uses one `RateLimiter` of its own for
+every attempt: 15 a minute, burst 1. That limiter lives in the recorder's process and
+**cannot see** the trading bot, the logger, `sig_dump.py` or any other client of the
+same account; it coordinates nothing with them. SIG's limit is per account, across all
+keys. Run a capture only while every other same-account client is stopped.
+
+**Rate limiting stops the run.** After any HTTP 429 the recorder sends no further
+request in that capture. The client still handles the 429 as usual: it imposes the
+`Retry-After` cooldown, or blocks the limiter for an oversized one, before the request
+hook refuses its retry. The recorder never calls `clear_block()`. A 429 or a block is
+reported as `aborted` with an explanation. Do not start another capture to get around
+a server cooldown or a blocked limiter; wait until SIG's limit has passed and nothing
+else is using the account.
 
 ## How responses are observed
 
 `rest.py` is unchanged. The recorder builds the httpx client with the same settings as
-`SigRestClient.create` and adds two httpx event hooks:
+`SigRestClient.create`, wraps its transport, and adds two httpx event hooks:
 
-- the request hook (above) reads only the method and URL, never headers;
-- the response hook reads the body. httpx would read it next anyway, inside the same
-  `send()` and therefore inside the client's read deadline. The client then decodes the
-  same cached bytes.
+- `_BoundedTransport` wraps the transport httpx would use anyway and adds no retries or
+  request handling. It reads each response body, decoded (so a compressed body counts
+  at its decoded size), and stops at the 8 MiB limit, for every status. The stream is
+  closed whether the read completes, overflows, fails or is cancelled. A response hook
+  could not do this, because `aread()` reads the whole body first. The read runs inside
+  the client's `send()`, so it stays under the client's read deadline.
+- The request hook (above) reads only the method and URL, never headers.
+- The response hook keeps the status, allowlisted headers and, for 2xx, the decoded
+  body bytes in memory, and notes any 429. The client decodes exactly the same bytes.
+
+**Credential check.** Before anything from a response is written, the recorder looks
+for the active API key, in memory only, in:
+- the raw body bytes;
+- every decoded JSON key and string, which catches `\u` escapes, `\/` and UTF-16 bodies;
+- the kept header values;
+- each next-page cursor, before it is sent.
+
+A match means nothing derived from that response is written: no body file, no
+temporary file, no hash. The step becomes `credential_detected`, the run stops
+(`aborted`, exit 1) with a fixed message, and the key should be treated as exposed.
+As a last line of defence, every manifest string is checked again; a match is
+replaced with a fixed marker, counted in `withheld_fields`, and the run fails. Bodies
+are never sanitised: a body is stored byte-for-byte or not at all.
 
 ## Capture format
 
@@ -78,8 +113,8 @@ sig_captures/<UTC time>-<random>/
 `bodies/` holds **2xx bodies only, byte-for-byte** as received (after HTTP content
 decoding). They are never parsed and re-serialised, so every number keeps its exact
 digits (`0.535`, `12.50`, `1E-3`), and nulls and key order are unchanged. A body is
-stored only if it decodes under the client's own rules (`parse_float=Decimal`, no
-NaN/Infinity) and is at most 8 MiB. Otherwise only its size and SHA-256 are kept.
+stored only if it passed the credential check and decodes under the client's own rules
+(`parse_float=Decimal`, no NaN/Infinity). Otherwise only its size is kept.
 
 `manifest.json` (format `bellwether.sig-capture/1`) records:
 
@@ -90,17 +125,20 @@ NaN/Infinity) and is at most 8 MiB. Otherwise only its size and SHA-256 are kept
 | `code`, `spec` | git commit and dirty flag; `docs/api/openapi.json` SHA-256 and version |
 | `target`, `selection`, `limits`, `plan` | base URL, tournament, options, planned reads |
 | `steps[]` | route, safe params, `outcome`, `client_validation_passed`, error, page info |
-| `steps[].attempts[]` | path, allowlisted params, HTTP status, allowlisted headers, body file + SHA-256, or the error body's shape and documented code |
+| `steps[].attempts[]` | path, allowlisted params, attempt outcome, HTTP status, allowlisted headers, body file + SHA-256, or the error body's shape and documented code |
 | `collections` | per paginated read: pages fetched, `complete`, `truncated`, note |
 | `not_run`, `anomalies` | planned reads never attempted; pagination inconsistencies |
+| `refused_requests`, `refused_after_429` | requests the hook refused before sending |
+| `credential_detected`, `withheld_fields` | credential check results |
 | `transformations` | every deliberate omission, listed below |
 | `review` | `sanitized: false`, `required_before_commit: true` |
 
-`load_replayable(run_dir)` returns the bodies of steps that passed client validation,
+`load_replayable(run_dir)` returns the bodies of steps whose outcome is `passed`,
 checked against their SHA-256, ready to serve through `httpx.MockTransport`.
 
 ## What is never recorded
 
+- The active API credential, in any form the credential check covers (above).
 - Request headers: no `Authorization`, API key, cookie, or complete request object.
 - Response headers other than the media type and a delta-seconds `Retry-After`: no
   `Set-Cookie`, `Location`, server or tracing headers.
@@ -116,19 +154,25 @@ checked against their SHA-256, ready to serve through `httpx.MockTransport`.
 
 | Run status | Exit | Meaning |
 | --- | --- | --- |
-| `succeeded` | 0 | every planned read ran and passed client validation |
-| `partial` | 1 | the run finished, but some read failed (validation, 400/404) or pagination was inconsistent |
-| `aborted` | 1 | stopped early: auth, 429, blocked limiter, tournament mismatch, transport, deadline, 5xx |
+| `succeeded` | 0 | every planned read ran, passed client validation and was stored complete |
+| `partial` | 1 | the run finished, but some read failed (validation, 400/404, body over the limit), pagination was inconsistent, or a manifest field was withheld |
+| `aborted` | 1 | stopped early: credential detected, any 429, blocked limiter, auth, tournament mismatch, transport, deadline, 5xx |
 | `error` | 1 | a recorder failure (for example a disk write); temporary files are removed |
 | `interrupted` | 130 | cancelled or Ctrl+C; the step in flight is marked `interrupted` |
 
 The manifest is rewritten after every step, so a crash leaves `in_progress`, which is
-never mistaken for success. A validation failure is never hidden. The step is
-`validation_failed` and its body is kept **locally** as evidence, but `load_replayable`
-excludes it, and the client is not loosened. A collection is `complete` only when its
-last page said `hasMore: false`. Stopping at the page cap is recorded as `truncated`:
-a sample, not the full collection. An existing run directory is never reused or
-overwritten.
+never mistaken for success. Failures are never hidden:
+
+- **Validation failure:** the step is `validation_failed` and its body is kept
+  **locally** as evidence, but `load_replayable` excludes it, and the client is not
+  loosened.
+- **Body over the limit:** the step is `body_too_large`, with no body and not
+  replayable, and the run is not `succeeded`. A truncated body is never treated as
+  complete.
+- **Pagination:** a collection is `complete` only when its last page said
+  `hasMore: false`. Stopping at the page cap is recorded as `truncated`: a sample, not
+  the full collection.
+- **Run directory:** an existing one is never reused or overwritten.
 
 ## Before a capture becomes a committed fixture
 
