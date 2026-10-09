@@ -90,9 +90,18 @@ else is using the account.
 **Credential check.** Before anything from a response is written, the recorder looks
 for the active API key, in memory only, in:
 - the raw body bytes;
-- every decoded JSON key and string, which catches `\u` escapes, `\/` and UTF-16 bodies;
+- every decoded JSON member name and string, which catches `\u` escapes, `\/` and
+  UTF-16/32 bodies;
 - the kept header values;
 - each next-page cursor, before it is sent.
+
+Members are checked as they are parsed, before repeated names collapse. Parsing keeps
+only the last value of a duplicate name, so this also covers earlier values, and the
+objects and lists they hold, that a later duplicate overwrites.
+
+**Duplicate member names** are not rejected. A body with harmless duplicates is stored
+byte-for-byte like any other, and the client keeps the last value of each name, as it
+does on every read. Only the credential check looks at the overwritten members.
 
 A match means nothing derived from that response is written: no body file, no
 temporary file, no hash. The step becomes `credential_detected`, the run stops
