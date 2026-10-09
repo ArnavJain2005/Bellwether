@@ -1,5 +1,18 @@
 {
-  "format": "bellwether.sig-capture/1",
+  "format": "bellwether.sig-source-provenance/1",
+  "label": "sanitized source provenance derived from the capture manifest; NOT the byte-exact capture manifest",
+  "sanitization": {
+    "derived_from": "manifest.json of capture 20261009T122244Z-fa008a (format bellwether.sig-capture/1)",
+    "omitted": [
+      "manifest SHA-256 (the capture manifest's own hash is not recorded anywhere)",
+      "$.steps[0].attempts[0].body.sha256",
+      "$.steps[0].attempts[0].body.bytes",
+      "$.steps[1].attempts[0].body.sha256",
+      "$.steps[1].attempts[0].body.bytes"
+    ],
+    "reason": "the original SHA-256 and size of a redacted body would let anyone verify guesses of the redacted values; the capture manifest's own hash could verify a reconstruction of it. Original hashes are kept only for unmodified bodies.",
+    "unchanged": "every other field holds the capture manifest's value"
+  },
   "provenance": {
     "kind": "recorded",
     "detail": "genuine responses recorded from SIG by this recorder; unreviewed"
@@ -125,9 +138,11 @@
           },
           "body": {
             "recorded": true,
-            "bytes": 398,
             "file": "bodies/01-tournament-a1.json",
-            "sha256": "d4b15fb0458fb69f195782c3cd63455fe8e77875596e14eb40f54ce5e7c6f908"
+            "omitted": [
+              "sha256",
+              "bytes"
+            ]
           },
           "error_body": null
         }
@@ -169,9 +184,11 @@
           },
           "body": {
             "recorded": true,
-            "bytes": 6145,
             "file": "bodies/02-tournament-markets-p1-a1.json",
-            "sha256": "8cc0b52c137f662e1d795bec65606061e88a6bbca13810858f6e41f36a6fcc24"
+            "omitted": [
+              "sha256",
+              "bytes"
+            ]
           },
           "error_body": null
         }

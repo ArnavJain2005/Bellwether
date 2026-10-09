@@ -26,19 +26,29 @@ itself stays local and uncommitted; only reviewed derived fixtures are committed
 ```
 recorded/<run id>/
   .gitattributes                "* -text": bytes are hashed, so no line-ending conversion
-  source-capture-manifest.json  the capture's own manifest, byte-for-byte (provenance only)
+  source-provenance.json        sanitized provenance derived from the capture manifest
   fixtures.json                 the effective fixture manifest (what the tests verify)
   bodies/NN-<step>-a<attempt>.json
 ```
 
-- **`source-capture-manifest.json`** records where the bodies came from: `recorded`
-  provenance, git commit and dirty flag, spec hash, run time, request paths and
-  parameters, and the SHA-256 of each *original* body. Original bodies that were redacted
-  are not committed, so those hashes describe bytes that are not in the repository. Never
-  use this file to validate a fixture body.
+- **`source-provenance.json`** is **sanitized** provenance derived from the capture
+  manifest. It is **not** the byte-exact capture manifest: its `format` is
+  `bellwether.sig-source-provenance/1`, and its `label` and `sanitization` fields say so. It keeps the capture identity, code and spec provenance,
+  the recorded requests, step outcomes, pagination and coverage. Every other field holds
+  the capture manifest's value, with these exceptions:
+  - The original SHA-256 and size of each **redacted** body are omitted. They would let
+    anyone verify guesses of the redacted values.
+  - The capture manifest's own SHA-256 is not recorded anywhere, because it could verify a
+    reconstruction.
+  - Original hashes are kept only for bodies committed unmodified.
+
+  Never use this file to validate a fixture body.
 - **`fixtures.json`** lists every committed body with its own SHA-256 and size, its label,
-  the recorded request and response status, the source body it came from (file and
-  original hash) and its redactions. The replay tests check every body against it.
+  the recorded request and response status, the source body it came from and its
+  redactions. It records the original hash only for unmodified bodies. It also holds the
+  SHA-256 of `source-provenance.json`. The replay tests check every body and the
+  provenance file against it, and check that every 64-hex string in the folder is
+  accounted for.
 - **Labels.** `recorded response, unmodified` means byte-identical to what SIG sent (after
   HTTP content decoding); the fixture hash equals the source hash.
   `derived from recorded response, redacted` means only the listed JSON paths were
@@ -57,18 +67,19 @@ exchange `947`, market `258`, depth 5, markets page limit 10 with one page, and
 
 | Fixture | Endpoint | Label | Redacted paths |
 | --- | --- | --- | --- |
-| `01-tournament-a1.json` | `GET /tournaments/{slug}` | derived, redacted | `$.myBalance` → `12345.67` (fixed test value) |
-| `02-tournament-markets-p1-a1.json` | `GET /tournaments/{slug}/markets` | derived, redacted | `$.data[0..9].creator.id` → `11111111-1111-4111-8111-111111111111`, `$.data[0..9].creator.username` → `redacted-creator-1` (one consistent placeholder for the single creator) |
+| `01-tournament-a1.json` | `GET /tournaments/{slug}` | derived, redacted | `$.myBalance` → `12345.67` and `$.isPendingEnrolment` → `true` (fixed test values; they say nothing about the account) |
+| `02-tournament-markets-p1-a1.json` | `GET /tournaments/{slug}/markets` | derived, redacted | `$.data[0..9].creator.id` → `11111111-1111-4111-8111-111111111111` and `$.data[0..9].creator.username` → `redacted-creator-1` (one consistent placeholder for the single creator); in `$.data[0..9].thumbnailUrl`, the shared first UUID segment → `22222222-2222-4222-8222-222222222222` (scheme, host, path shape and per-image file name unchanged) |
 | `03-exchange-prices-a1.json` | `GET /exchanges/prices` | unmodified | none |
 | `04-exchange-orderbook-947-a1.json` | `GET /exchanges/{id}/orderbook` | unmodified | none |
 | `05-market-orderbook-258-a1.json` | `GET /markets/{id}/orderbook` | unmodified | none |
 
 Prices, quantities, timestamps, nulls, key order, pagination and unknown fields are
-unchanged. Original and derived hashes are in `fixtures.json`.
+unchanged. `fixtures.json` holds the derived hashes, plus original hashes for the three
+unmodified bodies only.
 
 **Observed extra field.** Every market in `02` carries `thumbnailUrl`, which
-`docs/api/openapi.json` does not list for `TournamentMarket`. It is kept unchanged; the
-wire model ignores it (`extra="ignore"`).
+`docs/api/openapi.json` does not list for `TournamentMarket`. The field is kept, with
+its shared UUID segment redacted as above. The wire model ignores it (`extra="ignore"`).
 
 **Observed formats.** Book timestamps (`asOf.at`) carry seven fractional digits and a
 `+00:00` offset (for example `2026-10-09T12:22:56.4607814+00:00`). Other timestamps use

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from decimal import Decimal
 from typing import Any
 
@@ -114,37 +115,65 @@ def test_fixture_bytes_match_the_effective_manifest() -> None:
         assert len(data) == f["bytes"], f["name"]
 
 
-def test_source_capture_manifest_is_provenance_only() -> None:
+def source_provenance() -> tuple[bytes, dict[str, Any]]:
+    data = (RUN / effective_manifest()["source_capture"]["provenance_file"]).read_bytes()
+    return data, json.loads(data)
+
+
+def test_source_provenance_is_sanitized_and_labelled() -> None:
     manifest = effective_manifest()
-    source_bytes = (RUN / manifest["source_capture"]["manifest_file"]).read_bytes()
-    assert sha256(source_bytes) == manifest["source_capture"]["manifest_sha256"]
-    source = json.loads(source_bytes)
+    data, source = source_provenance()
+    assert sha256(data) == manifest["source_capture"]["provenance_sha256"]
+    assert source["format"] == "bellwether.sig-source-provenance/1"
+    assert source["label"] == manifest["source_capture"]["provenance_label"]
+    assert "sanitized" in source["label"] and "NOT the byte-exact" in source["label"]
+    assert not (RUN / "source-capture-manifest.json").exists()
     assert (
         source["provenance"]["kind"] == "recorded" == manifest["source_capture"]["provenance_kind"]
     )
     assert source["run"]["id"] == manifest["source_capture"]["run_id"]
     assert source["run"]["status"] == "succeeded"
+    assert source["code"]["git_commit"] == "a42cfb46afaa9a78debef1e6470c2dec17148355"
     assert source["code"]["git_dirty"] is False
     assert source["credential_detected"] is False and source["withheld_fields"] == 0
     assert source["target"]["tournament"] == {"slug": TOURNAMENT.slug, "id": TOURNAMENT.id}
+    assert source["not_run"] == [] and source["selection"]["include_orders"] is False
+    assert source["collections"]["tournament_markets"]["truncated"] is True
     steps = {s["index"]: s for s in source["steps"]}
     for f in manifest["fixtures"]:
         step = steps[f["source"]["capture_step"]]
         (attempt,) = step["attempts"]
-        # Each fixture names the recorded body it came from...
+        # Each fixture names the recorded request and body it came from...
         assert step["name"] == f["name"] and step["outcome"] == "passed"
+        assert step["client_validation_passed"] is True
         assert attempt["body"]["file"] == f["source"]["body_file"]
-        assert attempt["body"]["sha256"] == f["source"]["sha256"]
         assert attempt["path"] == f["request"]["path"]
         assert attempt["params"] == f["request"]["params"]
-        # ...but only unmodified fixtures may share that body's hash.
+        assert attempt["http_status"] == f["response"]["http_status"]
+        # ...but only unmodified fixtures keep the original hash, and equal it.
         if f["label"] == UNMODIFIED:
             assert f["redactions"] == []
-            assert f["sha256"] == f["source"]["sha256"]
+            assert f["sha256"] == f["source"]["sha256"] == attempt["body"]["sha256"]
+            assert f["bytes"] == f["source"]["bytes"] == attempt["body"]["bytes"]
         else:
-            assert f["label"] == REDACTED
-            assert f["redactions"]
-            assert f["sha256"] != f["source"]["sha256"]
+            assert f["label"] == REDACTED and f["redactions"]
+            assert "sha256" not in f["source"] and "bytes" not in f["source"]
+            assert "sha256" not in attempt["body"] and "bytes" not in attempt["body"]
+            assert attempt["body"]["omitted"] == ["sha256", "bytes"]
+
+
+def test_every_committed_hash_is_accounted_for() -> None:
+    # No original hash of a redacted body, and no hash of the capture manifest, may
+    # appear: either would let anyone verify guesses of what was redacted.
+    manifest = effective_manifest()
+    _, source = source_provenance()
+    allowed = {f["sha256"] for f in manifest["fixtures"]}
+    allowed |= {manifest["source_capture"]["provenance_sha256"], source["spec"]["sha256"]}
+    found: set[str] = set()
+    for path in RUN.rglob("*.json"):
+        found |= set(re.findall(r"\b[0-9a-f]{64}\b", path.read_text(encoding="utf-8")))
+    assert found <= allowed
+    assert "manifest_sha256" not in json.dumps(manifest)
 
 
 def test_redacted_paths_hold_their_documented_placeholders() -> None:
@@ -163,9 +192,13 @@ def test_redacted_paths_hold_their_documented_placeholders() -> None:
             for part in redaction["path"].removeprefix("$.").replace("[", ".").split("."):
                 node = node[int(part[:-1])] if part.endswith("]") else node[part]
             assert node == json.loads(redaction["replacement_json"], parse_float=Decimal)
+    tournament = fixtures_by_name()["tournament"]["redactions"]
+    assert [r["path"] for r in tournament] == ["$.myBalance", "$.isPendingEnrolment"]
     markets = fixtures_by_name()["tournament-markets-p1"]["redactions"]
     assert sorted(r["path"] for r in markets) == sorted(
-        f"$.data[{i}].creator.{field}" for i in range(10) for field in ("id", "username")
+        f"$.data[{i}].{field}"
+        for i in range(10)
+        for field in ("creator.id", "creator.username", "thumbnailUrl")
     )
 
 
@@ -182,7 +215,7 @@ def test_tournament_replay_verifies_the_real_slug_and_uuid() -> None:
     assert decimals([tournament.initialBalance]) == ["100000"]
     assert decimals([tournament.myBalance]) == ["12345.67"]  # redacted test value
     assert (tournament.memberCount, tournament.marketCount) == (4352, 237)
-    assert tournament.isPendingEnrolment is False
+    assert tournament.isPendingEnrolment is True  # redacted test value
 
 
 def test_markets_first_page_replay() -> None:
@@ -229,7 +262,12 @@ def test_markets_first_page_replay() -> None:
 
 def test_thumbnail_url_is_an_observed_extra_field_the_model_ignores() -> None:
     raw = json.loads((RUN / fixtures_by_name()["tournament-markets-p1"]["file"]).read_bytes())
-    assert all("thumbnailUrl" in market for market in raw["data"])
+    # The field and URL shape are kept; only the shared first segment is a placeholder.
+    shape = re.compile(
+        r"https://r2\.thesuper\.market/market-thumbnails/"
+        r"22222222-2222-4222-8222-222222222222/[0-9a-f-]{36}\.webp"
+    )
+    assert all(shape.fullmatch(market["thumbnailUrl"]) for market in raw["data"])
     assert "thumbnailUrl" not in TournamentMarket.model_fields
     page, _ = replay("list_tournament_markets_page", limit=10, status="any")
     assert all(not hasattr(m, "thumbnailUrl") and not m.model_extra for m in page.data)
