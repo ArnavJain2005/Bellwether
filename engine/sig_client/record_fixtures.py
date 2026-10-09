@@ -189,31 +189,52 @@ class _CredentialGuard:
         return self._text in value
 
     def in_body(self, content: bytes) -> bool:
-        """The key as raw bytes, or in any decoded JSON key or string.
+        """The key as raw bytes, or in any decoded JSON member name or string.
 
         Decoding covers every JSON escape (a \\u escape, an escaped solidus) and
-        UTF-16/32 bodies, which a raw byte search alone would miss.
+        UTF-16/32 bodies, which a raw byte search alone would miss. Every object member
+        is checked as it is parsed, before repeated names collapse: json.loads keeps only
+        the last value of a duplicate name, so an earlier member, or an object or list it
+        holds, would otherwise vanish from the parsed result unchecked.
         """
         if self._raw in content:
             return True
         try:
-            decoded = json.loads(content, parse_float=Decimal, parse_constant=_reject_constant)
+            root = json.loads(
+                content,
+                parse_float=Decimal,
+                parse_constant=_reject_constant,
+                object_pairs_hook=self._check_members,
+            )
+        except _CredentialInMember:
+            return True
         except (ValueError, RecursionError):
             return False  # not JSON: such a body is never stored
-        pending: list[object] = [decoded]
+        return self._in_strings(root)
+
+    def _check_members(self, pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        # Called once per object with all of its members in order, duplicates included.
+        for name, value in pairs:
+            if self._text in name or self._in_strings(value):
+                raise _CredentialInMember
+        return dict(pairs)  # last value wins for a repeated name, as in the client
+
+    def _in_strings(self, value: object) -> bool:
+        # Strings and lists only: every object in `value` was parsed, and so checked
+        # member by member, before `value` itself was complete.
+        pending = [value]
         while pending:
-            value = pending.pop()
-            if isinstance(value, str):
-                if self._text in value:
+            item = pending.pop()
+            if isinstance(item, str):
+                if self._text in item:
                     return True
-            elif isinstance(value, dict):
-                for key, item in value.items():
-                    if self._text in key:
-                        return True
-                    pending.append(item)
-            elif isinstance(value, list):
-                pending.extend(value)
+            elif isinstance(item, list):
+                pending.extend(item)
         return False
+
+
+class _CredentialInMember(Exception):
+    """Raised inside json.loads to stop parsing at the first member holding the key."""
 
 
 def utc_now() -> datetime:
