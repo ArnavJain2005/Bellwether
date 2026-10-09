@@ -50,6 +50,39 @@ python -m ruff check data/venue_markets
 git diff --check
 ```
 
+## Eligibility Evidence Rules
+
+A market is kept only with affirmative evidence of a **2026 U.S. Senate, House, governor or chamber-control contest**. Both venues apply the same checks in this order, and the first failing check becomes the exclusion reason (counted in the `exclusions` printed for each venue).
+
+**What counts as the contest identity.** Only the question/title, slug, structured Kalshi ticker/series and the event title. Description and rules text is *incidental*: it can neither make a market eligible nor ineligible. So a 2028 contest whose rules say "compare with the 2026 results" is rejected, and a genuine 2026 contest whose rules mention 2028 as background is kept. Closing dates and `close_time` are never cycle evidence.
+
+| Order | Check | Exclusion reason |
+| --- | --- | --- |
+| 1 | Market is open/active (Polymarket `closed is False`, `active is True`; Kalshi status `open`/`active`) | `market_closed`, `market_inactive` |
+| 2 | Not a resignation, appointment, confirmation, nomination, impeachment, retirement or cabinet/other unrelated event | `unrelated_political_event` |
+| 3 | No foreign country/demonym in the identity text (U.S. state names are masked first so "New Mexico" is not "Mexico"). If U.S. evidence is also present the subject is contradictory | `foreign_election`, `conflicting_jurisdiction` |
+| 4 | Not a state legislature contest ("state senate", "state house", "legislature", ...) | `state_legislative_contest` |
+| 5 | At most one U.S. state named (multi-state comparisons such as "Florida or South Carolina" are not one contest) | `conflicting_state_context` |
+| 6 | Identity names 2026 and no other year 2020-2039 (a ticker year such as `-26` counts; a second number such as a seat number does not). Any conflicting primary year is rejected | `lacks_2026_contest_year`, `non_2026_primary_contest` |
+| 7 | An office (Senate, House, governor/gubernatorial; the White House is not the House) **and** a contest term (win, election, race, seat, control, majority, midterm, ...), or a recognised structured symbol | `lacks_election_evidence` |
+| 8 | Positive U.S. jurisdiction, from explicit wording ("U.S.", "US", "USA", "United States"), an unambiguous U.S. state name, or a recognised structured symbol | `lacks_us_jurisdiction`, `ambiguous_jurisdiction` |
+
+Generic words ("senate", "governor", "control") alone are never enough. "Georgia" and "Washington" are ambiguous (country/city) and need explicit U.S. wording. State abbreviations are never inferred from prose such as "in".
+
+**Recognised structured Kalshi symbols** (no broad prefix bypasses the checks above, apart from replacing the office/contest and jurisdiction evidence): `CONTROLS`/`CONTROLH` (optionally `KX`-prefixed) for chamber control, and `SENATE<ST>`, `SENATEPARTY<ST>`, `GOV<ST>`/`GOVPARTY<ST>`, `HOUSE<ST><district|AL>` where `<ST>` is a real two-letter U.S. state code. The cycle year must still come from the identity text or from the year token of the ticker, and foreign/legislature/conflict checks still apply.
+
+**Limitations.**
+- Evidence is textual and deliberately conservative. A genuine market whose question has neither explicit U.S. wording nor a state name (for example "Will Democrats control the Senate after the 2026 midterms?") is excluded as `lacks_us_jurisdiction`; review the exclusion counts of a real fetch.
+- A year other than 2026 anywhere in the question/slug/title rejects the market, even when it is only background (e.g. "the seat held since 2022").
+- The foreign-term list is finite; an unlisted country is not detected unless U.S. evidence is absent.
+- Party names ("Democrats"/"Republicans") and the word "midterms" are not accepted as U.S. evidence by themselves.
+- Primary elections are not distinguished from general elections.
+- A state named alongside "House" (e.g. "Texas House") is read as a federal House contest unless a legislature phrase is present.
+
+## Polymarket Binary Outcome Mappings
+
+A market is kept only when `tokens` holds **exactly two** records, each with a nonempty string `outcome` and a nonempty string `token_id` (not null, blank or a placeholder such as `"None"`), with distinct labels (case-insensitive) and distinct token IDs. If either record is bad the whole market is rejected; a bad record is never dropped to salvage the other, and three outcomes are never truncated to two. Native labels are preserved (no `Yes`/`No` is invented) and the label, token ID and price stay associated whatever the array order. Reasons: `invalid_tokens` (not a list), `non_binary_tokens` (count is not two), `invalid_token_mapping` (malformed or duplicated).
+
 ## Output Schema
 
 The output JSON file contains:
@@ -64,8 +97,8 @@ The output JSON file contains:
     {
       "venue": "polymarket",
       "market_id": "0x123... (Condition ID)",
-      "question": "Will the Democratic Party control the Senate after the 2026 Midterm elections?",
-      "slug": "will-the-democratic-party-control-the-senate-after-the-2026-midterm-elections",
+      "question": "Will the Democratic Party control the U.S. Senate after the 2026 midterm elections?",
+      "slug": "will-the-democratic-party-control-the-us-senate-after-the-2026-midterm-elections",
       "outcomes": ["Yes", "No"],
       "clob_token_ids": ["113287701...", "10711843..."],
       "outcome_token_map": {

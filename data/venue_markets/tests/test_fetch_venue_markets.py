@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import copy
 import io
 import json
@@ -137,7 +138,7 @@ def test_polymarket_non_2026_cycle_excluded() -> None:
     }
     is_eligible, reason = is_2026_polymarket_market(aoc_2028)
     assert not is_eligible
-    assert reason == "non_2026_cycle"
+    assert reason == "non_2026_primary_contest"
 
 
 def test_polymarket_closed_or_inactive_excluded() -> None:
@@ -180,7 +181,7 @@ def test_kalshi_eligibility_checks() -> None:
     genuine = {
         "ticker": "SENATE-26",
         "status": "open",
-        "title": "2026 Senate control",
+        "title": "2026 U.S. Senate control",
         "rules_primary": "If the Democrats hold the Senate in 2026. (Unlike in 2028)",
     }
     is_eligible, _ = is_2026_kalshi_market(genuine, {}, is_primary_match=True)
@@ -206,8 +207,8 @@ def test_polymarket_token_mapping_validation() -> None:
     valid_items = {
         "data": [{
             "condition_id": "1001",
-            "question": "Will Democrats win Georgia Senate in 2026?",
-            "market_slug": "democrats-georgia-senate-2026",
+            "question": "Will Democrats win the U.S. Senate seat in Texas in 2026?",
+            "market_slug": "democrats-texas-senate-2026",
             "closed": False,
             "active": True,
             "tokens": [
@@ -226,7 +227,7 @@ def test_polymarket_token_mapping_validation() -> None:
     mismatched_items = {
         "data": [{
             "condition_id": "1002",
-            "question": "Will Republicans win Georgia Senate in 2026?",
+            "question": "Will Republicans win the U.S. Senate seat in Texas in 2026?",
             "closed": False,
             "active": True,
             "tokens": [
@@ -243,7 +244,7 @@ def test_polymarket_token_mapping_validation() -> None:
     null_outcome_items = {
         "data": [{
             "condition_id": "1003",
-            "question": "Will Democrats win Georgia Senate in 2026?",
+            "question": "Will Democrats win the U.S. Senate seat in Texas in 2026?",
             "closed": False,
             "active": True,
             "tokens": [
@@ -352,14 +353,14 @@ def _poly_item(cid: str, question: str, slug: str) -> dict:
 
 def _poly_controls() -> list[dict]:
     return [
-        _poly_item("poly-control-senate", "Will Democrats control the Senate in 2026?", "dems-control-senate-2026"),
-        _poly_item("poly-control-house", "Will Democrats control the House in 2026?", "dems-control-house-2026"),
+        _poly_item("poly-control-senate", "Will Democrats control the Senate in the 2026 U.S. midterms?", "dems-control-the-senate-2026-us-midterms"),
+        _poly_item("poly-control-house", "Will Democrats control the House in the 2026 U.S. midterms?", "dems-control-the-house-2026-us-midterms"),
     ]
 
 
 def _poly_seats(start: int, count: int) -> list[dict]:
     return [
-        _poly_item(f"poly-seat-{i}", f"Will Democrats win Senate seat {i} in 2026?", f"senate-seat-{i}-2026")
+        _poly_item(f"poly-seat-{i}", f"Will Democrats win U.S. Senate seat {i} in 2026?", f"us-senate-seat-{i}-2026")
         for i in range(start, start + count)
     ]
 
@@ -367,16 +368,16 @@ def _poly_seats(start: int, count: int) -> list[dict]:
 def _kalshi_controls() -> list[dict]:
     return [
         {
-            "title": "2026 Senate Control",
+            "title": "2026 U.S. Senate Control",
             "series_ticker": "CONTROLS",
             "event_ticker": "CONTROLS-26",
-            "markets": [{"ticker": "CONTROLS-26-D", "status": "open", "title": "2026 Senate Control"}],
+            "markets": [{"ticker": "CONTROLS-26-D", "status": "open", "title": "2026 U.S. Senate Control"}],
         },
         {
-            "title": "2026 House Control",
+            "title": "2026 U.S. House Control",
             "series_ticker": "CONTROLH",
             "event_ticker": "CONTROLH-26",
-            "markets": [{"ticker": "CONTROLH-26-D", "status": "open", "title": "2026 House Control"}],
+            "markets": [{"ticker": "CONTROLH-26-D", "status": "open", "title": "2026 U.S. House Control"}],
         },
     ]
 
@@ -384,10 +385,10 @@ def _kalshi_controls() -> list[dict]:
 def _kalshi_seats(start: int, count: int) -> list[dict]:
     return [
         {
-            "title": f"2026 Senate seat {i}",
+            "title": f"2026 U.S. Senate seat {i}",
             "series_ticker": "SENATE",
             "event_ticker": f"SENATE-26-{i}",
-            "markets": [{"ticker": f"SENATE-26-{i}", "status": "open", "title": f"2026 Senate seat {i}"}],
+            "markets": [{"ticker": f"SENATE-26-{i}", "status": "open", "title": f"2026 U.S. Senate seat {i}"}],
         }
         for i in range(start, start + count)
     ]
@@ -843,3 +844,541 @@ def test_main_kalshi_explicit_empty_terminal_cursor_ends_traversal(
 
     assert env.kalshi_cursors == [None, "k2"]
     _assert_success(env, code, POLY_IDS, KALSHI_IDS)
+
+
+# =====================================================================
+# 7. Election eligibility (both venues)
+# =====================================================================
+#
+# A market is eligible only with affirmative evidence of a 2026 U.S. Senate, House, governor
+# or chamber-control contest. The contest identity comes from the question/title, slug,
+# structured ticker/series and event title; description/rules text is incidental and can neither
+# create nor destroy eligibility. See README "Eligibility evidence rules".
+
+
+def _poly_market(question: str, slug: str = "", description: str = "", **extra: object) -> dict:
+    item: dict = {
+        "question": question,
+        "market_slug": slug,
+        "description": description,
+        "closed": False,
+        "active": True,
+    }
+    item.update(extra)
+    return item
+
+
+POLY_ELIGIBLE = [
+    pytest.param(_poly_market("Will Democrats win the U.S. Senate election in 2026?"), id="senate"),
+    pytest.param(_poly_market("Will Republicans win the U.S. House majority in the 2026 midterms?"), id="house"),
+    pytest.param(_poly_market("Who will win the 2026 Texas governor election?"), id="governor-state-context"),
+    pytest.param(_poly_market("Who will win the 2026 Ohio gubernatorial race?"), id="gubernatorial"),
+    pytest.param(_poly_market("Will Democrats control the Senate in the 2026 U.S. midterms?"), id="chamber-control-senate"),
+    pytest.param(_poly_market("Will Republicans control the House in the 2026 U.S. midterms?"), id="chamber-control-house"),
+    pytest.param(_poly_market("Will the Democrat win the Arizona Senate race in 2026?"), id="state-senate-race"),
+    pytest.param(_poly_market("Will Republicans win the West Virginia Senate race in 2026?"), id="west-virginia"),
+    pytest.param(_poly_market("Will Democrats win the Virginia Senate race in 2026?"), id="virginia"),
+    pytest.param(_poly_market("Will Democrats win the U.S. Senate seat in Georgia in 2026?"), id="georgia-with-explicit-us"),
+    pytest.param(
+        _poly_market("Will Democrats win the U.S. Senate election?", "will-democrats-win-the-us-senate-election-2026"),
+        id="year-from-slug",
+    ),
+    pytest.param(
+        _poly_market(
+            "Will Democrats control the U.S. Senate in 2026?",
+            description="Unlike 2028 and 2024, this concerns only the 2026 election.",
+        ),
+        id="rules-mention-other-years-as-background",
+    ),
+]
+
+
+@pytest.mark.parametrize("item", POLY_ELIGIBLE)
+def test_polymarket_eligible_contests(item: dict) -> None:
+    assert is_2026_polymarket_market(item) == (True, "verified_2026")
+
+
+POLY_INELIGIBLE = [
+    pytest.param(
+        _poly_market("Who will win the Brazilian Senate election in 2026?"),
+        "foreign_election",
+        id="brazilian-senate-2026",
+    ),
+    pytest.param(
+        _poly_market(
+            "Who will win the U.S. Senate election in 2028?",
+            description="Compare with the 2026 election results.",
+        ),
+        "non_2026_primary_contest",
+        id="us-senate-2028-rules-mention-2026",
+    ),
+    pytest.param(
+        _poly_market("Will Democrats win the U.S. Senate in 2026 and 2028?"),
+        "non_2026_primary_contest",
+        id="conflicting-primary-years",
+    ),
+    pytest.param(
+        _poly_market("Will Democrats win the U.S. Senate in 2026?", "us-senate-2028"),
+        "non_2026_primary_contest",
+        id="slug-contradicts-question-year",
+    ),
+    pytest.param(
+        _poly_market(
+            "Who will win the U.S. Senate election?",
+            description="Resolves in 2026.",
+            end_date_iso="2026-11-03T00:00:00Z",
+        ),
+        "lacks_2026_contest_year",
+        id="closing-date-and-description-not-cycle-evidence",
+    ),
+    pytest.param(
+        _poly_market("Will Democrats win the Georgia Senate race in 2026?"),
+        "ambiguous_jurisdiction",
+        id="georgia-country-or-state",
+    ),
+    pytest.param(
+        _poly_market("Will Democrats win the Senate in 2026?"),
+        "lacks_us_jurisdiction",
+        id="generic-senate-no-us-evidence",
+    ),
+    pytest.param(
+        _poly_market("Will the governor be re-elected in 2026?"),
+        "lacks_us_jurisdiction",
+        id="generic-governor-no-us-evidence",
+    ),
+    pytest.param(
+        _poly_market("Will the U.S. Senate vote on a Canada trade deal in 2026?"),
+        "conflicting_jurisdiction",
+        id="us-and-foreign-context",
+    ),
+    pytest.param(
+        _poly_market("Closer Senate Race in 2026: Florida or South Carolina?"),
+        "conflicting_state_context",
+        id="multi-state-comparison",
+    ),
+    pytest.param(
+        _poly_market("Will Democrats win the Texas state senate in 2026?"),
+        "state_legislative_contest",
+        id="state-legislature",
+    ),
+    pytest.param(
+        _poly_market("Will the U.S. governor of Texas resign in 2026?"),
+        "unrelated_political_event",
+        id="resignation",
+    ),
+    pytest.param(
+        _poly_market("Will Trump appoint a new U.S. Senate majority leader in 2026?"),
+        "unrelated_political_event",
+        id="appointment",
+    ),
+    pytest.param(
+        _poly_market("Who will be confirmed as Secretary of State in 2026 in the U.S.?"),
+        "unrelated_political_event",
+        id="confirmation",
+    ),
+    pytest.param(
+        _poly_market("Will the U.S. Senate pass the farm bill in 2026?"),
+        "lacks_election_evidence",
+        id="office-without-election",
+    ),
+    pytest.param(
+        _poly_market("Will Trump be in the White House after the 2026 U.S. election?"),
+        "lacks_election_evidence",
+        id="white-house-is-not-the-house",
+    ),
+    pytest.param(
+        _poly_market("Will the United States win the 2026 World Cup?"),
+        "lacks_election_evidence",
+        id="us-but-not-an-election",
+    ),
+    pytest.param(
+        _poly_market("Will Democrats control the Senate in the 2026 U.S. midterms?", closed=True),
+        "market_closed",
+        id="closed",
+    ),
+    pytest.param(
+        _poly_market("Will Democrats control the Senate in the 2026 U.S. midterms?", active=False),
+        "market_inactive",
+        id="inactive",
+    ),
+]
+
+
+@pytest.mark.parametrize(("item", "reason"), POLY_INELIGIBLE)
+def test_polymarket_ineligible_contests(item: dict, reason: str) -> None:
+    assert is_2026_polymarket_market(item) == (False, reason)
+
+
+def _kalshi_market(
+    ticker: str,
+    series: str,
+    title: str,
+    ev_title: str = "",
+    rules: str = "",
+    status: str = "open",
+    **extra: object,
+) -> tuple[dict, dict]:
+    market: dict = {"ticker": ticker, "status": status, "title": title, "rules_primary": rules}
+    market.update(extra)
+    return market, {"title": ev_title, "series_ticker": series, "event_ticker": ticker.rsplit("-", 1)[0]}
+
+
+KALSHI_ELIGIBLE = [
+    pytest.param(("KXSENATE-26", "KXSENATE", "Will Democrats win the U.S. Senate in 2026?"), id="senate-title"),
+    pytest.param(("HOUSE-26-A", "HOUSE", "Which party will win the U.S. House in 2026?"), id="house-title"),
+    pytest.param(("KXGOV-26", "KXGOV", "Who will win the 2026 Ohio governor race?"), id="governor-state-context"),
+    pytest.param(
+        ("KXCTRL-26", "KXCTRL", "Will Republicans control the U.S. House after the 2026 midterms?"),
+        id="chamber-control-title",
+    ),
+    pytest.param(("SENATEAZ-26-D", "SENATEAZ", "Democratic Party"), id="structured-senate-state"),
+    pytest.param(("HOUSETX12-26-D", "HOUSETX12", "Democratic Party"), id="structured-house-district"),
+    pytest.param(("GOVPARTYTX-26-D", "GOVPARTYTX", "Democratic Party"), id="structured-governor-state"),
+    pytest.param(("CONTROLS-26-D", "CONTROLS", "Democratic Party"), id="structured-senate-control"),
+    pytest.param(("KXCONTROLH-26-R", "KXCONTROLH", "Republican Party"), id="structured-house-control"),
+    pytest.param(("CONTROLS-2026-D", "CONTROLS", "Yes"), id="structured-four-digit-year"),
+    pytest.param(
+        ("KXSENATE-26", "KXSENATE", "Will Democrats win the U.S. Senate in 2026?", "", "Unlike in 2028, only 2026 counts."),
+        id="rules-mention-other-year-as-background",
+    ),
+    pytest.param(
+        ("KXSENATE-26-28", "KXSENATE", "Will Democrats win the U.S. Senate in 2026?"),
+        id="seat-number-is-not-a-year",
+    ),
+]
+
+
+@pytest.mark.parametrize("args", KALSHI_ELIGIBLE)
+@pytest.mark.parametrize("primary_flag", [False, True])
+def test_kalshi_eligible_contests(args: tuple, primary_flag: bool) -> None:
+    market, event = _kalshi_market(*args)
+    assert is_2026_kalshi_market(market, event, is_primary_match=primary_flag) == (True, None)
+
+
+KALSHI_INELIGIBLE = [
+    pytest.param(
+        ("KXBRSENATE-26", "KXBRSENATE", "Who will win the Brazilian Senate election in 2026?"),
+        "foreign_election",
+        id="brazilian-senate-2026",
+    ),
+    pytest.param(
+        (
+            "KXSENATE-28",
+            "KXSENATE",
+            "Who will win the U.S. Senate election in 2028?",
+            "",
+            "Compare with the 2026 election results.",
+        ),
+        "non_2026_primary_contest",
+        id="us-senate-2028-rules-mention-2026",
+    ),
+    pytest.param(
+        ("KXSENATE-28", "KXSENATE", "Will Democrats win the U.S. Senate in 2026?"),
+        "non_2026_primary_contest",
+        id="ticker-year-contradicts-title",
+    ),
+    pytest.param(
+        ("CONTROLH-28-D", "CONTROLH", "Democratic Party"),
+        "non_2026_primary_contest",
+        id="structured-control-with-2028-ticker",
+    ),
+    pytest.param(
+        ("SENATE-26-X", "SENATE", "Senate election 2026"),
+        "lacks_us_jurisdiction",
+        id="broad-senate-prefix-does-not-bypass",
+    ),
+    pytest.param(
+        ("SENATEXX-26-D", "SENATEXX", "Democratic Party"),
+        "lacks_election_evidence",
+        id="invalid-state-abbreviation-not-structured",
+    ),
+    pytest.param(
+        ("SENATEAZ-26-D", "SENATEAZ", "Australian Senate election 2026"),
+        "conflicting_jurisdiction",
+        id="structured-us-with-foreign-title",
+    ),
+    pytest.param(
+        ("KXSENATE-26", "KXSENATE", "Will Democrats win the Georgia Senate race in 2026?"),
+        "ambiguous_jurisdiction",
+        id="georgia-country-or-state",
+    ),
+    pytest.param(
+        ("KXSENATE-26", "KXSENATE", "Will Democrats win the Senate in 2026?"),
+        "lacks_us_jurisdiction",
+        id="in-is-not-indiana",
+    ),
+    pytest.param(
+        ("KXUKGEYEAR-26", "KXUKGEYEAR", "UK General Election in 2026", "UK General Election"),
+        "foreign_election",
+        id="uk-general-election",
+    ),
+    pytest.param(
+        ("NBA-26", "NBA", "2026 NBA Finals winner"),
+        "lacks_election_evidence",
+        id="sports",
+    ),
+    pytest.param(
+        ("KXSENATE-26", "KXSENATE", "Will the U.S. Senate majority leader resign in 2026?"),
+        "unrelated_political_event",
+        id="resignation",
+    ),
+    pytest.param(
+        ("KXSENATE", "KXSENATE", "Will Democrats win the U.S. Senate?", "", "", "open", {"close_time": "2026-11-03T00:00:00Z"}),
+        "lacks_2026_contest_year",
+        id="closing-time-is-not-cycle-evidence",
+    ),
+    pytest.param(
+        ("KXSENATE-26", "KXSENATE", "Closer Senate race 2026: Florida or South Carolina?"),
+        "conflicting_state_context",
+        id="multi-state-comparison",
+    ),
+    pytest.param(
+        ("KXSENATE-26", "KXSENATE", "Will Democrats win the Texas state senate in 2026?"),
+        "state_legislative_contest",
+        id="state-legislature",
+    ),
+    pytest.param(
+        ("KXSENATE-26", "KXSENATE", "Will the U.S. Senate pass the farm bill in 2026?"),
+        "lacks_election_evidence",
+        id="office-without-election",
+    ),
+    pytest.param(
+        ("CONTROLS-26-D", "CONTROLS", "Democratic Party", "", "", "closed"),
+        "market_inactive",
+        id="closed-status",
+    ),
+    pytest.param(
+        ("CONTROLS-26-D", "CONTROLS", "Democratic Party", "", "", ""),
+        "market_inactive",
+        id="missing-status",
+    ),
+]
+
+
+@pytest.mark.parametrize(("args", "reason"), KALSHI_INELIGIBLE)
+@pytest.mark.parametrize("primary_flag", [False, True])
+def test_kalshi_ineligible_contests(args: tuple, reason: str, primary_flag: bool) -> None:
+    extra = args[6] if len(args) > 6 else {}
+    market, event = _kalshi_market(*args[:6], **extra)
+    assert is_2026_kalshi_market(market, event, is_primary_match=primary_flag) == (False, reason)
+
+
+# =====================================================================
+# 8. Polymarket binary outcome-token mappings
+# =====================================================================
+
+class _PolyPageOpener:
+    def __init__(self, items: list[dict]) -> None:
+        self.items = items
+
+    def open(self, req: urllib.request.Request) -> io.BytesIO:
+        return io.BytesIO(json.dumps({"data": self.items, "next_cursor": "LTE="}).encode("utf-8"))
+
+
+def _binary_market(tokens: object, cid: str = "bin-1") -> dict:
+    return _poly_market(
+        "Will Democrats win the U.S. Senate election in 2026?",
+        "us-senate-2026",
+        condition_id=cid,
+        tokens=tokens,
+    )
+
+
+def _fetch_items(items: list[dict]) -> tuple[list[dict], dict[str, int]]:
+    return fetch_polymarket_markets(RateLimiter(interval=0.0), opener=_PolyPageOpener(items))
+
+
+_YES = {"outcome": "Yes", "token_id": "tok-yes", "price": 0.7}
+_NO = {"outcome": "No", "token_id": "tok-no", "price": 0.3}
+
+TOKEN_REJECTS = [
+    pytest.param([], "non_binary_tokens", id="zero-tokens"),
+    pytest.param([_YES], "non_binary_tokens", id="one-token"),
+    pytest.param([_YES, _NO, {"outcome": "Maybe", "token_id": "tok-maybe"}], "non_binary_tokens", id="three-tokens"),
+    pytest.param([_YES, _NO, dict(_YES, token_id="t3"), dict(_NO, token_id="t4")], "non_binary_tokens", id="four-tokens"),
+    pytest.param(None, "invalid_tokens", id="tokens-null"),
+    pytest.param("Yes/No", "invalid_tokens", id="tokens-not-a-list"),
+    pytest.param([_YES, dict(_NO, outcome="Yes")], "invalid_token_mapping", id="duplicate-labels"),
+    pytest.param([_YES, dict(_NO, outcome="yes")], "invalid_token_mapping", id="duplicate-labels-case-insensitive"),
+    pytest.param([_YES, dict(_NO, token_id="tok-yes")], "invalid_token_mapping", id="duplicate-token-ids"),
+    pytest.param([dict(_YES, outcome=None), _NO], "invalid_token_mapping", id="first-label-null"),
+    pytest.param([_YES, dict(_NO, outcome=None)], "invalid_token_mapping", id="second-label-null"),
+    pytest.param([_YES, dict(_NO, outcome="")], "invalid_token_mapping", id="blank-label"),
+    pytest.param([_YES, dict(_NO, outcome="   ")], "invalid_token_mapping", id="whitespace-label"),
+    pytest.param([_YES, dict(_NO, outcome="None")], "invalid_token_mapping", id="placeholder-label"),
+    pytest.param([_YES, dict(_NO, outcome=7)], "invalid_token_mapping", id="non-string-label"),
+    pytest.param([dict(_YES, token_id=None), _NO], "invalid_token_mapping", id="first-token-id-null"),
+    pytest.param([_YES, dict(_NO, token_id=None)], "invalid_token_mapping", id="second-token-id-null"),
+    pytest.param([_YES, dict(_NO, token_id="")], "invalid_token_mapping", id="blank-token-id"),
+    pytest.param([_YES, dict(_NO, token_id=" ")], "invalid_token_mapping", id="whitespace-token-id"),
+    pytest.param([_YES, dict(_NO, token_id="None")], "invalid_token_mapping", id="placeholder-token-id"),
+    pytest.param([_YES, dict(_NO, token_id=123)], "invalid_token_mapping", id="non-string-token-id"),
+    pytest.param([_YES, {"outcome": "No", "price": 0.3}], "invalid_token_mapping", id="missing-token-id"),
+    pytest.param([_YES, {"token_id": "tok-no", "price": 0.3}], "invalid_token_mapping", id="missing-label"),
+    pytest.param([_YES, "No"], "invalid_token_mapping", id="record-not-an-object"),
+]
+
+
+@pytest.mark.parametrize(("tokens", "reason"), TOKEN_REJECTS)
+def test_polymarket_rejects_non_binary_or_malformed_token_mappings(tokens: object, reason: str) -> None:
+    """The whole market is rejected; nothing is truncated or salvaged from a bad record."""
+    markets, excluded = _fetch_items([_binary_market(copy.deepcopy(tokens))])
+    assert markets == []
+    assert excluded == {reason: 1}
+
+
+def test_polymarket_accepts_exactly_two_valid_tokens() -> None:
+    markets, excluded = _fetch_items([_binary_market(copy.deepcopy([_YES, _NO]))])
+    assert excluded == {}
+    assert len(markets) == 1
+    market = markets[0]
+    assert market["outcomes"] == ["Yes", "No"]
+    assert market["clob_token_ids"] == ["tok-yes", "tok-no"]
+    assert market["outcome_token_map"] == {"Yes": "tok-yes", "No": "tok-no"}
+    assert market["snapshot_prices"]["outcome_prices"] == [0.7, 0.3]
+
+
+def test_polymarket_reversed_token_order_keeps_label_token_price_association() -> None:
+    markets, excluded = _fetch_items([_binary_market(copy.deepcopy([_NO, _YES]))])
+    assert excluded == {}
+    market = markets[0]
+    assert market["outcomes"] == ["No", "Yes"]
+    assert market["clob_token_ids"] == ["tok-no", "tok-yes"]
+    assert market["outcome_token_map"] == {"No": "tok-no", "Yes": "tok-yes"}
+    assert market["snapshot_prices"]["outcome_prices"] == [0.3, 0.7]
+    prices = dict(zip(market["outcomes"], market["snapshot_prices"]["outcome_prices"], strict=True))
+    assert prices == {"No": 0.3, "Yes": 0.7}
+
+
+def test_polymarket_preserves_native_non_yes_no_labels() -> None:
+    tokens = [
+        {"outcome": "Democratic", "token_id": "tok-d", "price": 0.55},
+        {"outcome": "Republican", "token_id": "tok-r", "price": 0.45},
+    ]
+    markets, excluded = _fetch_items([_binary_market(copy.deepcopy(tokens))])
+    assert excluded == {}
+    market = markets[0]
+    assert market["outcomes"] == ["Democratic", "Republican"]
+    assert market["outcome_token_map"] == {"Democratic": "tok-d", "Republican": "tok-r"}
+    assert "Yes" not in market["outcome_token_map"] and "No" not in market["outcome_token_map"]
+
+
+def test_polymarket_does_not_salvage_remaining_mapping_from_bad_record() -> None:
+    """One malformed record rejects the market even though the other record is perfectly valid."""
+    markets, excluded = _fetch_items([_binary_market([_YES, dict(_NO, token_id=None)])])
+    assert markets == []
+    assert excluded == {"invalid_token_mapping": 1}
+
+
+# =====================================================================
+# 9. Eligibility and mappings through the real main() harness
+# =====================================================================
+
+def _exclusions(out: str, venue: str) -> dict:
+    (line,) = [ln for ln in out.splitlines() if ln.startswith("Found") and f"from {venue}" in ln]
+    return ast.literal_eval(line.split("exclusions: ", 1)[1].rstrip(")"))
+
+
+def _poly_noise() -> list[dict]:
+    one = _poly_item("poly-bad-one-token", "Will Democrats win U.S. Senate seat 500 in 2026?", "us-senate-seat-500-2026")
+    one["tokens"] = one["tokens"][:1]
+    three = _poly_item("poly-bad-three-tokens", "Will Democrats win U.S. Senate seat 501 in 2026?", "us-senate-seat-501-2026")
+    three["tokens"] = [*three["tokens"], {"outcome": "Maybe", "token_id": "poly-bad-three-tokens-maybe"}]
+    null_label = _poly_item("poly-bad-null-label", "Will Democrats win U.S. Senate seat 502 in 2026?", "us-senate-seat-502-2026")
+    null_label["tokens"][1]["outcome"] = None
+    return [
+        _poly_item("poly-bad-brazil", "Who will win the Brazilian Senate election in 2026?", "brazilian-senate-election-2026"),
+        {
+            **_poly_item("poly-bad-2028", "Who will win the U.S. Senate election in 2028?", "us-senate-election-2028"),
+            "description": "Compare with the 2026 election results.",
+        },
+        one,
+        three,
+        null_label,
+    ]
+
+
+def _kalshi_noise() -> list[dict]:
+    def event(ticker: str, series: str, title: str, rules: str = "", status: str = "open") -> dict:
+        return {
+            "title": title,
+            "series_ticker": series,
+            "event_ticker": ticker,
+            "markets": [{"ticker": ticker, "status": status, "title": title, "rules_primary": rules}],
+        }
+
+    return [
+        event("KXBRSENATE-26", "KXBRSENATE", "Who will win the Brazilian Senate election in 2026?"),
+        event("KXSENATE-28", "KXSENATE", "Who will win the U.S. Senate election in 2028?", "Compare with the 2026 election results."),
+        event("SENATE-26-X", "SENATE", "Senate election 2026"),
+        event("KXSENATE-26-C", "KXSENATE", "Will Democrats win the U.S. Senate in 2026?", status="closed"),
+    ]
+
+
+def test_main_excludes_ineligible_markets_and_invalid_mappings_from_successful_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    poly, kalshi = _valid_poly(), _valid_kalshi()
+    poly["c2"]["data"] = poly["c2"]["data"] + _poly_noise()
+    kalshi["k2"]["events"] = kalshi["k2"]["events"] + _kalshi_noise()
+    env = _install(tmp_path, monkeypatch, poly, kalshi)
+    code, out, _err = _run_main(capsys)
+
+    assert env.poly_cursors == [None, "c2"]
+    assert env.kalshi_cursors == [None, "k2"]
+    published = _assert_success(env, code, POLY_IDS, KALSHI_IDS)
+    assert all(len(m["outcomes"]) == 2 for m in published["polymarket"])
+    assert _exclusions(out, "Polymarket") == {
+        "foreign_election": 1,
+        "non_2026_primary_contest": 1,
+        "non_binary_tokens": 2,
+        "invalid_token_mapping": 1,
+    }
+    assert _exclusions(out, "Kalshi") == {
+        "foreign_election": 1,
+        "non_2026_primary_contest": 1,
+        "lacks_us_jurisdiction": 1,
+        "market_inactive": 1,
+    }
+
+
+def _assert_validation_failure(env: _Env, code: object, err: str, reason: str) -> None:
+    assert env.poly_cursors == [None, "c2"]
+    assert env.kalshi_cursors == [None, "k2"]
+    assert code == 1
+    assert "VALIDATION FAILED ON NEW DATASET" in err
+    assert reason in err
+    _assert_preserved(env)
+
+
+def test_main_invalid_mapping_removing_house_control_preserves_latest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    poly = _valid_poly()
+    poly[""]["data"][1]["tokens"] = poly[""]["data"][1]["tokens"][:1]  # House control: one token
+    env = _install(tmp_path, monkeypatch, poly, _valid_kalshi())
+    code, _out, err = _run_main(capsys)
+    _assert_validation_failure(env, code, err, "Polymarket missing House Control market")
+
+
+def test_main_ineligible_senate_control_preserves_latest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    poly = _valid_poly()
+    poly[""]["data"][0]["question"] = "Will Democrats control the Senate in the 2026 midterms?"  # no U.S. evidence
+    poly[""]["data"][0]["market_slug"] = "dems-control-the-senate-2026-midterms"
+    env = _install(tmp_path, monkeypatch, poly, _valid_kalshi())
+    code, _out, err = _run_main(capsys)
+    _assert_validation_failure(env, code, err, "Polymarket missing Senate Control market")
+
+
+def test_main_conflicting_kalshi_house_control_year_preserves_latest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    kalshi = _valid_kalshi()
+    house_event = kalshi[""]["events"][1]
+    house_event["title"] = "2028 U.S. House Control"
+    house_event["markets"][0]["title"] = "2026 U.S. House Control 2028"
+    env = _install(tmp_path, monkeypatch, _valid_poly(), kalshi)
+    code, _out, err = _run_main(capsys)
+    _assert_validation_failure(env, code, err, "Kalshi missing House Control market")

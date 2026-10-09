@@ -32,12 +32,6 @@ class FetchError(Exception):
     """Raised when venue market fetching or pagination fails."""
 
 
-# Regex matching primary target series on Kalshi
-KALSHI_TARGET_SERIES_RE = re.compile(
-    r"^(?:KX)?(?:CONTROLS|CONTROLH|SENATE.*|GOVPARTY.*|HOUSE(?:PARTY)?[-_]?[A-Z]{2}[-_]?(?:\d+|AL).*)$",
-    re.IGNORECASE,
-)
-
 US_STATES = [
     "alabama", "alaska", "arizona", "arkansas", "california", "colorado",
     "connecticut", "delaware", "florida", "georgia", "hawaii", "idaho",
@@ -217,72 +211,227 @@ def classify_race(venue: str, market: dict[str, Any]) -> str:
 # Market Eligibility Verification
 # =====================================================================
 
+# Contest-evidence rules shared by both venues. See README "Eligibility evidence rules".
+CONTEST_YEAR = 2026
+
+# State names that are also countries/cities: not sufficient U.S. evidence on their own.
+AMBIGUOUS_STATE_NAMES = frozenset({"georgia", "washington"})
+
+_FOREIGN_TERMS = (
+    "argentina", "argentine", "australia", "australian", "austria", "austrian", "belgium", "belgian",
+    "brazil", "brazilian", "britain", "british", "canada", "canadian", "chile", "chilean", "china",
+    "chinese", "colombia", "colombian", "denmark", "danish", "egypt", "egyptian", "england", "english",
+    "eu", "european union", "european", "finland", "finnish", "france", "french", "germany", "german",
+    "greece", "greek", "hungary", "hungarian", "india", "indian", "indonesia", "indonesian", "iran",
+    "iranian", "ireland", "irish", "israel", "israeli", "italy", "italian", "japan", "japanese",
+    "kenya", "korea", "korean", "mexico", "mexican", "netherlands", "dutch", "nigeria", "nigerian",
+    "norway", "norwegian", "pakistan", "peru", "peruvian", "philippines", "philippine", "poland",
+    "polish", "portugal", "portuguese", "russia", "russian", "scotland", "scottish", "spain",
+    "spanish", "sweden", "swedish", "switzerland", "swiss", "taiwan", "turkey", "turkish", "uk",
+    "united kingdom", "ukraine", "ukrainian", "venezuela", "venezuelan", "wales", "welsh",
+    "south africa", "south african",
+)
+_FOREIGN_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(t) for t in sorted(_FOREIGN_TERMS, key=len, reverse=True)) + r")\b"
+)
+_UNRELATED_RE = re.compile(
+    r"\b(?:steps? down|resign(?:s|ed|ation)?|appoint(?:s|ed|ment)?|confirmed as|confirmation of"
+    r"|nominated|nomination to|impeach(?:ed|ment)?|retire(?:s|d|ment)?|cabinet|secretary of"
+    r"|reconciliation bill|federal reserve board of)\b"
+)
+_STATE_LEGISLATURE_RE = re.compile(
+    r"\b(?:state senate|state house|state assembly|state legislature|statehouse|legislature"
+    r"|general assembly|house of delegates)\b"
+)
+_US_WORDING_RE = re.compile(r"\b(?:us|usa|united states)\b")
+_OFFICE_RE = re.compile(r"\b(?:senate|house|governor|governors|gubernatorial)\b")
+_CONTEST_RE = re.compile(
+    r"\b(?:win|wins|won|winner|winners|elect|elected|election|elections|race|races|seat|seats"
+    r"|control|controls|controlled|majority|midterm|midterms|flip|flips)\b"
+)
+_YEAR_RE = re.compile(r"\b(20[23]\d)\b")
+
+# Narrow, state-validated Kalshi structured series/ticker patterns (a bare "SENATE" prefix is
+# deliberately NOT enough: the state abbreviation must follow and be a real U.S. state).
+_KALSHI_CONTROL_RE = re.compile(r"^(?:KX)?CONTROL[SH](?:[-_].*)?$")
+_KALSHI_STATE_CONTEST_RES = (
+    ("senate", re.compile(r"^(?:KX)?SENATE(?:PARTY[-_]?)?(?P<st>[A-Z]{2})(?:[-_].*)?$")),
+    ("governor", re.compile(r"^(?:KX)?GOV(?:PARTY)?[-_]?(?P<st>[A-Z]{2})(?:[-_].*)?$")),
+    ("house", re.compile(r"^(?:KX)?HOUSE(?:PARTY)?[-_]?(?P<st>[A-Z]{2})[-_]?(?:\d+|AL)(?:[-_].*)?$")),
+)
+
+
+def _normalize_contest_text(text: str | None) -> str:
+    """Lowercase, fold 'U.S.' spellings to 'us', drop punctuation and the 'White House'."""
+    t = (text or "").lower()
+    t = re.sub(r"\bu\.s\.a\.?", " usa ", t)
+    t = re.sub(r"\bu\.s\b\.?", " us ", t)
+    t = re.sub(r"[^a-z0-9]+", " ", t)
+    return re.sub(r"\bwhite house\b", " ", t)
+
+
+def _kalshi_structured_contest(series: str, ticker: str) -> str | None:
+    """Return 'control'/'senate'/'governor'/'house' for narrowly recognised U.S. Kalshi symbols."""
+    for symbol in (series, ticker):
+        s = (symbol or "").upper()
+        if _KALSHI_CONTROL_RE.match(s):
+            return "control"
+        for kind, pattern in _KALSHI_STATE_CONTEST_RES:
+            match = pattern.match(s)
+            if match and match.group("st") in STATE_ABBRS:
+                return kind
+    return None
+
+
+def _kalshi_symbol_years(*symbols: str) -> set[int]:
+    """Cycle years encoded in tickers: a 4-digit token, or the first 2-digit token in 20-39.
+
+    Later 2-digit tokens (seat/district numbers) are never read as years.
+    """
+    years: set[int] = set()
+    for symbol in symbols:
+        two_digit_seen = False
+        for token in re.split(r"[-_]", (symbol or "").upper())[1:]:
+            if re.fullmatch(r"20[23]\d", token):
+                years.add(int(token))
+            elif not two_digit_seen and re.fullmatch(r"[23]\d", token):
+                years.add(2000 + int(token))
+                two_digit_seen = True
+    return years
+
+
+def _evaluate_election_contest(
+    identity_text: str,
+    symbol_years: set[int] | None = None,
+    structured: str | None = None,
+) -> tuple[bool, str]:
+    """Decide from primary contest identity whether a market is a 2026 U.S. election contest.
+
+    ``identity_text`` must hold only primary identity (question/title, slug, event title);
+    description/rules text must never be passed in. Returns ``(True, "verified_2026")`` or
+    ``(False, reason)``.
+    """
+    text = _normalize_contest_text(identity_text)
+
+    if _UNRELATED_RE.search(text):
+        return False, "unrelated_political_event"
+
+    states = extract_states_from_text(text)
+    firm_states = [s for s in states if s not in AMBIGUOUS_STATE_NAMES]
+    explicit_us = bool(_US_WORDING_RE.search(text))
+
+    masked = text
+    for state in states:  # so 'new mexico' is not read as 'mexico'
+        masked = re.sub(rf"\b{re.escape(state)}\b", " ", masked)
+    if _FOREIGN_RE.search(masked):
+        has_us_context = explicit_us or bool(firm_states) or structured is not None
+        return False, "conflicting_jurisdiction" if has_us_context else "foreign_election"
+
+    if _STATE_LEGISLATURE_RE.search(text):
+        return False, "state_legislative_contest"
+    if len(states) >= 2:
+        return False, "conflicting_state_context"
+
+    # Primary evidence must name 2026 and nothing else; closing dates and rules are not evidence.
+    years = {int(y) for y in _YEAR_RE.findall(text)} | (symbol_years or set())
+    if years - {CONTEST_YEAR}:
+        return False, "non_2026_primary_contest"
+    if CONTEST_YEAR not in years:
+        return False, "lacks_2026_contest_year"
+
+    if structured is None and not (_OFFICE_RE.search(text) and _CONTEST_RE.search(text)):
+        return False, "lacks_election_evidence"
+
+    if structured is not None or explicit_us or firm_states:
+        return True, "verified_2026"
+    if states:
+        return False, "ambiguous_jurisdiction"
+    return False, "lacks_us_jurisdiction"
+
+
 def is_2026_polymarket_market(item: dict[str, Any]) -> tuple[bool, str]:
-    """Verify whether a Polymarket record belongs to the 2026 US midterm election cycle."""
+    """Verify whether a Polymarket record is a 2026 U.S. Senate/House/governor/control contest.
+
+    Identity is the question and slug only; the description is incidental rule text and is
+    ignored, as are closing dates.
+    """
     if item.get("closed") is not False:
         return False, "market_closed"
     if item.get("active") is not True:
         return False, "market_inactive"
 
-    q = (item.get("question") or "").lower()
-    slug = (item.get("market_slug") or "").lower()
-    desc = (item.get("description") or "").lower()
-    combined_text = f"{q} {slug} {desc}"
-
-    # Explicit exclusion for other election years or conflicting years
-    if ("2028" in combined_text or "2024" in combined_text) and "2026" not in combined_text:
-        return False, "non_2026_cycle"
-
-    # Negative keyword checks for non-midterm/unrelated politics
-    if any(k in q for k in ["steps down", "confirmed as secretary", "confirmed as member", "resigns", "resignation"]):
-        return False, "unrelated_political_event"
-
-    # Affirmative evidence of the relevant 2026 US election contest is required
-    # Year 2026 must be explicitly mentioned in textual content (closing year alone is insufficient)
-    if "2026" not in combined_text:
-        return False, "lacks_2026_cycle_evidence"
-
-    election_keywords = ["senate", "house", "governor", "gubernatorial", "control"]
-    if not any(k in combined_text for k in election_keywords):
-        return False, "lacks_election_evidence"
-
-    return True, "verified_2026"
+    identity = f"{item.get('question') or ''} {item.get('market_slug') or ''}"
+    return _evaluate_election_contest(identity)
 
 
-def is_2026_kalshi_market(m: dict[str, Any], ev: dict[str, Any], is_primary_match: bool) -> tuple[bool, str | None]:
-    """Verify whether a Kalshi market belongs to the 2026 US midterm election cycle."""
+def is_2026_kalshi_market(
+    m: dict[str, Any], ev: dict[str, Any], is_primary_match: bool = False
+) -> tuple[bool, str | None]:
+    """Verify whether a Kalshi market is a 2026 U.S. Senate/House/governor/control contest.
+
+    Identity is the market/event title plus structured ticker/series; rules text is incidental
+    and ignored. ``is_primary_match`` is accepted for backward compatibility and is ignored:
+    no series prefix, however broad, bypasses the evidence checks. Returns ``(True, None)`` or
+    ``(False, reason)``.
+    """
     m_status = (m.get("status") or "").lower()
     if m_status not in ("open", "active"):
         return False, "market_inactive"
 
     m_ticker = (m.get("ticker") or "").upper()
     m_series = (m.get("series_ticker") or ev.get("series_ticker") or "").upper()
-    m_title = (m.get("title") or ev.get("title") or "")
-    ev_title = (ev.get("title") or "")
-    rules_text = (m.get("rules_primary") or "") + " " + (m.get("rules_secondary") or "")
-    search_text = f"{m_ticker} {m_series} {m_title} {ev_title} {rules_text}".lower()
+    event_ticker = (ev.get("event_ticker") or "").upper()
+    m_title = m.get("title") or ev.get("title") or ""
+    ev_title = ev.get("title") or ""
 
-    # Reject foreign elections or non-election bets
-    if any(k in search_text for k in ["uk general", "chancellor of germany", "cabinet leave", "federal reserve board of", "reconciliation bill"]):
-        return False, "foreign_election"
-
-    if "2026" not in search_text:
-        return False, "lacks_2026_cycle_evidence"
-
-    if ("2028" in search_text or "2024" in search_text) and "2026" not in search_text:
-        return False, "non_2026_cycle"
-
-    if not is_primary_match:
-        election_keywords = ["senate", "house", "governor", "gubernatorial", "control"]
-        if not any(k in search_text for k in election_keywords):
-            return False, "lacks_election_evidence"
-
-    return True, None
+    structured = _kalshi_structured_contest(m_series, m_ticker)
+    symbol_years = _kalshi_symbol_years(m_ticker, m_series, event_ticker)
+    eligible, reason = _evaluate_election_contest(f"{m_title} {ev_title}", symbol_years, structured)
+    return (True, None) if eligible else (False, reason)
 
 
 # =====================================================================
 # Polymarket Fetcher
 # =====================================================================
+
+_PLACEHOLDER_VALUES = frozenset({"none", "null", "nan", "undefined"})
+
+
+def _clean_token_field(value: Any) -> str | None:
+    """Return a stripped nonempty, non-placeholder string, else None."""
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned or cleaned.lower() in _PLACEHOLDER_VALUES:
+        return None
+    return cleaned
+
+
+def _parse_binary_tokens(tokens: list[Any]) -> tuple[list[str], list[str], list[float | None]] | None:
+    """Parse exactly two outcome-token records into (labels, token_ids, prices) in API order.
+
+    Returns None unless BOTH records are well-formed with distinct labels and distinct token
+    IDs. A bad record never lets the other one be salvaged, and native labels are preserved.
+    """
+    if len(tokens) != 2:
+        return None
+    outcomes: list[str] = []
+    token_ids: list[str] = []
+    prices: list[float | None] = []
+    for record in tokens:
+        if not isinstance(record, dict):
+            return None
+        outcome = _clean_token_field(record.get("outcome"))
+        token_id = _clean_token_field(record.get("token_id"))
+        if outcome is None or token_id is None:
+            return None
+        outcomes.append(outcome)
+        token_ids.append(token_id)
+        prices.append(_safe_float(record.get("price")))
+    if len({o.casefold() for o in outcomes}) != 2 or len(set(token_ids)) != 2:
+        return None
+    return outcomes, token_ids, prices
+
 
 def _page_identity_signature(markets: list[Any]) -> tuple[Any, ...] | None:
     """Canonical signature of a raw Polymarket page, independent of order, prices and metadata.
@@ -386,34 +535,18 @@ def fetch_polymarket_markets(
                 continue
 
             tokens = item.get("tokens")
-            if not isinstance(tokens, list) or len(tokens) == 0:
+            if not isinstance(tokens, list):
                 excluded_counts["invalid_tokens"] = excluded_counts.get("invalid_tokens", 0) + 1
                 continue
+            if len(tokens) != 2:
+                excluded_counts["non_binary_tokens"] = excluded_counts.get("non_binary_tokens", 0) + 1
+                continue
 
-            outcomes = []
-            clob_tokens = []
-            prices = []
-            malformed = False
-            for t in tokens:
-                if not isinstance(t, dict):
-                    malformed = True
-                    break
-                outcome = t.get("outcome")
-                tid = t.get("token_id")
-                if not isinstance(outcome, str) or not outcome.strip() or outcome.strip() == "None":
-                    malformed = True
-                    break
-                if not isinstance(tid, str) or not tid.strip() or tid.strip() == "None":
-                    malformed = True
-                    break
-
-                outcomes.append(outcome.strip())
-                clob_tokens.append(tid.strip())
-                prices.append(_safe_float(t.get("price")))
-
-            if malformed or not outcomes or not clob_tokens or len(outcomes) != len(clob_tokens) or len(set(outcomes)) != len(outcomes) or len(set(clob_tokens)) != len(clob_tokens):
+            parsed = _parse_binary_tokens(tokens)
+            if parsed is None:
                 excluded_counts["invalid_token_mapping"] = excluded_counts.get("invalid_token_mapping", 0) + 1
                 continue
+            outcomes, clob_tokens, prices = parsed
 
             outcome_token_map = dict(zip(outcomes, clob_tokens))
 
@@ -593,14 +726,9 @@ def fetch_kalshi_markets(
                 m_series = m.get("series_ticker") or series_ticker
                 m_title = m.get("title") or ev_title
 
-                is_primary_match = bool(
-                    KALSHI_TARGET_SERIES_RE.match(m_series)
-                    or KALSHI_TARGET_SERIES_RE.match(m_ticker)
-                )
-
-                is_eligible, filter_note = is_2026_kalshi_market(m, ev, is_primary_match)
+                is_eligible, filter_note = is_2026_kalshi_market(m, ev)
                 if not is_eligible:
-                    reason = "inactive_or_non_2026"
+                    reason = filter_note or "ineligible"
                     excluded_counts[reason] = excluded_counts.get(reason, 0) + 1
                     continue
 
