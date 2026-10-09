@@ -16,3 +16,4 @@ jobs:
       - run: pip install -e .
       - run: ruff check .
       - run: pytest
+      - run: python -m pytest data/venue_markets/tests -q
