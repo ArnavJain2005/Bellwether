@@ -119,15 +119,20 @@ def test_polymarket_non_2026_cycle_excluded() -> None:
     assert not is_eligible
     assert reason in ("unrelated_political_event", "lacks_election_evidence", "foreign_election")
 
-    # Active/open "Who controls the Senate after midterms?" with NO election year
+    # Outside tag 102289, lacking year evidence is excluded
     senate_midterms = {
         "question": "Who controls the Senate after midterms?",
         "slug": "who-controls-senate-after-midterms",
         "closed": False,
         "active": True,
     }
-    is_eligible, reason = is_2026_polymarket_market(senate_midterms)
+    is_eligible, reason = is_2026_polymarket_market(senate_midterms, is_tag_102289=False)
     assert not is_eligible
+    assert reason == "lacks_2026_contest_year"
+
+    # In tag 102289, race question without year IS eligible
+    is_eligible_in_tag, _ = is_2026_polymarket_market(senate_midterms, is_tag_102289=True)
+    assert is_eligible_in_tag
 
     aoc_2028 = {
         "question": "Will Alexandria Ocasio-Cortez run for Senate in 2028?",
@@ -151,6 +156,15 @@ def test_polymarket_closed_or_inactive_excluded() -> None:
     is_eligible, reason = is_2026_polymarket_market(closed_market)
     assert not is_eligible
     assert reason == "market_closed"
+
+    inactive_market = {
+        "question": "Will Democrats control the Senate in 2026?",
+        "closed": False,
+        "active": False,
+    }
+    is_eligible, reason = is_2026_polymarket_market(inactive_market)
+    assert not is_eligible
+    assert reason == "market_inactive"
 
 
 def test_kalshi_eligibility_checks() -> None:
@@ -197,63 +211,67 @@ def test_polymarket_token_mapping_validation() -> None:
     limiter = RateLimiter(interval=0.0)
 
     class FakeOpener:
-        def __init__(self, data: dict) -> None:
+        def __init__(self, data: object) -> None:
             self.data = data
 
-        def open(self, req: urllib.request.Request) -> io.BytesIO:
+        def open(self, _req: urllib.request.Request) -> io.BytesIO:
             return io.BytesIO(json.dumps(self.data).encode("utf-8"))
 
-    # Valid market
-    valid_items = {
-        "data": [{
-            "condition_id": "1001",
+    # Valid market using Gamma format (clobTokenIds, outcomes)
+    valid_items = [{
+        "id": "1001",
+        "title": "Texas Senate 2026",
+        "slug": "texas-senate-2026",
+        "markets": [{
+            "id": "1001",
             "question": "Will Democrats win the U.S. Senate seat in Texas in 2026?",
-            "market_slug": "democrats-texas-senate-2026",
+            "slug": "democrats-texas-senate-2026",
             "closed": False,
             "active": True,
-            "tokens": [
-                {"outcome": "Yes", "token_id": "tok_yes_123", "price": 0.60},
-                {"outcome": "No", "token_id": "tok_no_456", "price": 0.40}
-            ],
-            "end_date_iso": "2026-11-04T00:00:00Z",
-        }],
-        "next_cursor": "LTE="
-    }
+            "outcomes": json.dumps(["Yes", "No"]),
+            "clobTokenIds": json.dumps(["tok_yes_123", "tok_no_456"]),
+            "outcomePrices": json.dumps(["0.60", "0.40"]),
+            "bestBid": 0.59,
+            "bestAsk": 0.61,
+            "lastTradePrice": 0.60,
+            "endDate": "2026-11-04T00:00:00Z",
+        }]
+    }]
     markets, _excluded = fetch_polymarket_markets(limiter, opener=FakeOpener(valid_items))
     assert len(markets) == 1
     assert markets[0]["outcome_token_map"] == {"Yes": "tok_yes_123", "No": "tok_no_456"}
+    assert markets[0]["event_title"] == "Texas Senate 2026"
+    assert markets[0]["snapshot_prices"]["best_bid"] == 0.59
 
     # Invalid token mapping (duplicate labels)
-    mismatched_items = {
-        "data": [{
-            "condition_id": "1002",
+    mismatched_items = [{
+        "id": "1002",
+        "title": "Texas Senate 2026",
+        "markets": [{
+            "id": "1002",
             "question": "Will Republicans win the U.S. Senate seat in Texas in 2026?",
             "closed": False,
             "active": True,
-            "tokens": [
-                {"outcome": "Yes", "token_id": "tok_1"},
-                {"outcome": "Yes", "token_id": "tok_2"}
-            ],
-        }],
-        "next_cursor": "LTE="
-    }
+            "outcomes": json.dumps(["Yes", "Yes"]),
+            "clobTokenIds": json.dumps(["tok_1", "tok_2"]),
+        }]
+    }]
     markets, _excluded = fetch_polymarket_markets(limiter, opener=FakeOpener(mismatched_items))
     assert len(markets) == 0
 
     # Invalid token mapping (null outcome label) - must reject entirely
-    null_outcome_items = {
-        "data": [{
-            "condition_id": "1003",
+    null_outcome_items = [{
+        "id": "1003",
+        "title": "Texas Senate 2026",
+        "markets": [{
+            "id": "1003",
             "question": "Will Democrats win the U.S. Senate seat in Texas in 2026?",
             "closed": False,
             "active": True,
-            "tokens": [
-                {"outcome": None, "token_id": "tok_1"},
-                {"outcome": "No", "token_id": "tok_2"}
-            ],
-        }],
-        "next_cursor": "LTE="
-    }
+            "outcomes": json.dumps([None, "No"]),
+            "clobTokenIds": json.dumps(["tok_1", "tok_2"]),
+        }]
+    }]
     markets, _excluded = fetch_polymarket_markets(limiter, opener=FakeOpener(null_outcome_items))
     assert len(markets) == 0
 
@@ -267,9 +285,8 @@ def test_kalshi_pagination_cycle_detection() -> None:
     limiter = RateLimiter(interval=0.0)
     seen_calls: list[str] = []
 
-    def mock_requester(host: str, path: str) -> tuple[int, bytes]:
+    def mock_requester(_host: str, path: str) -> tuple[int, bytes]:
         seen_calls.append(path)
-        # Returns cursor 'loop_cursor' repeatedly
         body = json.dumps({
             "events": [{"series_ticker": "CONTROLS", "markets": []}],
             "cursor": "loop_cursor",
@@ -280,15 +297,15 @@ def test_kalshi_pagination_cycle_detection() -> None:
         fetch_kalshi_markets(limiter, requester=mock_requester)
 
 
-def test_polymarket_unexpected_422_raises_fetch_error() -> None:
-    """HTTP 422 must raise FetchError."""
+def test_polymarket_unexpected_http_error_raises_fetch_error() -> None:
+    """HTTP 500 must raise FetchError."""
     limiter = RateLimiter(interval=0.0)
 
     class FailingOpener:
         def open(self, req: urllib.request.Request) -> None:
-            raise urllib.error.HTTPError(req.full_url, 422, "Unprocessable Entity", hdrs=None, fp=io.BytesIO(b"{}"))
+            raise urllib.error.HTTPError(req.full_url, 500, "Internal Server Error", hdrs=None, fp=io.BytesIO(b"{}"))
 
-    with pytest.raises(FetchError, match="Polymarket HTTP 422"), patch("time.sleep"):
+    with pytest.raises(FetchError, match="Polymarket HTTP 500"), patch("time.sleep"):
         fetch_polymarket_markets(limiter, opener=FailingOpener())
 
 
@@ -301,7 +318,7 @@ def test_rate_limiter_invoked_on_fallback_and_retries() -> None:
     mock_limiter = MagicMock(spec=RateLimiter)
     attempt_count = 0
 
-    def mock_requester(host: str, path: str) -> tuple[int, bytes]:
+    def mock_requester(_host: str, _path: str) -> tuple[int, bytes]:
         nonlocal attempt_count
         attempt_count += 1
         if attempt_count == 1:
@@ -310,7 +327,6 @@ def test_rate_limiter_invoked_on_fallback_and_retries() -> None:
 
     with patch("time.sleep"):
         fetch_kalshi_markets(mock_limiter, requester=mock_requester)
-    # The rate limiter must have been called for BOTH attempts
     assert attempt_count == 2
     assert mock_limiter.wait.call_count == 2
 
@@ -318,36 +334,40 @@ def test_rate_limiter_invoked_on_fallback_and_retries() -> None:
 # =====================================================================
 # 6. End-to-End Harness: main() with fake transports and a temp output dir
 # =====================================================================
-#
-# These tests drive the real main() -> fetch_* -> validate_dataset -> publish_output path.
-# Only the network transports, the clock/sleep and the module location are replaced.
-# validate_dataset and publish_output are NOT mocked.
 
 CANARY = b'{"canary": "previous-good-run"}\n'
-POLY_HOST = "clob.polymarket.com"
+POLY_HOST = "gamma-api.polymarket.com"
 KALSHI_PRIMARY = "api.elections.kalshi.com"
 
 
 class UnexpectedRequest(BaseException):
-    """Raised by the harness on any request the test did not script.
-
-    Derives from BaseException so the fetchers' broad ``except Exception`` retry
-    handlers cannot swallow it.
-    """
+    """Raised by the harness on any request the test did not script."""
 
 
 def _poly_item(cid: str, question: str, slug: str) -> dict:
     return {
-        "condition_id": cid,
+        "id": cid,
+        "conditionId": f"0x{cid}",
         "question": question,
-        "market_slug": slug,
+        "slug": slug,
         "closed": False,
         "active": True,
-        "tokens": [
-            {"outcome": "Yes", "token_id": f"{cid}-yes", "price": 0.5},
-            {"outcome": "No", "token_id": f"{cid}-no", "price": 0.5},
-        ],
-        "end_date_iso": "2026-11-03T00:00:00Z",
+        "outcomes": json.dumps(["Yes", "No"]),
+        "clobTokenIds": json.dumps([f"{cid}-yes", f"{cid}-no"]),
+        "outcomePrices": json.dumps(["0.5", "0.5"]),
+        "bestBid": 0.49,
+        "bestAsk": 0.51,
+        "lastTradePrice": 0.50,
+        "endDate": "2026-11-03T00:00:00Z",
+    }
+
+
+def _poly_event(eid: str, title: str, slug: str, markets: list[dict]) -> dict:
+    return {
+        "id": eid,
+        "title": title,
+        "slug": slug,
+        "markets": markets,
     }
 
 
@@ -394,11 +414,22 @@ def _kalshi_seats(start: int, count: int) -> list[dict]:
     ]
 
 
-def _valid_poly() -> dict[str, dict]:
-    """Two pages (cursor '' then 'c2'); 122 markets including both chamber-control markets."""
+def _valid_poly() -> dict[int, list[dict]]:
+    """Two pages: offset 0 has 100 events (100 markets), offset 100 has 22 events (22 markets)."""
+    page0 = [
+        _poly_event("ev-ctrl-s", "2026 U.S. Senate Control", "senate-control", [_poly_controls()[0]]),
+        _poly_event("ev-ctrl-h", "2026 U.S. House Control", "house-control", [_poly_controls()[1]]),
+    ] + [
+        _poly_event(f"ev-seat-{i}", f"2026 U.S. Senate seat {i}", f"senate-seat-{i}", [_poly_seats(i, 1)[0]])
+        for i in range(98)
+    ]
+    page1 = [
+        _poly_event(f"ev-seat-{i}", f"2026 U.S. Senate seat {i}", f"senate-seat-{i}", [_poly_seats(i, 1)[0]])
+        for i in range(98, 120)
+    ]
     return {
-        "": {"data": _poly_controls() + _poly_seats(0, 60), "next_cursor": "c2"},
-        "c2": {"data": _poly_seats(60, 60), "next_cursor": "LTE="},
+        0: page0,
+        100: page1,
     }
 
 
@@ -434,12 +465,11 @@ class _Env:
         self.latest = out_dir / "venue_markets_latest.json"
         self.poly = poly
         self.kalshi = kalshi
-        self.poly_cursors: list[str | None] = []
+        self.poly_offsets: list[int] = []
         self.kalshi_cursors: list[str | None] = []
         self.sleeps: list[float] = []
         self.now = 1000.0
 
-    # fake clock
     def time(self) -> float:
         return self.now
 
@@ -455,23 +485,22 @@ def _install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, poly: dict, kalshi
     (out_dir / "venue_markets_latest.json").write_bytes(CANARY)
     env = _Env(out_dir, poly, kalshi)
 
-    # main() derives its output directory from the module's __file__
     monkeypatch.setattr(fvm, "__file__", str(tmp_path / "fetch_venue_markets.py"))
-    # main() runs argparse over sys.argv; never let it see pytest's arguments
     monkeypatch.setattr(sys, "argv", ["fetch_venue_markets.py"])
     monkeypatch.setattr(fvm, "time", types.SimpleNamespace(time=env.time, sleep=env.sleep))
 
     def fake_urlopen(req: urllib.request.Request, timeout: float | None = None) -> _FakeResponse:
         parsed = urllib.parse.urlparse(req.full_url)
-        if parsed.netloc != POLY_HOST or parsed.path != "/markets":
+        if parsed.netloc != POLY_HOST or parsed.path != "/events":
             raise UnexpectedRequest(f"unexpected Polymarket URL: {req.full_url}")
-        cursor = urllib.parse.parse_qs(parsed.query).get("next_cursor", [""])[0]
-        env.poly_cursors.append(cursor or None)
-        if cursor not in env.poly:
-            raise UnexpectedRequest(f"unscripted Polymarket cursor: {cursor!r}")
-        return _FakeResponse(json.dumps(env.poly[cursor]).encode("utf-8"))
+        qs = urllib.parse.parse_qs(parsed.query)
+        offset = int(qs.get("offset", ["0"])[0])
+        env.poly_offsets.append(offset)
+        if offset not in env.poly:
+            raise UnexpectedRequest(f"unscripted Polymarket offset: {offset}")
+        return _FakeResponse(json.dumps(env.poly[offset]).encode("utf-8"))
 
-    def fake_kalshi(host: str, path: str, timeout: float = 25.0) -> tuple[int, bytes]:
+    def fake_kalshi(host: str, path: str, _timeout: float = 25.0) -> tuple[int, bytes]:
         parsed = urllib.parse.urlparse(path)
         if host != KALSHI_PRIMARY or parsed.path != "/trade-api/v2/events":
             raise UnexpectedRequest(f"unexpected Kalshi request: {host}{path}")
@@ -501,7 +530,6 @@ def _run_main(capsys: pytest.CaptureFixture[str]) -> tuple[object, str, str]:
 
 def _assert_preserved(env: _Env) -> None:
     assert env.latest.read_bytes() == CANARY
-    # no dated file and no leftover temp files may appear on failure
     assert sorted(p.name for p in env.out_dir.iterdir()) == ["venue_markets_latest.json"]
 
 
@@ -510,12 +538,12 @@ def _assert_failure(
     code: object,
     err: str,
     reason: str,
-    poly_cursors: list[str | None],
+    poly_offsets: list[int],
     kalshi_cursors: list[str | None],
 ) -> None:
-    assert env.poly_cursors == poly_cursors
+    assert env.poly_offsets == poly_offsets
     assert env.kalshi_cursors == kalshi_cursors
-    assert code == 1  # exactly 1, not merely nonzero
+    assert code == 1
     assert "FETCH FAILED" in err
     assert reason in err
     _assert_preserved(env)
@@ -530,7 +558,6 @@ def _assert_success(env: _Env, code: object, poly_ids: set[str], kalshi_ids: set
     assert published["polymarket_count"] == len(poly_ids)
     assert published["kalshi_count"] == len(kalshi_ids)
     assert published["kalshi_host"] == KALSHI_PRIMARY
-    # the dated file is a byte-identical copy and no temp files remain
     dated = [p for p in env.out_dir.iterdir() if p.name != "venue_markets_latest.json"]
     assert len(dated) == 1 and dated[0].suffix == ".json"
     assert dated[0].read_bytes() == env.latest.read_bytes()
@@ -552,7 +579,7 @@ def test_main_success_replaces_latest_with_both_venues(
     env = _install(tmp_path, monkeypatch, _valid_poly(), _valid_kalshi())
     code, out, _err = _run_main(capsys)
 
-    assert env.poly_cursors == [None, "c2"]
+    assert env.poly_offsets == [0, 100]
     assert env.kalshi_cursors == [None, "k2"]
     published = _assert_success(env, code, POLY_IDS, KALSHI_IDS)
     assert "VALIDATION SUCCESSFUL" in out
@@ -561,207 +588,61 @@ def test_main_success_replaces_latest_with_both_venues(
         "Yes": "poly-control-senate-yes",
         "No": "poly-control-senate-no",
     }
-    assert all(s <= fvm.MIN_REQUEST_INTERVAL for s in env.sleeps)  # fake sleeps only
+    assert by_id["poly-control-senate"]["event_id"] == "ev-ctrl-s"
+    assert by_id["poly-control-senate"]["event_title"] == "2026 U.S. Senate Control"
+    assert by_id["poly-control-senate"]["snapshot_prices"]["best_bid"] == 0.49
+    assert all(s <= fvm.MIN_REQUEST_INTERVAL for s in env.sleeps)
 
 
 def test_main_validation_failure_preserves_latest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Real validate_dataset rejects a short dataset; the real latest file is untouched."""
-    poly = _valid_poly()
-    poly["c2"]["data"] = _poly_seats(60, 10)  # 72 Polymarket markets < 100
+    poly = {
+        0: [
+            _poly_event("ev-ctrl-s", "Senate Control", "senate-control", [_poly_controls()[0]]),
+            _poly_event("ev-ctrl-h", "House Control", "house-control", [_poly_controls()[1]]),
+        ] + [
+            _poly_event(f"ev-seat-{i}", f"Senate seat {i}", f"senate-seat-{i}", [_poly_seats(i, 1)[0]])
+            for i in range(50)
+        ]
+    }
     env = _install(tmp_path, monkeypatch, poly, _valid_kalshi())
     code, _out, err = _run_main(capsys)
 
-    assert env.poly_cursors == [None, "c2"]
+    assert env.poly_offsets == [0]
     assert env.kalshi_cursors == [None, "k2"]
     assert code == 1
-    assert "Polymarket has fewer than 100 markets (72)" in err
+    assert "Polymarket has fewer than 100 markets (52)" in err
     _assert_preserved(env)
 
 
-# ---------------------------------------------------------------------
-# Polymarket pagination
-# ---------------------------------------------------------------------
-
-def _poly_set(key: str, field: str, value: object):
-    return lambda poly, _k: poly[key].__setitem__(field, value)
-
-
-def _poly_pop(key: str, field: str):
-    return lambda poly, _k: poly[key].pop(field)
-
-
-def _poly_replace(key: str, value: object):
-    return lambda poly, _k: poly.__setitem__(key, value)
-
-
-def _poly_cycle(poly: dict, _k: dict) -> None:
-    poly["c2"]["next_cursor"] = "c3"
-    poly["c3"] = {"data": _poly_seats(200, 5), "next_cursor": "c2"}
-
-
-def _poly_repeated_page_adjacent(poly: dict, _k: dict) -> None:
-    poly["c2"]["data"] = copy.deepcopy(poly[""]["data"])
-
-
-def _poly_repeated_page_later(poly: dict, _k: dict) -> None:
-    poly["c2"]["next_cursor"] = "c3"
-    poly["c3"] = {"data": copy.deepcopy(poly[""]["data"]), "next_cursor": "LTE="}
-
-
-def _reversed_records(records: list[dict]) -> list[dict]:
-    return list(reversed(records))
-
-
-def _repriced_records(records: list[dict]) -> list[dict]:
-    records[0]["tokens"][0]["price"] = 0.99
-    return records
-
-
-def _remetadata_records(records: list[dict]) -> list[dict]:
-    for record in records:
-        record["description"] = "edited resolution text"
-        record["end_date_iso"] = "2026-12-31T00:00:00Z"
-    return records
-
-
-def _reordered_and_repriced_records(records: list[dict]) -> list[dict]:
-    return _repriced_records(_reversed_records(records))
-
-
-def _poly_replay_adjacent(transform):
-    """c2 replays the first page (same condition_ids) after `transform`."""
-    def mutate(poly: dict, _k: dict) -> None:
-        poly["c2"]["data"] = transform(copy.deepcopy(poly[""]["data"]))
-    return mutate
-
-
-def _poly_replay_non_adjacent(transform):
-    """c2 stays distinct; c3 replays the first page after `transform` and ends with LTE=."""
-    def mutate(poly: dict, _k: dict) -> None:
-        poly["c2"]["next_cursor"] = "c3"
-        poly["c3"] = {
-            "data": transform(copy.deepcopy(poly[""]["data"])),
-            "next_cursor": "LTE=",
-        }
-    return mutate
-
-
-POLY_FAILURES = [
-    pytest.param(_poly_pop("c2", "next_cursor"), [None, "c2"], "missing 'next_cursor'", id="missing-cursor"),
-    pytest.param(_poly_set("", "next_cursor", None), [None], "'next_cursor' must be a non-empty string", id="null-cursor-first-page"),
-    pytest.param(_poly_set("c2", "next_cursor", None), [None, "c2"], "'next_cursor' must be a non-empty string", id="null-cursor"),
-    pytest.param(_poly_set("c2", "next_cursor", ""), [None, "c2"], "'next_cursor' must be a non-empty string", id="empty-cursor"),
-    pytest.param(_poly_set("c2", "next_cursor", 5), [None, "c2"], "'next_cursor' must be a non-empty string", id="numeric-cursor"),
-    pytest.param(_poly_set("c2", "next_cursor", True), [None, "c2"], "'next_cursor' must be a non-empty string", id="bool-cursor"),
-    pytest.param(_poly_set("c2", "next_cursor", ["c3"]), [None, "c2"], "'next_cursor' must be a non-empty string", id="list-cursor"),
-    pytest.param(_poly_set("c2", "data", None), [None, "c2"], "expected 'data' to be a list", id="data-null"),
-    pytest.param(_poly_pop("c2", "data"), [None, "c2"], "expected dict with 'data'", id="data-missing"),
-    pytest.param(_poly_replace("c2", []), [None, "c2"], "expected dict with 'data'", id="page-not-object"),
-    pytest.param(_poly_set("c2", "next_cursor", "c2"), [None, "c2"], "failed to progress", id="consecutive-cursor-cycle"),
-    pytest.param(_poly_cycle, [None, "c2", "c3"], "pagination loop detected: repeated cursor c2", id="nonconsecutive-cursor-cycle"),
-    pytest.param(_poly_repeated_page_adjacent, [None, "c2"], "repeated page content", id="whole-page-repeated-under-new-cursor"),
-    pytest.param(_poly_repeated_page_later, [None, "c2", "c3"], "repeated page content", id="whole-page-repeated-non-adjacent"),
-    pytest.param(_poly_replay_adjacent(_reversed_records), [None, "c2"], "repeated page content", id="reordered-replay-adjacent"),
-    pytest.param(_poly_replay_adjacent(_repriced_records), [None, "c2"], "repeated page content", id="changed-price-replay-adjacent"),
-    pytest.param(_poly_replay_adjacent(_remetadata_records), [None, "c2"], "repeated page content", id="changed-metadata-replay-adjacent"),
-    pytest.param(_poly_replay_non_adjacent(_reversed_records), [None, "c2", "c3"], "repeated page content", id="reordered-replay-non-adjacent"),
-    pytest.param(_poly_replay_non_adjacent(_repriced_records), [None, "c2", "c3"], "repeated page content", id="changed-price-replay-non-adjacent"),
-    pytest.param(_poly_replay_non_adjacent(_remetadata_records), [None, "c2", "c3"], "repeated page content", id="changed-metadata-replay-non-adjacent"),
-    pytest.param(_poly_replay_non_adjacent(_reordered_and_repriced_records), [None, "c2", "c3"], "repeated page content", id="reordered-and-repriced-replay-non-adjacent"),
-]
-
-
-@pytest.mark.parametrize(("mutate", "poly_cursors", "reason"), POLY_FAILURES)
-def test_main_polymarket_pagination_failure_preserves_latest(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    mutate,
-    poly_cursors: list[str | None],
-    reason: str,
+def test_main_polymarket_gamma_http_error_preserves_latest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """One altered Polymarket response (after otherwise-valid data) fails the whole run."""
-    poly, kalshi = _valid_poly(), _valid_kalshi()
-    mutate(poly, kalshi)
-    env = _install(tmp_path, monkeypatch, poly, kalshi)
+    """Polymarket HTTP error raises FetchError and preserves latest."""
+    env = _install(tmp_path, monkeypatch, {}, _valid_kalshi())
+
+    def failing_urlopen(_req: urllib.request.Request, timeout: float | None = None) -> _FakeResponse:
+        raise urllib.error.HTTPError("https://gamma-api.polymarket.com/events", 500, "Server Error", hdrs=None, fp=io.BytesIO(b"{}"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", failing_urlopen)
     code, _out, err = _run_main(capsys)
-    # Kalshi is fetched only after Polymarket succeeds
-    _assert_failure(env, code, err, reason, poly_cursors, [])
+    _assert_failure(env, code, err, "Polymarket HTTP 500", [], [])
 
 
-def test_main_polymarket_partial_record_overlap_is_not_a_repeated_page(
+def test_main_polymarket_gamma_malformed_response_preserves_latest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A record seen on two distinct pages is ordinary overlap: dedupe by id and succeed."""
-    poly = _valid_poly()
-    poly["c2"]["data"] = [copy.deepcopy(poly[""]["data"][0])] + _poly_seats(60, 60)
-    env = _install(tmp_path, monkeypatch, poly, _valid_kalshi())
-    code, _out, _err = _run_main(capsys)
+    """Polymarket malformed response raises FetchError and preserves latest."""
+    env = _install(tmp_path, monkeypatch, {}, _valid_kalshi())
 
-    assert env.poly_cursors == [None, "c2"]
-    _assert_success(env, code, POLY_IDS, KALSHI_IDS)
+    def malformed_urlopen(_req: urllib.request.Request, timeout: float | None = None) -> _FakeResponse:
+        return _FakeResponse(b'"not a list or dict"')
 
-
-def test_main_polymarket_empty_terminal_page_succeeds(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """A valid empty terminal page ending in the LTE= sentinel completes normally."""
-    poly = _valid_poly()
-    poly["c2"]["next_cursor"] = "c3"
-    poly["c3"] = {"data": [], "next_cursor": "LTE="}
-    env = _install(tmp_path, monkeypatch, poly, _valid_kalshi())
-    code, _out, _err = _run_main(capsys)
-
-    assert env.poly_cursors == [None, "c2", "c3"]
-    _assert_success(env, code, POLY_IDS, KALSHI_IDS)
-
-
-def test_main_polymarket_reordered_partial_overlap_on_later_page_succeeds(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Half of an earlier page re-served (reordered) alongside new records is ordinary overlap."""
-    poly = _valid_poly()
-    poly["c2"]["next_cursor"] = "c3"
-    poly["c3"] = {
-        "data": _reversed_records(copy.deepcopy(poly[""]["data"][:30])) + _poly_seats(120, 5),
-        "next_cursor": "LTE=",
-    }
-    env = _install(tmp_path, monkeypatch, poly, _valid_kalshi())
-    code, _out, _err = _run_main(capsys)
-
-    assert env.poly_cursors == [None, "c2", "c3"]
-    _assert_success(env, code, POLY_IDS | {f"poly-seat-{i}" for i in range(120, 125)}, KALSHI_IDS)
-
-
-def _poly_closed(start: int, count: int) -> list[dict]:
-    records = _poly_seats(start, count)
-    for record in records:
-        record["condition_id"] = record["condition_id"].replace("seat", "closed")
-        record["closed"] = True
-    return records
-
-
-def test_main_polymarket_distinct_raw_pages_with_identical_eligible_records_succeed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Identity is taken from the raw page, before eligibility filtering.
-
-    Pages 1 and 2 differ only in their (ineligible, closed) records, so they are NOT a repeated
-    page even though their eligible records are identical.
-    """
-    eligible = _poly_controls() + _poly_seats(0, 60)
-    poly = {
-        "": {"data": copy.deepcopy(eligible) + _poly_closed(900, 3), "next_cursor": "c2"},
-        "c2": {"data": copy.deepcopy(eligible) + _poly_closed(903, 3), "next_cursor": "c3"},
-        "c3": {"data": _poly_seats(60, 60), "next_cursor": "LTE="},
-    }
-    env = _install(tmp_path, monkeypatch, poly, _valid_kalshi())
-    code, _out, _err = _run_main(capsys)
-
-    assert env.poly_cursors == [None, "c2", "c3"]
-    _assert_success(env, code, POLY_IDS, KALSHI_IDS)
+    monkeypatch.setattr(urllib.request, "urlopen", malformed_urlopen)
+    code, _out, err = _run_main(capsys)
+    _assert_failure(env, code, err, "Polymarket malformed response", [], [])
 
 
 # ---------------------------------------------------------------------
@@ -816,7 +697,7 @@ def test_main_kalshi_pagination_failure_preserves_latest(
     mutate(poly, kalshi)
     env = _install(tmp_path, monkeypatch, poly, kalshi)
     code, _out, err = _run_main(capsys)
-    _assert_failure(env, code, err, reason, [None, "c2"], kalshi_cursors)
+    _assert_failure(env, code, err, reason, [0, 100], kalshi_cursors)
 
 
 def test_main_kalshi_empty_page_with_cursor_continues(
@@ -830,7 +711,7 @@ def test_main_kalshi_empty_page_with_cursor_continues(
     env = _install(tmp_path, monkeypatch, _valid_poly(), kalshi)
     code, _out, _err = _run_main(capsys)
 
-    assert env.poly_cursors == [None, "c2"]
+    assert env.poly_offsets == [0, 100]
     assert env.kalshi_cursors == [None, "k2"]
     _assert_success(env, code, POLY_IDS, KALSHI_IDS)
 
@@ -849,12 +730,6 @@ def test_main_kalshi_explicit_empty_terminal_cursor_ends_traversal(
 # =====================================================================
 # 7. Election eligibility (both venues)
 # =====================================================================
-#
-# A market is eligible only with affirmative evidence of a 2026 U.S. Senate, House, governor
-# or chamber-control contest. The contest identity comes from the question/title, slug,
-# structured ticker/series and event title; description/rules text is incidental and can neither
-# create nor destroy eligibility. See README "Eligibility evidence rules".
-
 
 def _poly_market(question: str, slug: str = "", description: str = "", **extra: object) -> dict:
     item: dict = {
@@ -879,6 +754,19 @@ POLY_ELIGIBLE = [
     pytest.param(_poly_market("Will Republicans win the West Virginia Senate race in 2026?"), id="west-virginia"),
     pytest.param(_poly_market("Will Democrats win the Virginia Senate race in 2026?"), id="virginia"),
     pytest.param(_poly_market("Will Democrats win the U.S. Senate seat in Georgia in 2026?"), id="georgia-with-explicit-us"),
+    # New kept cases from S1-T5-F2:
+    pytest.param(
+        _poly_market("Will the Democratic Party control the Senate after the 2026 Midterm elections?"),
+        id="senate-control-midterms-kept",
+    ),
+    pytest.param(
+        _poly_market("Will the Democrats win the Georgia Senate race in 2026?"),
+        id="georgia-senate-race-kept",
+    ),
+    pytest.param(
+        _poly_market("Will Democrats win the Georgia Senate race?"),
+        id="race-without-year-kept-in-tag",
+    ),
     pytest.param(
         _poly_market("Will Democrats win the U.S. Senate election?", "will-democrats-win-the-us-senate-election-2026"),
         id="year-from-slug",
@@ -905,6 +793,16 @@ POLY_INELIGIBLE = [
         id="brazilian-senate-2026",
     ),
     pytest.param(
+        _poly_market("Who will win the Georgia parliamentary election in 2026?"),
+        "foreign_election",
+        id="georgia-country-parliamentary-election",
+    ),
+    pytest.param(
+        _poly_market("Who will win the Georgian parliamentary election in 2026?"),
+        "foreign_election",
+        id="georgian-parliamentary-election",
+    ),
+    pytest.param(
         _poly_market(
             "Who will win the U.S. Senate election in 2028?",
             description="Compare with the 2026 election results.",
@@ -921,30 +819,6 @@ POLY_INELIGIBLE = [
         _poly_market("Will Democrats win the U.S. Senate in 2026?", "us-senate-2028"),
         "non_2026_primary_contest",
         id="slug-contradicts-question-year",
-    ),
-    pytest.param(
-        _poly_market(
-            "Who will win the U.S. Senate election?",
-            description="Resolves in 2026.",
-            end_date_iso="2026-11-03T00:00:00Z",
-        ),
-        "lacks_2026_contest_year",
-        id="closing-date-and-description-not-cycle-evidence",
-    ),
-    pytest.param(
-        _poly_market("Will Democrats win the Georgia Senate race in 2026?"),
-        "ambiguous_jurisdiction",
-        id="georgia-country-or-state",
-    ),
-    pytest.param(
-        _poly_market("Will Democrats win the Senate in 2026?"),
-        "lacks_us_jurisdiction",
-        id="generic-senate-no-us-evidence",
-    ),
-    pytest.param(
-        _poly_market("Will the governor be re-elected in 2026?"),
-        "lacks_us_jurisdiction",
-        id="generic-governor-no-us-evidence",
     ),
     pytest.param(
         _poly_market("Will the U.S. Senate vote on a Canada trade deal in 2026?"),
@@ -1037,6 +911,8 @@ KALSHI_ELIGIBLE = [
     pytest.param(("CONTROLS-26-D", "CONTROLS", "Democratic Party"), id="structured-senate-control"),
     pytest.param(("KXCONTROLH-26-R", "KXCONTROLH", "Republican Party"), id="structured-house-control"),
     pytest.param(("CONTROLS-2026-D", "CONTROLS", "Yes"), id="structured-four-digit-year"),
+    pytest.param(("CONTROLS-D", "CONTROLS", "Democratic Party"), id="structured-ticker-without-year"),
+    pytest.param(("KXSENATE-26", "KXSENATE", "Will the Democrats win the Georgia Senate race in 2026?"), id="georgia-senate-race-kalshi"),
     pytest.param(
         ("KXSENATE-26", "KXSENATE", "Will Democrats win the U.S. Senate in 2026?", "", "Unlike in 2028, only 2026 counts."),
         id="rules-mention-other-year-as-background",
@@ -1060,6 +936,11 @@ KALSHI_INELIGIBLE = [
         ("KXBRSENATE-26", "KXBRSENATE", "Who will win the Brazilian Senate election in 2026?"),
         "foreign_election",
         id="brazilian-senate-2026",
+    ),
+    pytest.param(
+        ("KXGEPARL-26", "KXGEPARL", "Georgia parliamentary election in 2026"),
+        "foreign_election",
+        id="georgia-parliament-election",
     ),
     pytest.param(
         (
@@ -1098,16 +979,6 @@ KALSHI_INELIGIBLE = [
         id="structured-us-with-foreign-title",
     ),
     pytest.param(
-        ("KXSENATE-26", "KXSENATE", "Will Democrats win the Georgia Senate race in 2026?"),
-        "ambiguous_jurisdiction",
-        id="georgia-country-or-state",
-    ),
-    pytest.param(
-        ("KXSENATE-26", "KXSENATE", "Will Democrats win the Senate in 2026?"),
-        "lacks_us_jurisdiction",
-        id="in-is-not-indiana",
-    ),
-    pytest.param(
         ("KXUKGEYEAR-26", "KXUKGEYEAR", "UK General Election in 2026", "UK General Election"),
         "foreign_election",
         id="uk-general-election",
@@ -1121,11 +992,6 @@ KALSHI_INELIGIBLE = [
         ("KXSENATE-26", "KXSENATE", "Will the U.S. Senate majority leader resign in 2026?"),
         "unrelated_political_event",
         id="resignation",
-    ),
-    pytest.param(
-        ("KXSENATE", "KXSENATE", "Will Democrats win the U.S. Senate?", "", "", "open", {"close_time": "2026-11-03T00:00:00Z"}),
-        "lacks_2026_contest_year",
-        id="closing-time-is-not-cycle-evidence",
     ),
     pytest.param(
         ("KXSENATE-26", "KXSENATE", "Closer Senate race 2026: Florida or South Carolina?"),
@@ -1171,8 +1037,9 @@ class _PolyPageOpener:
     def __init__(self, items: list[dict]) -> None:
         self.items = items
 
-    def open(self, req: urllib.request.Request) -> io.BytesIO:
-        return io.BytesIO(json.dumps({"data": self.items, "next_cursor": "LTE="}).encode("utf-8"))
+    def open(self, _req: urllib.request.Request) -> io.BytesIO:
+        events = [{"id": "ev-1", "title": "2026 Senate", "slug": "2026-senate", "markets": self.items}]
+        return io.BytesIO(json.dumps(events).encode("utf-8"))
 
 
 def _binary_market(tokens: object, cid: str = "bin-1") -> dict:
@@ -1281,11 +1148,20 @@ def _exclusions(out: str, venue: str) -> dict:
 
 def _poly_noise() -> list[dict]:
     one = _poly_item("poly-bad-one-token", "Will Democrats win U.S. Senate seat 500 in 2026?", "us-senate-seat-500-2026")
-    one["tokens"] = one["tokens"][:1]
+    one["tokens"] = [
+        {"outcome": "Yes", "token_id": "poly-bad-one-token-yes", "price": 0.5}
+    ]
     three = _poly_item("poly-bad-three-tokens", "Will Democrats win U.S. Senate seat 501 in 2026?", "us-senate-seat-501-2026")
-    three["tokens"] = [*three["tokens"], {"outcome": "Maybe", "token_id": "poly-bad-three-tokens-maybe"}]
+    three["tokens"] = [
+        {"outcome": "Yes", "token_id": "poly-bad-three-tokens-yes", "price": 0.5},
+        {"outcome": "No", "token_id": "poly-bad-three-tokens-no", "price": 0.5},
+        {"outcome": "Maybe", "token_id": "poly-bad-three-tokens-maybe", "price": 0.0},
+    ]
     null_label = _poly_item("poly-bad-null-label", "Will Democrats win U.S. Senate seat 502 in 2026?", "us-senate-seat-502-2026")
-    null_label["tokens"][1]["outcome"] = None
+    null_label["tokens"] = [
+        {"outcome": "Yes", "token_id": "poly-bad-null-label-yes", "price": 0.5},
+        {"outcome": None, "token_id": "poly-bad-null-label-no", "price": 0.5},
+    ]
     return [
         _poly_item("poly-bad-brazil", "Who will win the Brazilian Senate election in 2026?", "brazilian-senate-election-2026"),
         {
@@ -1319,12 +1195,12 @@ def test_main_excludes_ineligible_markets_and_invalid_mappings_from_successful_o
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     poly, kalshi = _valid_poly(), _valid_kalshi()
-    poly["c2"]["data"] = poly["c2"]["data"] + _poly_noise()
+    poly[100].append(_poly_event("ev-noise", "Noise", "noise", _poly_noise()))
     kalshi["k2"]["events"] = kalshi["k2"]["events"] + _kalshi_noise()
     env = _install(tmp_path, monkeypatch, poly, kalshi)
     code, out, _err = _run_main(capsys)
 
-    assert env.poly_cursors == [None, "c2"]
+    assert env.poly_offsets == [0, 100]
     assert env.kalshi_cursors == [None, "k2"]
     published = _assert_success(env, code, POLY_IDS, KALSHI_IDS)
     assert all(len(m["outcomes"]) == 2 for m in published["polymarket"])
@@ -1343,7 +1219,7 @@ def test_main_excludes_ineligible_markets_and_invalid_mappings_from_successful_o
 
 
 def _assert_validation_failure(env: _Env, code: object, err: str, reason: str) -> None:
-    assert env.poly_cursors == [None, "c2"]
+    assert env.poly_offsets == [0, 100]
     assert env.kalshi_cursors == [None, "k2"]
     assert code == 1
     assert "VALIDATION FAILED ON NEW DATASET" in err
@@ -1355,7 +1231,9 @@ def test_main_invalid_mapping_removing_house_control_preserves_latest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     poly = _valid_poly()
-    poly[""]["data"][1]["tokens"] = poly[""]["data"][1]["tokens"][:1]  # House control: one token
+    # House control market with only 1 token
+    poly[0][1]["markets"][0]["clobTokenIds"] = json.dumps(["only-one-tok"])
+    poly[0][1]["markets"][0]["outcomes"] = json.dumps(["Yes"])
     env = _install(tmp_path, monkeypatch, poly, _valid_kalshi())
     code, _out, err = _run_main(capsys)
     _assert_validation_failure(env, code, err, "Polymarket missing House Control market")
@@ -1365,8 +1243,9 @@ def test_main_ineligible_senate_control_preserves_latest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     poly = _valid_poly()
-    poly[""]["data"][0]["question"] = "Will Democrats control the Senate in the 2026 midterms?"  # no U.S. evidence
-    poly[""]["data"][0]["market_slug"] = "dems-control-the-senate-2026-midterms"
+    # Senate control made ineligible by conflicting primary year 2028
+    poly[0][0]["markets"][0]["question"] = "Will Democrats control the Senate in 2028?"
+    poly[0][0]["markets"][0]["slug"] = "dems-control-the-senate-2028"
     env = _install(tmp_path, monkeypatch, poly, _valid_kalshi())
     code, _out, err = _run_main(capsys)
     _assert_validation_failure(env, code, err, "Polymarket missing Senate Control market")

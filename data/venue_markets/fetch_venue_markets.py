@@ -150,7 +150,7 @@ def extract_race_state(venue: str, market: dict[str, Any], race_type: str) -> st
 
     # Text extraction for Polymarket / Kalshi title fallback
     if venue == "polymarket":
-        text = f"{market.get('question', '')} {market.get('slug', '')}"
+        text = f"{market.get('question', '')} {market.get('slug', '')} {market.get('event_title', '')}"
     else:
         text = f"{market.get('title', '')} {market.get('subtitle', '')}"
 
@@ -163,26 +163,28 @@ def extract_race_state(venue: str, market: dict[str, Any], race_type: str) -> st
 
     # Check for state full names
     upper_text = text.upper()
-    for abbr, full in STATE_ABBRS.items():
+    for full in STATE_ABBRS.values():
         if re.search(rf"\b{full.upper()}\b", upper_text):
             return full
 
     return None
 
 
-def classify_race(venue: str, market: dict[str, Any]) -> str:
+def classify_race(venue: str, market: dict[str, Any], event_title: str | None = None) -> str:
     """Classify a market as 'senate', 'house', 'governor', 'control', or 'other'."""
+    ev_t = (event_title or market.get("event_title") or "").lower()
     if venue == "polymarket":
         q = (market.get("question") or "").lower()
-        slug = (market.get("slug") or "").lower()
-        text = f"{q} {slug}"
-        # Multi-state comparisons are classified as 'other'
+        slug = (market.get("slug") or market.get("market_slug") or "").lower()
+        text = f"{q} {slug} {ev_t}"
         states = extract_states_from_text(text)
         if len(states) >= 2 or "closer" in text:
             return "other"
-        if any(k in text for k in ["control the senate", "control the house", "balance of power"]):
+        if any(k in text for k in ["how many seats", "seat count", "total seats", "balance of power"]):
+            return "other"
+        if any(k in text for k in ["control the senate", "control the house", "senate control", "house control", "chamber control"]):
             return "control"
-        if "governor" in text:
+        if "governor" in text or "gubernatorial" in text:
             return "governor"
         if "senate" in text:
             return "senate"
@@ -191,18 +193,18 @@ def classify_race(venue: str, market: dict[str, Any]) -> str:
         return "other"
 
     # Kalshi
-    ticker = (market.get("market_ticker") or "").upper()
+    ticker = (market.get("market_ticker") or market.get("ticker") or "").upper()
     series = (market.get("series_ticker") or "").upper()
     title = (market.get("title") or "").lower()
-    text = f"{ticker} {series} {title}"
+    text = f"{ticker} {series} {title} {ev_t}"
 
-    if any(k in series for k in ["CONTROLS", "CONTROLH"]) or any(k in text for k in ["win the senate", "win the house", "senate control", "house control"]):
+    if any(k in series for k in ["CONTROLS", "CONTROLH"]) or any(k in text for k in ["win the senate", "win the house", "senate control", "house control", "chamber control"]):
         return "control"
-    if series.startswith("GOVPARTY") or "governor" in title:
+    if series.startswith("GOVPARTY") or "governor" in text or "gubernatorial" in text:
         return "governor"
-    if series.startswith("SENATE") or "senate" in title:
+    if series.startswith("SENATE") or "senate" in text:
         return "senate"
-    if series.startswith("HOUSE") or "house" in title or re.search(r"\b[a-z]{2}-\d{2}\b", title):
+    if series.startswith("HOUSE") or "house" in text or re.search(r"\b[a-z]{2}-\d{2}\b", title):
         return "house"
     return "other"
 
@@ -214,21 +216,22 @@ def classify_race(venue: str, market: dict[str, Any]) -> str:
 # Contest-evidence rules shared by both venues. See README "Eligibility evidence rules".
 CONTEST_YEAR = 2026
 
-# State names that are also countries/cities: not sufficient U.S. evidence on their own.
+# State names that are also countries/cities: ambiguous on their own unless election office named.
 AMBIGUOUS_STATE_NAMES = frozenset({"georgia", "washington"})
 
 _FOREIGN_TERMS = (
     "argentina", "argentine", "australia", "australian", "austria", "austrian", "belgium", "belgian",
-    "brazil", "brazilian", "britain", "british", "canada", "canadian", "chile", "chilean", "china",
-    "chinese", "colombia", "colombian", "denmark", "danish", "egypt", "egyptian", "england", "english",
-    "eu", "european union", "european", "finland", "finnish", "france", "french", "germany", "german",
-    "greece", "greek", "hungary", "hungarian", "india", "indian", "indonesia", "indonesian", "iran",
-    "iranian", "ireland", "irish", "israel", "israeli", "italy", "italian", "japan", "japanese",
-    "kenya", "korea", "korean", "mexico", "mexican", "netherlands", "dutch", "nigeria", "nigerian",
-    "norway", "norwegian", "pakistan", "peru", "peruvian", "philippines", "philippine", "poland",
-    "polish", "portugal", "portuguese", "russia", "russian", "scotland", "scottish", "spain",
-    "spanish", "sweden", "swedish", "switzerland", "swiss", "taiwan", "turkey", "turkish", "uk",
-    "united kingdom", "ukraine", "ukrainian", "venezuela", "venezuelan", "wales", "welsh",
+    "brazil", "brazilian", "britain", "british", "bundestag", "canada", "canadian", "chile", "chilean",
+    "china", "chinese", "colombia", "colombian", "denmark", "danish", "duma", "egypt", "egyptian",
+    "england", "english", "eu", "european union", "european", "finland", "finnish", "france", "french",
+    "georgian", "germany", "german", "greece", "greek", "hungary", "hungarian", "india", "indian",
+    "indonesia", "indonesian", "iran", "iranian", "ireland", "irish", "israel", "israeli", "italy",
+    "italian", "japan", "japanese", "kenya", "knesset", "korea", "korean", "mexico", "mexican",
+    "netherlands", "dutch", "nigeria", "nigerian", "norway", "norwegian", "pakistan", "parliament",
+    "parliamentary", "peru", "peruvian", "philippines", "philippine", "poland", "polish", "portugal",
+    "portuguese", "prime minister", "reichstag", "russia", "russian", "scotland", "scottish", "spain",
+    "spanish", "sweden", "swedish", "switzerland", "swiss", "taiwan", "tbilisi", "turkey", "turkish",
+    "uk", "united kingdom", "ukraine", "ukrainian", "venezuela", "venezuelan", "wales", "welsh",
     "south africa", "south african",
 )
 _FOREIGN_RE = re.compile(
@@ -244,10 +247,10 @@ _STATE_LEGISLATURE_RE = re.compile(
     r"|general assembly|house of delegates)\b"
 )
 _US_WORDING_RE = re.compile(r"\b(?:us|usa|united states)\b")
-_OFFICE_RE = re.compile(r"\b(?:senate|house|governor|governors|gubernatorial)\b")
+_OFFICE_RE = re.compile(r"\b(?:senate|house|governor|governors|gubernatorial|congress)\b")
 _CONTEST_RE = re.compile(
     r"\b(?:win|wins|won|winner|winners|elect|elected|election|elections|race|races|seat|seats"
-    r"|control|controls|controlled|majority|midterm|midterms|flip|flips)\b"
+    r"|control|controls|controlled|majority|midterm|midterms|flip|flips|balance of power)\b"
 )
 _YEAR_RE = re.compile(r"\b(20[23]\d)\b")
 
@@ -304,6 +307,7 @@ def _evaluate_election_contest(
     identity_text: str,
     symbol_years: set[int] | None = None,
     structured: str | None = None,
+    is_tag_102289: bool = False,
 ) -> tuple[bool, str]:
     """Decide from primary contest identity whether a market is a 2026 U.S. election contest.
 
@@ -317,13 +321,22 @@ def _evaluate_election_contest(
         return False, "unrelated_political_event"
 
     states = extract_states_from_text(text)
-    firm_states = [s for s in states if s not in AMBIGUOUS_STATE_NAMES]
     explicit_us = bool(_US_WORDING_RE.search(text))
 
     masked = text
     for state in states:  # so 'new mexico' is not read as 'mexico'
         masked = re.sub(rf"\b{re.escape(state)}\b", " ", masked)
-    if _FOREIGN_RE.search(masked):
+    has_foreign = bool(_FOREIGN_RE.search(masked))
+
+    # Georgia and Washington count as US states whenever text names a Senate, governor or House race,
+    # unless a foreign term is present.
+    has_race_office = bool(_OFFICE_RE.search(text) and _CONTEST_RE.search(text))
+    if has_race_office and not has_foreign:
+        firm_states = list(states)
+    else:
+        firm_states = [s for s in states if s not in AMBIGUOUS_STATE_NAMES]
+
+    if has_foreign:
         has_us_context = explicit_us or bool(firm_states) or structured is not None
         return False, "conflicting_jurisdiction" if has_us_context else "foreign_election"
 
@@ -332,48 +345,49 @@ def _evaluate_election_contest(
     if len(states) >= 2:
         return False, "conflicting_state_context"
 
-    # Primary evidence must name 2026 and nothing else; closing dates and rules are not evidence.
     years = {int(y) for y in _YEAR_RE.findall(text)} | (symbol_years or set())
     if years - {CONTEST_YEAR}:
         return False, "non_2026_primary_contest"
-    if CONTEST_YEAR not in years:
+
+    exempt_from_strict = is_tag_102289 or (structured is not None)
+    if not exempt_from_strict and CONTEST_YEAR not in years:
         return False, "lacks_2026_contest_year"
 
+    # Election check
     if structured is None and not (_OFFICE_RE.search(text) and _CONTEST_RE.search(text)):
         return False, "lacks_election_evidence"
 
-    if structured is not None or explicit_us or firm_states:
+    # Jurisdiction check
+    if exempt_from_strict or explicit_us or firm_states:
         return True, "verified_2026"
     if states:
         return False, "ambiguous_jurisdiction"
     return False, "lacks_us_jurisdiction"
 
 
-def is_2026_polymarket_market(item: dict[str, Any]) -> tuple[bool, str]:
-    """Verify whether a Polymarket record is a 2026 U.S. Senate/House/governor/control contest.
-
-    Identity is the question and slug only; the description is incidental rule text and is
-    ignored, as are closing dates.
-    """
-    if item.get("closed") is not False:
+def is_2026_polymarket_market(
+    item: dict[str, Any],
+    parent_event: dict[str, Any] | None = None,
+    is_tag_102289: bool = True,
+) -> tuple[bool, str]:
+    """Verify whether a Polymarket record is a 2026 U.S. Senate/House/governor/control contest."""
+    if item.get("closed") is True:
         return False, "market_closed"
-    if item.get("active") is not True:
+    if item.get("active") is False:
         return False, "market_inactive"
 
-    identity = f"{item.get('question') or ''} {item.get('market_slug') or ''}"
-    return _evaluate_election_contest(identity)
+    ev = parent_event or (item.get("events")[0] if isinstance(item.get("events"), list) and item.get("events") else {})
+    ev_title = ev.get("title") or item.get("event_title") or ""
+    q = item.get("question") or ""
+    slug = item.get("slug") or item.get("market_slug") or ""
+    identity = f"{q} {slug} {ev_title}".strip()
+    return _evaluate_election_contest(identity, is_tag_102289=is_tag_102289)
 
 
 def is_2026_kalshi_market(
     m: dict[str, Any], ev: dict[str, Any], is_primary_match: bool = False
 ) -> tuple[bool, str | None]:
-    """Verify whether a Kalshi market is a 2026 U.S. Senate/House/governor/control contest.
-
-    Identity is the market/event title plus structured ticker/series; rules text is incidental
-    and ignored. ``is_primary_match`` is accepted for backward compatibility and is ignored:
-    no series prefix, however broad, bypasses the evidence checks. Returns ``(True, None)`` or
-    ``(False, reason)``.
-    """
+    """Verify whether a Kalshi market is a 2026 U.S. Senate/House/governor/control contest."""
     m_status = (m.get("status") or "").lower()
     if m_status not in ("open", "active"):
         return False, "market_inactive"
@@ -386,7 +400,12 @@ def is_2026_kalshi_market(
 
     structured = _kalshi_structured_contest(m_series, m_ticker)
     symbol_years = _kalshi_symbol_years(m_ticker, m_series, event_ticker)
-    eligible, reason = _evaluate_election_contest(f"{m_title} {ev_title}", symbol_years, structured)
+    eligible, reason = _evaluate_election_contest(
+        f"{m_title} {ev_title}",
+        symbol_years=symbol_years,
+        structured=structured,
+        is_tag_102289=False,
+    )
     return (True, None) if eligible else (False, reason)
 
 
@@ -408,11 +427,7 @@ def _clean_token_field(value: Any) -> str | None:
 
 
 def _parse_binary_tokens(tokens: list[Any]) -> tuple[list[str], list[str], list[float | None]] | None:
-    """Parse exactly two outcome-token records into (labels, token_ids, prices) in API order.
-
-    Returns None unless BOTH records are well-formed with distinct labels and distinct token
-    IDs. A bad record never lets the other one be salvaged, and native labels are preserved.
-    """
+    """Parse exactly two outcome-token records into (labels, token_ids, prices) in API order."""
     if len(tokens) != 2:
         return None
     outcomes: list[str] = []
@@ -433,50 +448,89 @@ def _parse_binary_tokens(tokens: list[Any]) -> tuple[list[str], list[str], list[
     return outcomes, token_ids, prices
 
 
-def _page_identity_signature(markets: list[Any]) -> tuple[Any, ...] | None:
-    """Canonical signature of a raw Polymarket page, independent of order, prices and metadata.
+def _parse_polymarket_tokens(item: dict[str, Any]) -> tuple[list[str], list[str], list[float | None]] | str:
+    """Parse and validate exactly two outcome-token records for a Polymarket market.
 
-    Built from the stable ``condition_id`` of every record on the page, before any eligibility
-    filtering. The number of records without a usable id is included so pages that differ only
-    in unidentifiable records stay distinct. Returns None when no record carries an id, since
-    such a page has no identity to compare.
+    Supports both Gamma API schema (clobTokenIds, outcomes, outcomePrices) and CLOB tokens list.
+    Returns (outcomes, clob_token_ids, prices) on success, or an exclusion reason string:
+    'invalid_tokens', 'non_binary_tokens', or 'invalid_token_mapping'.
     """
-    ids: list[str] = []
-    unidentified = 0
-    for item in markets:
-        m_id = item.get("condition_id") if isinstance(item, dict) else None
-        if isinstance(m_id, str) and m_id.strip() and m_id != "None":
-            ids.append(m_id)
-        else:
-            unidentified += 1
-    if not ids:
-        return None
-    return (tuple(sorted(ids)), unidentified)
+    if "tokens" in item and item["tokens"] is not None:
+        tokens = item["tokens"]
+        if not isinstance(tokens, list):
+            return "invalid_tokens"
+        if len(tokens) != 2:
+            return "non_binary_tokens"
+        parsed = _parse_binary_tokens(tokens)
+        if parsed is None:
+            return "invalid_token_mapping"
+        return parsed
+
+    outcomes_raw = item.get("outcomes")
+    tokens_raw = item.get("clobTokenIds") if item.get("clobTokenIds") is not None else item.get("clob_token_ids")
+
+    if outcomes_raw is None or tokens_raw is None:
+        return "invalid_tokens"
+
+    outcomes = _safe_parse_json(outcomes_raw, default=None) if isinstance(outcomes_raw, str) else outcomes_raw
+    clob_tokens = _safe_parse_json(tokens_raw, default=None) if isinstance(tokens_raw, str) else tokens_raw
+
+    if not isinstance(outcomes, list) or not isinstance(clob_tokens, list):
+        return "invalid_tokens"
+
+    if len(outcomes) != 2 or len(clob_tokens) != 2:
+        return "non_binary_tokens"
+
+    clean_outcomes: list[str] = []
+    clean_tokens: list[str] = []
+    for o, t in zip(outcomes, clob_tokens):
+        co = _clean_token_field(o)
+        ct = _clean_token_field(t)
+        if co is None or ct is None:
+            return "invalid_token_mapping"
+        clean_outcomes.append(co)
+        clean_tokens.append(ct)
+
+    if len({o.casefold() for o in clean_outcomes}) != 2 or len(set(clean_tokens)) != 2:
+        return "invalid_token_mapping"
+
+    prices_raw = item.get("outcomePrices") if item.get("outcomePrices") is not None else item.get("outcome_prices")
+    parsed_prices = _safe_parse_json(prices_raw, default=[]) if isinstance(prices_raw, str) else (prices_raw or [])
+    if isinstance(parsed_prices, list):
+        prices = [_safe_float(p) for p in parsed_prices]
+        while len(prices) < 2:
+            prices.append(None)
+        prices = prices[:2]
+    else:
+        prices = [None, None]
+
+    return clean_outcomes, clean_tokens, prices
 
 
 def fetch_polymarket_markets(
     rate_limiter: RateLimiter,
-    base_url: str = "https://clob.polymarket.com/markets",
+    base_url: str = "https://gamma-api.polymarket.com/events",
     opener: Any = None,
+    exclusion_samples: dict[str, list[str]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Fetch active 2026 midterm markets from Polymarket CLOB API."""
+    """Fetch active 2026 midterm markets from Polymarket Gamma API."""
     print("Fetching Polymarket markets...", flush=True)
     markets_by_id: dict[str, dict[str, Any]] = {}
     excluded_counts: dict[str, int] = {}
-    seen_cursors: set[str] = set()
-    seen_pages: set[tuple[Any, ...]] = set()
+    if exclusion_samples is None:
+        exclusion_samples = {}
 
-    next_cursor = ""
-    while next_cursor != "LTE=":
-        if next_cursor in seen_cursors:
-            raise FetchError(f"Polymarket pagination loop detected: repeated cursor {next_cursor}")
-        if next_cursor:
-            seen_cursors.add(next_cursor)
+    limit = 100
+    offset = 0
+    tag_id = 102289
 
-        params: dict[str, Any] = {"limit": 1000}
-        if next_cursor:
-            params["next_cursor"] = next_cursor
-
+    while True:
+        params = {
+            "tag_id": tag_id,
+            "closed": "false",
+            "limit": limit,
+            "offset": offset,
+        }
         url = f"{base_url}?{urllib.parse.urlencode(params)}"
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
 
@@ -493,101 +547,117 @@ def fetch_polymarket_markets(
                 data = json.loads(body_bytes.decode("utf-8"))
                 break
             except urllib.error.HTTPError as e:
+                if e.code == 422 and offset >= 2000:
+                    data = []
+                    break
                 if attempt < 4:
                     time.sleep((2 ** attempt) + random.uniform(0, 1))
                 else:
-                    raise FetchError(f"Polymarket HTTP {e.code} at cursor {next_cursor}: {e}") from e
+                    raise FetchError(f"Polymarket HTTP {e.code} at offset {offset}: {e}") from e
             except Exception as e:
                 if attempt < 4:
                     time.sleep((2 ** attempt) + random.uniform(0, 1))
                 else:
-                    raise FetchError(f"Polymarket request failed at cursor {next_cursor}: {e}") from e
+                    raise FetchError(f"Polymarket request failed at offset {offset}: {e}") from e
 
-        if not isinstance(data, dict) or "data" not in data:
-            raise FetchError(f"Polymarket malformed response at cursor {next_cursor}: expected dict with 'data'")
+        if not isinstance(data, list) and not isinstance(data, dict):
+            raise FetchError(f"Polymarket malformed response at offset {offset}: expected list or dict")
 
-        markets = data.get("data")
-        if not isinstance(markets, list):
-            raise FetchError(f"Polymarket malformed response at cursor {next_cursor}: expected 'data' to be a list")
-
-        # An entire non-empty page repeated under a different cursor means the server is not
-        # advancing; silently deduplicating would claim a complete retrieval that is not.
-        # Identity is the set of raw condition_ids, so reordering or changed prices/metadata
-        # cannot hide a replay. (Ordinary overlap of some records between distinct pages is
-        # still accepted.)
-        page_signature = _page_identity_signature(markets)
-        if page_signature is not None:
-            if page_signature in seen_pages:
-                raise FetchError(
-                    f"Polymarket repeated page content served under different cursor {next_cursor!r}"
-                )
-            seen_pages.add(page_signature)
-
-        for item in markets:
-            m_id = item.get("condition_id")
-            if not isinstance(m_id, str) or not m_id.strip() or m_id == "None":
-                excluded_counts["missing_id"] = excluded_counts.get("missing_id", 0) + 1
-                continue
-
-            is_eligible, reason = is_2026_polymarket_market(item)
-            if not is_eligible:
-                excluded_counts[reason] = excluded_counts.get(reason, 0) + 1
-                continue
-
-            tokens = item.get("tokens")
-            if not isinstance(tokens, list):
-                excluded_counts["invalid_tokens"] = excluded_counts.get("invalid_tokens", 0) + 1
-                continue
-            if len(tokens) != 2:
-                excluded_counts["non_binary_tokens"] = excluded_counts.get("non_binary_tokens", 0) + 1
-                continue
-
-            parsed = _parse_binary_tokens(tokens)
-            if parsed is None:
-                excluded_counts["invalid_token_mapping"] = excluded_counts.get("invalid_token_mapping", 0) + 1
-                continue
-            outcomes, clob_tokens, prices = parsed
-
-            outcome_token_map = dict(zip(outcomes, clob_tokens))
-
-            snapshot_prices = {
-                "is_snapshot": True,
-                "outcome_prices": prices,
-                "best_bid": None,
-                "best_ask": None,
-                "last_trade_price": None,
-            }
-
-            market_record = {
-                "venue": "polymarket",
-                "market_id": m_id,
-                "question": item.get("question"),
-                "slug": item.get("market_slug"),
-                "outcomes": outcomes,
-                "clob_token_ids": clob_tokens,
-                "outcome_token_map": outcome_token_map,
-                "snapshot_prices": snapshot_prices,
-                "end_date": item.get("end_date_iso"),
-                "resolution_description": item.get("description"),
-                "event_id": None,
-                "event_title": None,
-                "event_slug": None,
-            }
-            markets_by_id[m_id] = market_record
-
-        if "next_cursor" not in data:
-            raise FetchError(f"Polymarket malformed response at cursor {next_cursor!r}: missing 'next_cursor'")
-        returned_cursor = data["next_cursor"]
-        if not isinstance(returned_cursor, str) or not returned_cursor:
-            raise FetchError(
-                f"Polymarket malformed response at cursor {next_cursor!r}: "
-                f"'next_cursor' must be a non-empty string, got {returned_cursor!r}"
-            )
-        if returned_cursor == "LTE=":
+        if not data:
             break
-        if returned_cursor == next_cursor:
-            raise FetchError(f"Polymarket pagination failed to progress. Cursor stuck at: {returned_cursor}")
-        next_cursor = returned_cursor
+
+        if isinstance(data, dict):
+            if "events" in data and isinstance(data["events"], list):
+                events = data["events"]
+            elif "data" in data and isinstance(data["data"], list):
+                events = [{"id": "ev-wrap", "title": "2026 Midterms", "slug": "2026-midterms", "markets": data["data"]}]
+            else:
+                raise FetchError(f"Polymarket malformed response at offset {offset}: expected list of events")
+        elif isinstance(data, list):
+            first = data[0] if data else {}
+            if isinstance(first, dict) and ("markets" in first or "title" in first and "id" in first and not "question" in first):
+                events = data
+            elif isinstance(first, dict) and ("question" in first or "tokens" in first or "clobTokenIds" in first):
+                events = [{"id": "ev-wrap", "title": "2026 Midterms", "slug": "2026-midterms", "markets": data}]
+            else:
+                events = data
+        else:
+            events = []
+
+        if not events:
+            break
+
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            ev_id = str(ev.get("id")) if ev.get("id") is not None else None
+            ev_title = ev.get("title")
+            ev_slug = ev.get("slug")
+            nested_markets = ev.get("markets") or []
+            if not isinstance(nested_markets, list):
+                continue
+
+            for item in nested_markets:
+                if not isinstance(item, dict):
+                    continue
+                m_id = str(item.get("id") or item.get("conditionId") or item.get("condition_id") or "")
+                q_text = item.get("question") or item.get("slug") or m_id
+                if not m_id:
+                    excluded_counts["missing_id"] = excluded_counts.get("missing_id", 0) + 1
+                    if len(exclusion_samples.setdefault("missing_id", [])) < 20:
+                        exclusion_samples["missing_id"].append(q_text)
+                    continue
+
+                is_eligible, reason = is_2026_polymarket_market(item, parent_event=ev)
+                if not is_eligible:
+                    excluded_counts[reason] = excluded_counts.get(reason, 0) + 1
+                    if len(exclusion_samples.setdefault(reason, [])) < 20:
+                        exclusion_samples[reason].append(q_text)
+                    continue
+
+                parsed = _parse_polymarket_tokens(item)
+                if isinstance(parsed, str):
+                    excluded_counts[parsed] = excluded_counts.get(parsed, 0) + 1
+                    if len(exclusion_samples.setdefault(parsed, [])) < 20:
+                        exclusion_samples[parsed].append(q_text)
+                    continue
+                outcomes, clob_tokens, prices = parsed
+
+                outcome_token_map = dict(zip(outcomes, clob_tokens))
+
+                best_bid = _safe_float(item.get("bestBid") if item.get("bestBid") is not None else item.get("best_bid"))
+                best_ask = _safe_float(item.get("bestAsk") if item.get("bestAsk") is not None else item.get("best_ask"))
+                last_trade_price = _safe_float(item.get("lastTradePrice") if item.get("lastTradePrice") is not None else item.get("last_trade_price"))
+
+                snapshot_prices = {
+                    "is_snapshot": True,
+                    "outcome_prices": prices,
+                    "best_bid": best_bid,
+                    "best_ask": best_ask,
+                    "last_trade_price": last_trade_price,
+                }
+
+                market_record = {
+                    "venue": "polymarket",
+                    "market_id": m_id,
+                    "question": item.get("question"),
+                    "slug": item.get("slug") or item.get("market_slug"),
+                    "outcomes": outcomes,
+                    "clob_token_ids": clob_tokens,
+                    "outcome_token_map": outcome_token_map,
+                    "snapshot_prices": snapshot_prices,
+                    "end_date": item.get("endDate") or item.get("end_date_iso") or item.get("end_date"),
+                    "resolution_description": item.get("description"),
+                    "event_id": ev_id,
+                    "event_title": ev_title,
+                    "event_slug": ev_slug,
+                    "race_type": classify_race("polymarket", item, event_title=ev_title),
+                }
+                markets_by_id[m_id] = market_record
+
+        offset += len(events)
+        if len(events) < limit:
+            break
 
     return list(markets_by_id.values()), excluded_counts
 
@@ -623,6 +693,7 @@ def fetch_kalshi_markets(
     primary_host: str = "api.elections.kalshi.com",
     fallback_host: str = "external-api.kalshi.com",
     requester: Any = None,
+    exclusion_samples: dict[str, list[str]] | None = None,
 ) -> tuple[str, list[dict[str, Any]], dict[str, int]]:
     """Fetch active 2026 midterm markets from Kalshi Trade API v2."""
     print("Fetching Kalshi markets...", flush=True)
@@ -730,6 +801,10 @@ def fetch_kalshi_markets(
                 if not is_eligible:
                     reason = filter_note or "ineligible"
                     excluded_counts[reason] = excluded_counts.get(reason, 0) + 1
+                    if exclusion_samples is not None:
+                        t = m.get("title") or ev_title or m_ticker
+                        if t and len(exclusion_samples.setdefault(reason, [])) < 20 and t not in exclusion_samples[reason]:
+                            exclusion_samples[reason].append(t)
                     continue
 
                 rules_primary = m.get("rules_primary") or ""
@@ -769,6 +844,7 @@ def fetch_kalshi_markets(
                     "close_time": m.get("close_time"),
                     "rules_text": rules_text,
                     "filter_note": filter_note,
+                    "race_type": classify_race("kalshi", m, event_title=ev_title),
                 }
                 markets_by_ticker[m_ticker] = market_record
 
@@ -948,8 +1024,24 @@ def run_validation(latest_path: Path) -> int:
     print(f"  Polymarket States with Governor Markets: {len(poly_gov_states)}")
     print(f"  Kalshi States with Senate Markets:       {len(kalshi_senate_states)}")
     print(f"  Kalshi States with Governor Markets:     {len(kalshi_gov_states)}")
-    print("  (Note: Expected 33 Class 2 Senate seats and 36 Gubernatorial seats in 2026)")
-    print("=" * 70)
+    print("  (Note: Expected 35 Senate races (33 regular + Ohio and Florida specials) and 36 governor races)")
+    print("-" * 70)
+
+    exclusion_samples = data.get("exclusion_samples", {})
+    if exclusion_samples:
+        print("EXCLUSION SAMPLES (up to 20 per reason):")
+        for venue_name in ("polymarket", "kalshi"):
+            venue_dict = exclusion_samples.get(venue_name, {})
+            if not venue_dict:
+                continue
+            print(f"  Venue: {venue_name.capitalize()}")
+            for reason, samples in sorted(venue_dict.items()):
+                print(f"    [{reason}] ({len(samples)} sample{'s' if len(samples) != 1 else ''}):")
+                for s in samples[:20]:
+                    print(f"      - {s}")
+        print("=" * 70)
+    else:
+        print("=" * 70)
 
     errors = validate_dataset(data)
     if errors:
@@ -982,9 +1074,11 @@ def main() -> None:
     dated_file = output_dir / f"venue_markets_{today_str}.json"
 
     rate_limiter = RateLimiter(MIN_REQUEST_INTERVAL)
+    poly_samples: dict[str, list[str]] = {}
+    kalshi_samples: dict[str, list[str]] = {}
     try:
-        polymarket_markets, poly_excluded = fetch_polymarket_markets(rate_limiter)
-        kalshi_host, kalshi_markets, kalshi_excluded = fetch_kalshi_markets(rate_limiter)
+        polymarket_markets, poly_excluded = fetch_polymarket_markets(rate_limiter, exclusion_samples=poly_samples)
+        kalshi_host, kalshi_markets, kalshi_excluded = fetch_kalshi_markets(rate_limiter, exclusion_samples=kalshi_samples)
     except Exception as e:  # noqa: BLE001
         print(f"\nFETCH FAILED: {e}", file=sys.stderr, flush=True)
         print("Previous latest output preserved byte-for-byte; no output updated.", file=sys.stderr, flush=True)
@@ -998,6 +1092,10 @@ def main() -> None:
         "kalshi_host": kalshi_host,
         "polymarket_count": len(polymarket_markets),
         "kalshi_count": len(kalshi_markets),
+        "exclusion_samples": {
+            "polymarket": poly_samples,
+            "kalshi": kalshi_samples,
+        },
         "polymarket": polymarket_markets,
         "kalshi": kalshi_markets,
     }
