@@ -40,9 +40,18 @@ must not act on a market until it is ready again. Each HeldBook also says whethe
 expiry time is known (REST books carry no `nextExpiryAt`).
 
 Blockers: a settlement requires the authoritative market state, and a trade without a
-sequence requires the exchange's price and trade tape over REST. This slice reads
-neither, so those reasons stay in `blockers(market_id)` and the market is not ready
-again for the life of the feed. An orderbook resync never clears them.
+sequence requires the exchange's price and trade tape over REST. A revision gap, a batch
+flagged `resyncRequired`, a malformed message or a batch missing a named book may have
+hidden either. This slice reads neither the market state nor the trade tape, so those
+reasons stay in `blockers(market_id)` and the market is not ready again for the life of
+the feed. An orderbook resync refreshes the books but never clears a blocker.
+
+Order expiry: a REST read clears a known `nextExpiryAt` only when it is shown to have
+been made at or after it (see realtime_topic.py); a read that started earlier keeps the
+expiry outstanding and the market is read again.
+
+Closing: once `aclose()` begins, `is_ready()` is False for every market, and a resync
+whose response arrives afterwards applies nothing and publishes nothing.
 
 Retry waits: a valid Retry-After on a failed mint or resync is a minimum wait; backoff
 limits (`max_retry_s`) never shorten it. A Retry-After too large to hold safely stops
@@ -276,6 +285,9 @@ class RealtimeFeedPolicy:
     max_retry_s: float = 120.0
     tick_s: float = 1.0
     trade_id_memory: int = DEFAULT_TRADE_ID_MEMORY
+    # [client policy] How far the local wall clock may run ahead of SIG's: an unversioned
+    # REST book covers an order expiry only if requested at least this long after it.
+    expiry_skew_margin_s: float = 1.0
 
     def __post_init__(self) -> None:
         if check_positive_int("snapshot_depth", self.snapshot_depth) > ORDERBOOK_DEPTH_MAX:
@@ -288,6 +300,7 @@ class RealtimeFeedPolicy:
             "resync_retry_s",
             "max_retry_s",
             "tick_s",
+            "expiry_skew_margin_s",
         ):
             check_positive_seconds(name, getattr(self, name))
         check_positive_int("resync_reads_per_minute", self.resync_reads_per_minute)
@@ -543,7 +556,8 @@ class RealtimeMarketFeed:
 
     def _ready_now(self, market: _Market) -> bool:
         return (
-            market.ready
+            not self._closing.is_set()
+            and market.ready
             and not market.blockers
             and self._token_valid()
             and not market.topic.has_expired_book(self._wall_epoch())
@@ -576,15 +590,20 @@ class RealtimeMarketFeed:
                 request = market.wanted
                 started_at = market.topic.stamp()
                 market.last_start = self._clock()
+                requested_epoch = self._wall_epoch()
                 try:
                     snapshot = await self._rest.get_market_orderbook(
                         market.market_id, depth=self._policy.snapshot_depth
                     )
+                    if self._closing.is_set():
+                        break  # closing began while the read was in flight
                     changed = market.topic.apply_snapshot(
                         snapshot.tournament_orderbook().exchanges,
                         depth=self._policy.snapshot_depth,
                         started_at=started_at,
                         now_epoch=self._wall_epoch(),
+                        requested_epoch=requested_epoch,
+                        skew_margin=Decimal(str(self._policy.expiry_skew_margin_s)),
                     )
                 except _PERMANENT:
                     raise
@@ -617,6 +636,8 @@ class RealtimeMarketFeed:
                         ", ".join(sorted(market.blockers)),
                     )
                     continue
+                if self._closing.is_set():
+                    break
                 market.ready = True
                 logger.info("realtime market %s ready", market.market_id)
                 self._emit(MarketReady(market.market_id))

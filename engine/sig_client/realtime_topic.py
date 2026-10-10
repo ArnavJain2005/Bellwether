@@ -32,7 +32,10 @@ this order:
 Steps 7 and 8 need REST reads other than the orderbook (the trade tape and the market
 itself), which this slice does not make. They are reported as `blockers`: the feed keeps
 the market not ready until they are reconciled, and an orderbook resync cannot clear
-them.
+them. The same holds wherever events may have been dropped: a revision gap, a batch
+flagged `resyncRequired`, a malformed message and a batch missing a named book all
+discard arrays that could have held settlements or trades (see BLOCKING_REASONS). Their
+discarded arrays are still never emitted.
 
 Delivery revisions are the only gap counter. Trade and book `sequence` values are
 engine event numbers ("provenance, not the topic gap counter") and are never compared
@@ -49,8 +52,15 @@ REST snapshots ([client policy] where the spec is silent):
 - REST books carry no `nextExpiryAt`, so their order-expiry time is unknown.
 - A held book whose known `nextExpiryAt` has passed is out of date even though its
   version is not: order expiry emits no engine event, so the engine version does not
-  move. A REST book replaces it when its version is equal or newer (or either version is
-  null); an older REST read is ignored, and the market stays not ready.
+  move. A REST book replaces it only when the read is shown to be at or after that
+  expiry (below) and its version is equal or newer (or either version is null);
+  otherwise the expired book is kept, the market stays not ready and is read again.
+- A known expiry E is covered by a REST read when the read happened at or after E:
+  for a versioned book, its `asOf.at` (the engine clock when the book was read) is at or
+  after E; for an unversioned book, the request was sent at least `skew_margin` after E
+  on the local wall clock (a lower bound for the read time). A REST book that replaces a
+  held book without covering its E keeps E as an outstanding expiry, so a read that
+  started before E can never erase it.
 - Exchanges absent from the snapshot are dropped: REST is authoritative on the set.
 """
 
@@ -104,8 +114,19 @@ class StaleReason(StrEnum):
     STOPPED = "feed stopped"
 
 
-# Recovery that an orderbook read cannot provide (see steps 7 and 8).
-BLOCKING_REASONS = frozenset({StaleReason.NULL_TRADE_SEQUENCE, StaleReason.MARKET_SETTLED})
+# Recovery that an orderbook read cannot provide: settlement needs the market state, a
+# null-sequence trade needs the trade tape (steps 7 and 8), and a message whose arrays were
+# discarded or never seen may have hidden either.
+BLOCKING_REASONS = frozenset(
+    {
+        StaleReason.NULL_TRADE_SEQUENCE,
+        StaleReason.MARKET_SETTLED,
+        StaleReason.REVISION_GAP,
+        StaleReason.RESYNC_REQUIRED,
+        StaleReason.MALFORMED,
+        StaleReason.MISSING_BOOK,
+    }
+)
 
 
 class BookSource(StrEnum):
@@ -122,7 +143,8 @@ class HeldBook:
     """The book held for one exchange. Prices and quantities are exactly as SIG sent.
 
     `complete` is False for a REST book with a side that may be cut off at `depth`.
-    `expiry_known` is False for REST books, which carry no `nextExpiryAt`.
+    `expiry_known` is False for REST books, which carry no `nextExpiryAt`; such a book may
+    still carry an outstanding earlier expiry (`next_expiry_at`) its read did not cover.
     """
 
     exchange_id: str
@@ -376,11 +398,15 @@ class MarketTopic:
         depth: int,
         started_at: int,
         now_epoch: Decimal | None = None,
+        requested_epoch: Decimal | None = None,
+        skew_margin: Decimal = Decimal(0),
     ) -> list[HeldBook]:
         """Apply one REST market orderbook. `started_at` is `stamp()` when it was requested.
 
         `now_epoch` is the wall-clock instant the result is applied at; held books whose
         known order expiry is at or before it are treated as out of date.
+        `requested_epoch` is the wall-clock instant the request was sent; with
+        `skew_margin` it bounds the read time of an unversioned book (module docstring).
 
         Returns the books that changed. Raises SnapshotError, applying nothing, for a
         snapshot that cannot be applied.
@@ -402,10 +428,13 @@ class MarketTopic:
         changed: list[HeldBook] = []
         for exchange, key in candidates:
             held = self._books.get(exchange.exchangeId)
-            if not self._snapshot_wins(held, key, started_at, now_epoch):
+            covered = _covers(held, key, requested_epoch, skew_margin)
+            if not self._snapshot_wins(held, key, started_at, now_epoch, covered):
                 assert held is not None
                 books[exchange.exchangeId] = held
                 continue
+            # An expiry this read did not cover stays outstanding on the new book.
+            carried = held if held is not None and not covered else None
             self._stamp += 1
             new = HeldBook(
                 exchange_id=exchange.exchangeId,
@@ -414,11 +443,11 @@ class MarketTopic:
                 asks=tuple(exchange.asks),
                 source=BookSource.REST,
                 complete=len(exchange.bids) < depth and len(exchange.asks) < depth,
-                next_expiry_at=None,
+                next_expiry_at=carried.next_expiry_at if carried else None,
                 expiry_known=False,
                 stamp=self._stamp,
                 version_key=key,
-                expiry_epoch=None,
+                expiry_epoch=carried.expiry_epoch if carried else None,
             )
             books[exchange.exchangeId] = new
             changed.append(new)
@@ -431,11 +460,15 @@ class MarketTopic:
         key: VersionKey | None,
         started_at: int,
         now_epoch: Decimal | None,
+        covered: bool,
     ) -> bool:
         if held is None:
             return True
         if _expired(held, now_epoch):
-            # Expiry changed the book without moving its version: an equal version wins.
+            # Expiry changed the book without moving its version: an equal version wins,
+            # but only a read made at or after the expiry can show the expired depth gone.
+            if not covered:
+                return False
             return key is None or held.version_key is None or key >= held.version_key
         if key is not None:
             return held.version_key is None or key > held.version_key
@@ -467,3 +500,19 @@ def _expired(book: HeldBook, now_epoch: Decimal | None) -> bool:
     return (
         now_epoch is not None and book.expiry_epoch is not None and book.expiry_epoch <= now_epoch
     )
+
+
+def _covers(
+    held: HeldBook | None,
+    key: VersionKey | None,
+    requested_epoch: Decimal | None,
+    skew_margin: Decimal,
+) -> bool:
+    """Whether a REST read is shown to be at or after the held book's known expiry."""
+    if held is None or held.expiry_epoch is None:
+        return True
+    if key is not None:
+        return key[1] >= held.expiry_epoch  # asOf.at: when the engine read the book
+    if requested_epoch is None:
+        return False
+    return requested_epoch - skew_margin >= held.expiry_epoch

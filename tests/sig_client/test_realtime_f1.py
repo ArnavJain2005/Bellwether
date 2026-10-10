@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -571,7 +572,15 @@ def _rest(sequence: int | None) -> Any:
 def test_expired_held_book_yields_to_equal_or_newer_rest(rest_sequence: Any, wins: bool) -> None:
     t = _topic_with_expired_push(9)
     now = epoch_seconds(T0)
-    changed = t.apply_snapshot([_rest(rest_sequence)], depth=200, started_at=t.stamp(), now_epoch=now)
+    # Requested after the expiry (T0 - 1 s) plus the margin, so an unversioned read covers it.
+    changed = t.apply_snapshot(
+        [_rest(rest_sequence)],
+        depth=200,
+        started_at=t.stamp(),
+        now_epoch=now,
+        requested_epoch=now,
+        skew_margin=Decimal("0.5"),
+    )
     assert bool(changed) is wins
     assert t.has_expired_book(now) is (not wins)
 
