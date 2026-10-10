@@ -55,12 +55,15 @@ REST snapshots ([client policy] where the spec is silent):
   move. A REST book replaces it only when the read is shown to be at or after that
   expiry (below) and its version is equal or newer (or either version is null);
   otherwise the expired book is kept, the market stays not ready and is read again.
-- A known expiry E is covered by a REST read when the read happened at or after E:
-  for a versioned book, its `asOf.at` (the engine clock when the book was read) is at or
-  after E; for an unversioned book, the request was sent at least `skew_margin` after E
-  on the local wall clock (a lower bound for the read time). A REST book that replaces a
-  held book without covering its E keeps E as an outstanding expiry, so a read that
-  started before E can never erase it.
+- A known expiry E is covered by a REST read when the read happened at or after E.
+  For a versioned book this is shown by SIG itself: its `asOf.at` (the engine clock when
+  the book was read) is at or after E. An unversioned book has no read time, only the
+  local wall-clock instant the request was sent; that proves nothing about SIG's clock
+  unless an operator has configured a bound `skew_margin` on how far the local clock may
+  run ahead of SIG's. With no bound (None, the default) an unversioned read never covers
+  E. With a bound, it covers E when the request was sent at least `skew_margin` after E.
+  A REST book that replaces a held book without covering its E keeps E as an
+  outstanding expiry, so a read that cannot be shown to follow E never erases it.
 - Exchanges absent from the snapshot are dropped: REST is authoritative on the set.
 """
 
@@ -399,14 +402,15 @@ class MarketTopic:
         started_at: int,
         now_epoch: Decimal | None = None,
         requested_epoch: Decimal | None = None,
-        skew_margin: Decimal = Decimal(0),
+        skew_margin: Decimal | None = None,
     ) -> list[HeldBook]:
         """Apply one REST market orderbook. `started_at` is `stamp()` when it was requested.
 
         `now_epoch` is the wall-clock instant the result is applied at; held books whose
         known order expiry is at or before it are treated as out of date.
-        `requested_epoch` is the wall-clock instant the request was sent; with
-        `skew_margin` it bounds the read time of an unversioned book (module docstring).
+        `requested_epoch` is the wall-clock instant the request was sent; with a
+        configured `skew_margin` it bounds the read time of an unversioned book. Without
+        one (None) an unversioned book never covers a known expiry (module docstring).
 
         Returns the books that changed. Raises SnapshotError, applying nothing, for a
         snapshot that cannot be applied.
@@ -506,13 +510,13 @@ def _covers(
     held: HeldBook | None,
     key: VersionKey | None,
     requested_epoch: Decimal | None,
-    skew_margin: Decimal,
+    skew_margin: Decimal | None,
 ) -> bool:
     """Whether a REST read is shown to be at or after the held book's known expiry."""
     if held is None or held.expiry_epoch is None:
         return True
     if key is not None:
         return key[1] >= held.expiry_epoch  # asOf.at: when the engine read the book
-    if requested_epoch is None:
-        return False
+    if requested_epoch is None or skew_margin is None:
+        return False  # no evidence about SIG's clock: fail closed
     return requested_epoch - skew_margin >= held.expiry_epoch

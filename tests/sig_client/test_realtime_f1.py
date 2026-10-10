@@ -38,7 +38,7 @@ from engine.sig_client.realtime import (
     MarketStale,
     RealtimeFeedPolicy,
 )
-from engine.sig_client.realtime_topic import MarketTopic, StaleReason
+from engine.sig_client.realtime_topic import BookSource, MarketTopic, StaleReason
 from engine.sig_client.realtime_wire import epoch_seconds
 from engine.sig_client.wire import CombinedOrderbookExchange
 
@@ -213,13 +213,16 @@ def test_book_expiry_passing_without_tick_withdraws_readiness() -> None:
 def test_already_expired_pushed_book_is_refetched_without_tick() -> None:
     async def scenario(h: Harness) -> None:
         await h.start()
+        # A versioned REST read made after the expiry (T0 - 1 s), by SIG's own clock.
+        h.router.routes[f"/api/v1{ORDERBOOK}"] = json_response(200, _orderbook(9))
         h.transport.batch(h.topic(), batch(1, 0, books=[book(9, next_expiry=iso(-1))]))
         await settle()
         assert stale_reasons(h) == [StaleReason.BOOK_EXPIRY]
         assert not h.feed.is_ready(MARKET)
         await h.clock.advance(2.0)  # min_resync_interval_s; the timer still never fires
         assert h.count(ORDERBOOK) == 2
-        assert h.feed.books(MARKET)[EX].as_of is None  # replaced by the REST book
+        held = h.feed.books(MARKET)[EX]
+        assert held.source is BookSource.REST and held.expiry_epoch is None
         assert h.feed.is_ready(MARKET) and readies(h) == 2
         await h.stop()
 

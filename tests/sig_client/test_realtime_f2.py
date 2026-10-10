@@ -190,14 +190,15 @@ def test_unversioned_read_requested_before_expiry_cannot_clear_it() -> None:
         first_gate.set()
         await settle()
         # The first read cannot be shown to be after the expiry; the immediate follow-up
-        # was requested at T0+6, past T0+5 plus the 1 s skew margin, and recovers.
+        # was requested at T0+6, past T0+5 plus the configured 1 s bound, and recovers.
         assert state["calls"] == 2
         held = h.feed.books(MARKET)[EX]
         assert (held.source, held.as_of, held.expiry_epoch) == (BookSource.REST, None, None)
         assert h.feed.is_ready(MARKET) and readies(h) == before + 1
         await h.stop()
 
-    run(scenario, policy=QUIET)
+    # An explicitly configured clock bound (F3: the default is None, see test_realtime_f3).
+    run(scenario, policy=RealtimeFeedPolicy(tick_s=1e6, expiry_skew_margin_s=1.0))
 
 
 def test_replacement_before_expiry_keeps_the_expiry_outstanding() -> None:

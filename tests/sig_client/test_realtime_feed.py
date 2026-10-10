@@ -486,15 +486,14 @@ def test_book_expiry_triggers_a_refetch() -> None:
     async def scenario(h: Harness) -> None:
         await h.start()
         expiry = (T0 + timedelta(seconds=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # SIG reads the book half a second after the expiry, by its own clock.
+        h.router.routes[f"/api/v1{ORDERBOOK}"] = orderbook(9, at="2026-10-10T12:00:30.5+00:00")
         h.transport.batch(h.topic(), batch(1, 0, books=[book(9, next_expiry=expiry)]))
         await h.clock.advance(29.0)
         assert h.count(ORDERBOOK) == 1
         await h.clock.advance(2.0)
         assert StaleReason.BOOK_EXPIRY in stale_reasons(h)
-        # Read at the expiry instant: an unversioned book cannot show it was read after.
-        assert h.count(ORDERBOOK) == 2 and not h.feed.is_ready(MARKET)
-        await h.clock.advance(1.0)  # follow-up read, requested past the skew margin
-        assert h.count(ORDERBOOK) == 3 and h.feed.is_ready(MARKET)
+        assert h.count(ORDERBOOK) == 2 and h.feed.is_ready(MARKET)
         await h.stop()
 
     run(scenario)

@@ -45,10 +45,18 @@ flagged `resyncRequired`, a malformed message or a batch missing a named book ma
 hidden either. This slice reads neither the market state nor the trade tape, so those
 reasons stay in `blockers(market_id)` and the market is not ready again for the life of
 the feed. An orderbook resync refreshes the books but never clears a blocker.
+Restarting the feed only discards this in-memory state: it does not reconcile the market
+state or the trades that may have been missed, so a restart is not a recovery
+procedure. Until the reconciliation reads exist, nothing establishes that a blocked
+market is safe to act on again.
 
 Order expiry: a REST read clears a known `nextExpiryAt` only when it is shown to have
-been made at or after it (see realtime_topic.py); a read that started earlier keeps the
-expiry outstanding and the market is read again.
+been made at or after it (see realtime_topic.py); otherwise the expiry stays outstanding,
+the market stays not ready and is read again on the normal resync schedule. A versioned
+read is shown by SIG's own `asOf.at`. An unversioned read can be shown only through
+`expiry_skew_margin_s`, an operator-configured bound on how far the local clock may run
+ahead of SIG's; it is unset (None) by default, and then an unversioned read never clears
+a known expiry. No clock synchronization is attempted.
 
 Closing: once `aclose()` begins, `is_ready()` is False for every market, and a resync
 whose response arrives afterwards applies nothing and publishes nothing.
@@ -76,6 +84,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass, field
@@ -285,9 +294,10 @@ class RealtimeFeedPolicy:
     max_retry_s: float = 120.0
     tick_s: float = 1.0
     trade_id_memory: int = DEFAULT_TRADE_ID_MEMORY
-    # [client policy] How far the local wall clock may run ahead of SIG's: an unversioned
-    # REST book covers an order expiry only if requested at least this long after it.
-    expiry_skew_margin_s: float = 1.0
+    # [client policy] A bound, in seconds, on how far the local wall clock may run ahead of
+    # SIG's. None (the default) means unknown: an unversioned REST book then never clears
+    # a known order expiry. Set it only with evidence that the bound holds.
+    expiry_skew_margin_s: float | None = None
 
     def __post_init__(self) -> None:
         if check_positive_int("snapshot_depth", self.snapshot_depth) > ORDERBOOK_DEPTH_MAX:
@@ -300,9 +310,16 @@ class RealtimeFeedPolicy:
             "resync_retry_s",
             "max_retry_s",
             "tick_s",
-            "expiry_skew_margin_s",
         ):
             check_positive_seconds(name, getattr(self, name))
+        bound = self.expiry_skew_margin_s
+        if bound is not None and (
+            isinstance(bound, bool)
+            or not isinstance(bound, (int, float))
+            or not math.isfinite(bound)
+            or bound < 0
+        ):
+            raise ValueError("expiry_skew_margin_s must be None or a finite number >= 0")
         check_positive_int("resync_reads_per_minute", self.resync_reads_per_minute)
         check_positive_int("trade_id_memory", self.trade_id_memory)
         if self.refresh_margin_s >= DOCUMENTED_TOKEN_LIFETIME_S:
@@ -388,6 +405,8 @@ class RealtimeMarketFeed:
         self._tasks: set[asyncio.Task[None]] = set()
         self._started = False
         self._closing = asyncio.Event()
+        bound = self._policy.expiry_skew_margin_s
+        self._skew_margin = None if bound is None else Decimal(str(bound))
 
     # --- public state -------------------------------------------------------------------
 
@@ -603,7 +622,7 @@ class RealtimeMarketFeed:
                         started_at=started_at,
                         now_epoch=self._wall_epoch(),
                         requested_epoch=requested_epoch,
-                        skew_margin=Decimal(str(self._policy.expiry_skew_margin_s)),
+                        skew_margin=self._skew_margin,
                     )
                 except _PERMANENT:
                     raise
