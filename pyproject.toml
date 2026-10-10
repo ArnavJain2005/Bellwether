@@ -12,7 +12,7 @@ dependencies = [
     "httpx",
     "pydantic>=2",
     "pytest",
-    "ruff",
+    "ruff==0.16.10",
 ]
 
 [tool.setuptools]
