@@ -1,0 +1,19 @@
+{
+  "provenance": "synthetic, spec-derived: envelope, pagination, coverage and trade 98342 from examples, except that trade 98342's createdAt is moved from the example 2026-04-04T18:23:11.000Z to 2026-04-03T18:23:11.000Z, because the example lies after the example `to` (exclusive); trade 98341 (NO, null price and volume) is a placeholder",
+  "openapi": [
+    "#/paths/~1exchanges~1{id}~1trades/get/responses/200/content/application~1json/schema",
+    "#/components/schemas/ExchangeTrade"
+  ],
+  "body": {
+    "exchangeId": "36",
+    "marketId": "26",
+    "from": "1970-01-01T00:00:00.000Z",
+    "to": "2026-04-04T00:00:00.000Z",
+    "data": [
+      {"id": "98342", "createdAt": "2026-04-03T18:23:11.000Z", "price": 0.42, "size": 100, "side": "YES", "volume": 42},
+      {"id": "98341", "createdAt": "2026-04-03T18:20:00.000Z", "price": null, "size": 3, "side": "NO", "volume": null}
+    ],
+    "pagination": {"limit": 200, "hasMore": false, "nextCursor": null},
+    "coverage": {"complete": true, "projectedThroughSequence": 184233}
+  }
+}

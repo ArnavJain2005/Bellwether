@@ -162,11 +162,14 @@ def test_no_public_write_or_arbitrary_request_methods() -> None:
         "create",
         "get_exchange_orderbook",
         "get_exchange_prices",
+        "get_market",  # S1-T3-B
         "get_market_orderbook",
         "get_tournament",
         "limiter",  # read-only accessor (S1-T3-A: the feed checks the shared budget)
+        "list_all_exchange_trades",  # S1-T3-B
         "list_all_orders",
         "list_all_tournament_markets",
+        "list_exchange_trades_page",  # S1-T3-B
         "list_orders_page",
         "list_tournament_markets_page",
         "tournament",  # read-only accessor for the configured TournamentRef

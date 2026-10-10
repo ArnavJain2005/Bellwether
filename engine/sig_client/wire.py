@@ -50,6 +50,18 @@ WirePositiveNumber = Annotated[Decimal, BeforeValidator(_json_number), Field(gt=
 """A finite JSON number strictly above 0, exactly as sent (fractions allowed)."""
 
 
+def _json_integer(value: object) -> Decimal:
+    # JSON Schema's "integer" is any number with no fractional part (100 and 100.0).
+    number = _json_number(value)
+    if number != number.to_integral_value():
+        raise PydanticCustomError("json_integer", "expected an integral JSON number")
+    return number
+
+
+WireNonNegativeInteger = Annotated[Decimal, BeforeValidator(_json_integer), Field(ge=0)]
+"""An integral JSON number of at least 0, exactly as sent (kept as a Decimal)."""
+
+
 def _json_true(value: object) -> bool:
     # Only the JSON literal `true` (Python True). Literal[True] alone would accept 1.
     if value is not True:
@@ -268,3 +280,110 @@ class OrdersPage(WireModel):
     data: list[Order]
     pagination: OrderPagination
     coverage: OrderCoverage | None = None  # documented as optional (not in `required`)
+
+
+# --- GET /markets/{id} ------------------------------------------------------------------
+# #/paths/~1markets~1{id}/get/responses/200/content/application~1json/schema
+# = #/components/schemas/Market
+
+
+class MarketExchange(WireModel):
+    """#/components/schemas/Exchange.
+
+    `latestPrice` is documented as the latest YES trade price in the resolved context
+    (null: no trade in that context; never the global price), so it is bounded to [0, 1].
+    `initialPrice` has no documented range or denomination and is left unbounded.
+    """
+
+    id: str
+    option: str | None
+    latestPrice: WirePrice | None
+    initialPrice: WireNumber | None
+
+
+class MarketContextExchange(WireModel):
+    """#/components/schemas/MarketContextExchange: the latest YES price in one context."""
+
+    id: str
+    latestPrice: WirePrice | None
+
+
+class MarketPricingContext(WireModel):
+    """#/components/schemas/MarketPricingContext (with MarketReadContextDescriptor)."""
+
+    type: Literal["public", "tournament"]
+    tournament: MarketTournamentContext | None
+    status: Literal["open", "closed", "settled"]
+    settledWith: str | None
+    settledOn: str | None
+    exchanges: list[MarketContextExchange]
+
+
+class Market(WireModel):
+    """The client checks that `contexts` holds exactly the configured tournament and that
+    the top-level scope fields agree with it; read them from `tournament_context()`."""
+
+    id: str
+    title: str
+    thumbnailUrl: str | None
+    status: Literal["open", "closed", "settled"]
+    createdAt: str | None
+    settlementDate: str | None
+    settledWith: str | None
+    settledOn: str | None
+    categories: list[str]
+    isComposite: bool
+    isMultiOutcome: bool
+    exchanges: list[MarketExchange]
+    contexts: list[MarketPricingContext]
+    creator: MarketCreator | None
+
+    def tournament_context(self) -> MarketPricingContext:
+        return self.contexts[0]
+
+
+# --- GET /exchanges/{id}/trades ---------------------------------------------------------
+# #/paths/~1exchanges~1{id}~1trades/get/responses/200/content/application~1json/schema
+# Items: #/components/schemas/ExchangeTrade
+
+
+class ExchangeTrade(WireModel):
+    """One fill. `price` is the YES-normalized fill price (null allowed), `size` the
+    absolute share count (an integer), `volume` an undocumented-unit notional column."""
+
+    id: str
+    createdAt: str
+    price: WirePrice | None
+    size: WireNonNegativeInteger
+    side: Literal["YES", "NO"]
+    volume: WireNumber | None
+
+
+class ExchangeTradesPagination(WireModel):
+    limit: int
+    hasMore: bool
+    nextCursor: str | None
+
+
+class TradeCoverage(WireModel):
+    """Reporting projection coverage metadata, exactly as sent.
+
+    `complete` is typed boolean and described as always true (here it is not an enum, as
+    it is for orders), so the model keeps the value as sent; the client rejects false.
+    `projectedThroughSequence` is the latest trading-engine sequence the reporting
+    projection reflects, or null when no checkpoint exists. It says nothing about whether
+    the projection has caught up with the engine.
+    """
+
+    complete: bool
+    projectedThroughSequence: int | None
+
+
+class ExchangeTradesPage(WireModel):
+    exchangeId: str
+    marketId: str
+    from_: str = Field(alias="from")  # `from` is a Python keyword
+    to: str
+    data: list[ExchangeTrade]
+    pagination: ExchangeTradesPagination
+    coverage: TradeCoverage | None = None  # documented as optional (not in `required`)
