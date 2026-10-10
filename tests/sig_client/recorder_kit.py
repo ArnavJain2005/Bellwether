@@ -36,6 +36,8 @@ PRICES = f"{API}/exchanges/prices"
 EXCHANGE_BOOK = f"{API}/exchanges/36/orderbook"
 MARKET_BOOK = f"{API}/markets/26/orderbook"
 ORDERS = f"{API}/orders"
+MARKET_DETAIL = f"{API}/markets/26"
+TRADES = f"{API}/exchanges/36/trades"
 
 BUILD = {
     "code": {"recorder_version": "test", "git_commit": None, "git_dirty": None},

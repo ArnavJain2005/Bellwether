@@ -1,4 +1,4 @@
-# SIG fixture recorder (S1-T4-A)
+# SIG fixture recorder (S1-T4-A; market detail and trades S1-T3-B-B)
 
 `engine/sig_client/record_fixtures.py` records a **small, bounded, read-only** sample of
 SIG responses through `SigRestClient`, so the client can later be checked against what
@@ -29,10 +29,17 @@ sends GET requests to SIG. Run `--help` for every option.
 | `--orders-status` | `open` | `open`, `closed`, `expired`, `all` |
 | `--skip-orders` | off | omits `GET /orders` entirely |
 | `--depth` | 5 | 1–20 levels per side |
+| `--include-market-detail` | off | adds `GET /markets/{id}` for every `--market-id` |
+| `--include-trades` | off | adds `GET /exchanges/{id}/trades` for every `--exchange-id`; needs the window below |
+| `--trades-from` / `--trades-to` | none | ISO-8601 with an offset (`Z` or `±HH:MM`), whole milliseconds, from < to, `to` not after the capture starts |
+| `--trades-page-limit` / `--trades-max-pages` | 10 / 1 | 1–50 / 1–3 per exchange |
 | `--output-root` | `sig_captures/` | a new run directory is created inside it |
 
 Arguments are validated before credentials are read or any request is possible.
-Rejected values are never echoed.
+Rejected values are never echoed. A trades window given without `--include-trades`, or
+`--include-trades` without both ends of the window, is rejected. The check that the
+window does not end after the capture starts runs at capture time, before the run
+directory is created or any request is sent; the preview does not consult the clock.
 
 ## What one run reads
 
@@ -45,17 +52,29 @@ In order, each through the existing client and its retries, deadlines and valida
 5. `GET /markets/{id}/orderbook`: once per selected market.
 6. `GET /orders?tournamentId=…`: up to `--orders-max-pages` pages (unless skipped).
 
+Only on request, after every default read (so a default run's steps and body file
+names never change):
+
+7. `GET /markets/{id}?tournamentId=…`: once per selected market, with
+   `--include-market-detail`, through `SigRestClient.get_market`.
+8. `GET /exchanges/{id}/trades?tournamentId=…&limit=…&from=…&to=…`: up to
+   `--trades-max-pages` pages per selected exchange, with `--include-trades`, through
+   `SigRestClient.list_exchange_trades_page`.
+
 No POST or DELETE, no orders, cancels, fills, positions or realtime tokens. A request
 hook refuses, before sending, anything that is not a GET to a planned path under the
-configured base URL, a scoped read without exactly the configured `tournamentId`, and
-any URL that holds the active credential.
+configured base URL, a scoped read without exactly the configured `tournamentId`, a
+trades read without exactly the planned `limit`, `from` and `to` (one of each), and any
+URL that holds the active credential.
 
 **Logical reads and HTTP attempts.** A logical read is one page or object request
-above. The largest plan is 28 logical reads (1 tournament, 3 market pages, prices, 10
-exchange books, 10 market books, 3 order pages). Each read may take up to 4 HTTP
-attempts under the client's retry policy (for 503 and transient transport failures),
-so a run sends at most 112 HTTP requests. The preview prints both numbers for the
-chosen options. At one admission every 4 s, 28 reads take about two minutes, and
+above. The largest default plan is 28 logical reads (1 tournament, 3 market pages,
+prices, 10 exchange books, 10 market books, 3 order pages). Each read may take up to 4
+HTTP attempts under the client's retry policy (for 503 and transient transport
+failures), so it sends at most 112 HTTP requests. With both opt-ins at their bounds
+(10 market details, 10 exchanges × 3 trades pages) the largest plan is 68 logical reads
+and 272 HTTP requests. The preview prints both numbers for the chosen options. At one
+admission every 4 s, 28 reads take about two minutes and 68 about four and a half;
 retries add to that.
 
 **Rate budget: capture standalone.** The recorder uses one `RateLimiter` of its own for
@@ -156,8 +175,8 @@ checked against their SHA-256, ready to serve through `httpx.MockTransport`.
 - Exception or error text: only client error classes, documented codes, the client's
   fixed descriptions and its validation summaries (field locations and error types,
   never values).
-- Query parameters outside an allowlist (`cursor`, `depth`, `exchangeId`, `ids`,
-  `limit`, `marketId`, `status`, `tournamentId`); only their count is kept.
+- Query parameters outside an allowlist (`cursor`, `depth`, `exchangeId`,
+  `from`, `ids`, `limit`, `marketId`, `status`, `to`, `tournamentId`); only their count is kept.
 
 ## Outcomes and exit status
 
@@ -181,14 +200,50 @@ never mistaken for success. Failures are never hidden:
 - **Pagination:** a collection is `complete` only when its last page said
   `hasMore: false`. Stopping at the page cap is recorded as `truncated`: a sample, not
   the full collection.
+- **Trade tape:** see below. `complete` there is about pagination only.
 - **Run directory:** an existing one is never reused or overwritten.
+
+## The trade tape
+
+Each `exchange_trades_<id>` collection records one exchange's tape over the fixed
+window. Every page asks for the same `from` (inclusive) and `to` (exclusive), so SIG's
+moving default of "now" is never used, and the window must not end after the capture
+starts, so no trade can arrive inside it while its pages are read. Each page passes the
+client's own validation (exchange, echoed window, order, `coverage.complete`, explicit
+null `coverage` rejected); the recorder loosens none of it.
+
+| Field | Content |
+| --- | --- |
+| `cursor_chain` | the cursor sent for each page read, in order (`null` for the first) |
+| `last_next_cursor` | `nextCursor` of the last page read: `null` once `hasMore` was false; at the page cap, the cursor that was **not** followed |
+| `complete` / `truncated` | the walk reached `hasMore: false` / stopped at the page cap with `hasMore: true` (never both) |
+| `coverage_per_page` | each page's `coverage` as sent: `{"present": false}` when omitted, else `complete` and `projectedThroughSequence` (which may be `null`) |
+| `projection_freshness` | always `unknown` |
+| `note`, `anomalies` | why the walk stopped early |
+
+Each page's step also keeps its own `coverage` in `steps[].page`. **A complete tape
+does not mean the data is fresh**: it shows only that every page of SIG's reporting
+projection for the window was read. Whether the projection has caught up with the
+trading engine is not established, and `projectedThroughSequence` is never compared
+with anything.
+
+Across pages, the recorder also flags as anomalies (ending the walk, run `partial`) a
+repeated cursor, a page naming a different market, a trade id seen twice, and a page
+holding trades newer than the previous page's. These are recorder labels only; the
+page method compares nothing across pages, and `list_all_exchange_trades` (which does)
+is not used, because it returns no partial tape.
+
+`from` and `to` are recorded in each attempt's allowlisted parameters only in the
+client's exact format (`YYYY-MM-DDTHH:MM:SS.mmmZ`), so a capture replays by path and
+parameters.
 
 ## Before a capture becomes a committed fixture
 
 A capture is **not sanitised**. Removing credentials does not make it safe to publish.
 
 - The tournament body includes the account's balance (`myBalance`), and orders bodies
-  are the account's own orders. Decide what may be committed, and redact by hand only
+  are the account's own orders. Market detail and trade-tape bodies are tournament
+  data, not account data, but are reviewed the same way. Decide what may be committed, and redact by hand only
   if the manifest then records the redaction.
 - Keep the manifest with any committed body, so its provenance (`recorded`, commit,
   spec hash, time) stays attached. Never relabel synthetic data as recorded.
