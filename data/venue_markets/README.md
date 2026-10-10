@@ -18,7 +18,7 @@ python data/venue_markets/fetch_venue_markets.py
 ```
 
 This will:
-- Query Polymarket's Gamma API (`https://gamma-api.polymarket.com/events`) with `tag_id=102289` (midterms) and `closed=false` using offset pagination to fetch all active 2026 midterm election events and nested markets.
+- Query Polymarket's Gamma API (`https://gamma-api.polymarket.com/events/keyset`) with `tag_id=102289` (midterms) and `closed=false` using keyset pagination to fetch tag-filtered active 2026 midterm election events and nested markets (tag traversal yields tag-filtered results and does not claim to prove coverage of every 2026 election market on the venue).
 - Query Kalshi's Trade API v2 for open election events and markets (Senate, House, governor, chamber control series).
 - Save results atomically (temporary file + atomic rename) to:
   - `data/venue_markets/output/venue_markets_<YYYY-MM-DD>.json`
@@ -55,25 +55,28 @@ git diff --check
 
 A market is kept only with affirmative evidence of a **2026 U.S. Senate, House, governor, chamber-control, or related midterm contest**. Both venues apply evidence checks in a structured order, and the first failing check becomes the exclusion reason (counted in the `exclusions` printed for each venue).
 
-**Contest identity sources:** The question/title, slug, structured Kalshi ticker/series, and parent event title. Description and rules text is *incidental*: it can neither make a market eligible nor ineligible. Closing dates and `close_time` are never cycle evidence.
+**Contest identity sources:** The question/title, slug, structured Kalshi ticker/series, parent event title, and parent event slug. Description and rules text is *incidental*: it can neither make a market eligible nor ineligible. Closing dates and `close_time` are never cycle evidence.
 
 | Order | Check | Exclusion reason |
 | --- | --- | --- |
-| 1 | Market is open/active (Polymarket `closed is not True`, `active is not False`; Kalshi status `open`/`active`) | `market_closed`, `market_inactive` |
+| 1 | Market is strictly open/active (Polymarket `closed` is exactly `False`, `active` is exactly `True`; Kalshi status `open`/`active`) | `market_closed`, `market_inactive` |
 | 2 | Not a resignation, appointment, confirmation, nomination, impeachment, retirement, or unrelated event | `unrelated_political_event` |
 | 3 | No foreign country/demonym or foreign political entity in the identity text (U.S. state names masked first). Foreign elections such as foreign parliament elections are excluded. If U.S. evidence is also present, the subject is contradictory | `foreign_election`, `conflicting_jurisdiction` |
 | 4 | Not a state legislature contest ("state senate", "state house", "legislature", ...) | `state_legislative_contest` |
 | 5 | At most one U.S. state named (multi-state comparisons such as "Florida or South Carolina" are classified as `other` or rejected if multi-seat) | `conflicting_state_context` |
 | 6 | Primary identity names no year other than 2026. Any conflicting primary year (e.g. 2028 or 2024) is rejected | `non_2026_primary_contest` |
-| 7 | An office (Senate, House, governor, Congress) and contest term (win, election, race, seat, control, majority, midterm, balance of power), or a recognised structured symbol | `lacks_election_evidence` |
-| 8 | Positive U.S. jurisdiction or cycle evidence | `lacks_us_jurisdiction`, `ambiguous_jurisdiction` |
+| 7 | Explicit 2026 election cycle evidence present (from question/slug/parent event for Polymarket, or title/year-bearing symbol for Kalshi) | `lacks_2026_contest_year` |
+| 8 | An office (Senate, House, governor, Congress) and contest term (win, election, race, seat, control, majority, midterm, balance of power), or a recognised structured symbol | `lacks_election_evidence` |
+| 9 | Positive U.S. jurisdiction or cycle evidence | `lacks_us_jurisdiction`, `ambiguous_jurisdiction` |
 
-**Exemption for Tag 102289 & Structured Tickers:**
-- For Polymarket markets in `tag_id=102289` (midterms) and Kalshi markets with a recognized structured ticker, a missing year or missing explicit "U.S." wording is **not** a reason to exclude.
+**Election-Cycle & Jurisdiction Evidence:**
+- Explicit 2026 election cycle evidence is strictly required for all markets. A numeric tag ID (`tag_id=102289`) or recognized Kalshi series alone must **not** establish the year 2026.
+- For Polymarket, 2026 evidence must be established from relevant market or parent-event identity text (question, market slug, parent event title, parent event slug). Source tag context (`tag_id=102289`) establishes U.S. jurisdiction when explicitly supplied by the fetcher, but does not waive the requirement for explicit 2026 cycle evidence.
+- For Kalshi, recognized structured symbols establish office and U.S. jurisdiction, but 2026 cycle evidence is strictly required from relevant titles or recognized year-bearing market/event symbols. Arbitrary numeric suffixes, district numbers, and ambiguous components in a ticker must not establish a year. A cycle year is only extracted from a valid position following a recognized prefix.
 - Georgia and Washington count as valid U.S. states whenever the text names a Senate, governor, or House race, unless a foreign term is present. Country parliamentary elections (e.g. Georgia parliamentary election) remain excluded under `foreign_election`.
 - Kept markets are classified as `senate`, `house`, `governor`, `control`, or `other` (seat counts, balance-of-power combos) using the parent event title as well as the question, and labeled with `race_type`.
 
-**Recognised structured Kalshi symbols:** `CONTROLS`/`CONTROLH` (optionally `KX`-prefixed) for chamber control, and `SENATE<ST>`, `SENATEPARTY<ST>`, `GOV<ST>`/`GOVPARTY<ST>`, `HOUSE<ST><district|AL>` where `<ST>` is a real two-letter U.S. state code.
+**Recognised structured Kalshi symbols:** `CONTROLS`/`CONTROLH` and state-validated `SENATE<ST>`, `SENATEPARTY<ST>`, `GOV<ST>`/`GOVPARTY<ST>`, `HOUSE<ST><district|AL>` (optionally `KX`-prefixed, where `<ST>` is a real two-letter U.S. state code). Generic Kalshi SENATE/HOUSE/GOV prefixes are recognized by year extraction; they do not alone supply the office/jurisdiction evidence that the structured eligibility helper requires.
 
 ## Polymarket Binary Outcome Mappings
 
@@ -157,6 +160,8 @@ The output JSON file contains:
 
 - **TLS / SSL**: Standard strict certificate verification is enforced. No `CERT_NONE` or legacy renegotiation flags.
 - **Kalshi Fallback**: Tries `api.elections.kalshi.com` first, and gracefully falls back to `external-api.kalshi.com` on connection errors with jittered backoff.
+- **Kalshi Connection Reuse**: Each fetch owns one verified TLS context and reuses healthy HTTPS connections per host. Every response body is fully read before reuse, including HTTP errors. Request, header, or body failures discard the connection; server-requested closure causes a fresh connection on the next attempt. All owned connections close when the fetch finishes or fails. `_kalshi_request()` remains a one-shot helper for diagnostics.
 - **Rate Limiting**: Shared per-venue limiter enforces $\le 4$ requests per second across all request attempts, retries, and host fallbacks.
 - **Failure Resilience**: Connection errors retry with exponential backoff and jitter. Failed runs preserve previous outputs byte-for-byte.
+- **Bounded Recovery**: Connection reuse adds no retries. The existing initial attempt plus at most four retry rounds per page, immediate primary-to-fallback attempt, rate-limiter waits, timeouts and cursor retention remain in force. This reduces fresh TLS handshakes but cannot guarantee access when the network or upstream repeatedly resets connections.
 - **Git Hygiene**: `data/venue_markets/output/` is git-ignored. Raw market data dumps are never committed.

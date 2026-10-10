@@ -22,7 +22,7 @@ import urllib.parse
 import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 USER_AGENT = "bellwether/0.1 (research)"
 MIN_REQUEST_INTERVAL = 0.3  # at most 4 requests per second per venue
@@ -246,7 +246,7 @@ _STATE_LEGISLATURE_RE = re.compile(
     r"\b(?:state senate|state house|state assembly|state legislature|statehouse|legislature"
     r"|general assembly|house of delegates)\b"
 )
-_US_WORDING_RE = re.compile(r"\b(?:us|usa|united states)\b")
+_US_WORDING_RE = re.compile(r"\b(?:us|usa|united states|midterms?)\b")
 _OFFICE_RE = re.compile(r"\b(?:senate|house|governor|governors|gubernatorial|congress)\b")
 _CONTEST_RE = re.compile(
     r"\b(?:win|wins|won|winner|winners|elect|elected|election|elections|race|races|seat|seats"
@@ -254,13 +254,13 @@ _CONTEST_RE = re.compile(
 )
 _YEAR_RE = re.compile(r"\b(20[23]\d)\b")
 
-# Narrow, state-validated Kalshi structured series/ticker patterns (a bare "SENATE" prefix is
-# deliberately NOT enough: the state abbreviation must follow and be a real U.S. state).
-_KALSHI_CONTROL_RE = re.compile(r"^(?:KX)?CONTROL[SH](?:[-_].*)?$")
+# Narrow, state-validated Kalshi structured series/ticker patterns
+_KALSHI_CONTROL_RE = re.compile(r"^(?:KX)?CONTROL[SH](?:[-_](?P<yr>20[23]\d|[23]\d))?(?:[-_].*)?$")
+_KALSHI_GENERIC_RE = re.compile(r"^(?:KX)?(?:SENATE(?:PARTY)?|HOUSE(?:PARTY)?|GOV(?:PARTY)?)(?:[-_](?P<yr>20[23]\d|[23]\d))?(?:[-_].*)?$")
 _KALSHI_STATE_CONTEST_RES = (
-    ("senate", re.compile(r"^(?:KX)?SENATE(?:PARTY[-_]?)?(?P<st>[A-Z]{2})(?:[-_].*)?$")),
-    ("governor", re.compile(r"^(?:KX)?GOV(?:PARTY)?[-_]?(?P<st>[A-Z]{2})(?:[-_].*)?$")),
-    ("house", re.compile(r"^(?:KX)?HOUSE(?:PARTY)?[-_]?(?P<st>[A-Z]{2})[-_]?(?:\d+|AL)(?:[-_].*)?$")),
+    ("senate", re.compile(r"^(?:KX)?SENATE(?:PARTY[-_]?)?(?P<st>[A-Z]{2})(?:[-_](?P<yr>20[23]\d|[23]\d))?(?:[-_].*)?$")),
+    ("governor", re.compile(r"^(?:KX)?GOV(?:PARTY)?[-_]?(?P<st>[A-Z]{2})(?:[-_](?P<yr>20[23]\d|[23]\d))?(?:[-_].*)?$")),
+    ("house", re.compile(r"^(?:KX)?HOUSE(?:PARTY)?[-_]?(?P<st>[A-Z]{2})[-_]?(?:\d+|AL)(?:[-_](?P<yr>20[23]\d|[23]\d))?(?:[-_].*)?$")),
 )
 
 
@@ -287,19 +287,35 @@ def _kalshi_structured_contest(series: str, ticker: str) -> str | None:
 
 
 def _kalshi_symbol_years(*symbols: str) -> set[int]:
-    """Cycle years encoded in tickers: a 4-digit token, or the first 2-digit token in 20-39.
+    """Cycle years encoded in recognized structured Kalshi tickers.
 
-    Later 2-digit tokens (seat/district numbers) are never read as years.
+    A year is only extracted from a valid cycle-year position following a recognized prefix.
     """
     years: set[int] = set()
     for symbol in symbols:
-        two_digit_seen = False
-        for token in re.split(r"[-_]", (symbol or "").upper())[1:]:
-            if re.fullmatch(r"20[23]\d", token):
-                years.add(int(token))
-            elif not two_digit_seen and re.fullmatch(r"[23]\d", token):
-                years.add(2000 + int(token))
-                two_digit_seen = True
+        s = (symbol or "").upper()
+
+        match = _KALSHI_CONTROL_RE.match(s)
+        if match:
+            yr = match.group("yr")
+            if yr:
+                years.add(int(yr) if len(yr) == 4 else 2000 + int(yr))
+            continue
+
+        match = _KALSHI_GENERIC_RE.match(s)
+        if match:
+            yr = match.group("yr")
+            if yr:
+                years.add(int(yr) if len(yr) == 4 else 2000 + int(yr))
+            continue
+
+        for kind, pattern in _KALSHI_STATE_CONTEST_RES:
+            match = pattern.match(s)
+            if match and match.group("st") in STATE_ABBRS:
+                yr = match.group("yr")
+                if yr:
+                    years.add(int(yr) if len(yr) == 4 else 2000 + int(yr))
+                break
     return years
 
 
@@ -349,8 +365,7 @@ def _evaluate_election_contest(
     if years - {CONTEST_YEAR}:
         return False, "non_2026_primary_contest"
 
-    exempt_from_strict = is_tag_102289 or (structured is not None)
-    if not exempt_from_strict and CONTEST_YEAR not in years:
+    if CONTEST_YEAR not in years:
         return False, "lacks_2026_contest_year"
 
     # Election check
@@ -358,7 +373,7 @@ def _evaluate_election_contest(
         return False, "lacks_election_evidence"
 
     # Jurisdiction check
-    if exempt_from_strict or explicit_us or firm_states:
+    if explicit_us or firm_states or (structured is not None) or is_tag_102289:
         return True, "verified_2026"
     if states:
         return False, "ambiguous_jurisdiction"
@@ -368,19 +383,23 @@ def _evaluate_election_contest(
 def is_2026_polymarket_market(
     item: dict[str, Any],
     parent_event: dict[str, Any] | None = None,
-    is_tag_102289: bool = True,
+    is_tag_102289: bool = False,
 ) -> tuple[bool, str]:
     """Verify whether a Polymarket record is a 2026 U.S. Senate/House/governor/control contest."""
-    if item.get("closed") is True:
+    closed_val = item.get("closed")
+    if closed_val is not False or type(closed_val) is not bool:
         return False, "market_closed"
-    if item.get("active") is False:
+
+    active_val = item.get("active")
+    if active_val is not True or type(active_val) is not bool:
         return False, "market_inactive"
 
     ev = parent_event or (item.get("events")[0] if isinstance(item.get("events"), list) and item.get("events") else {})
     ev_title = ev.get("title") or item.get("event_title") or ""
+    ev_slug = ev.get("slug") or item.get("event_slug") or ""
     q = item.get("question") or ""
     slug = item.get("slug") or item.get("market_slug") or ""
-    identity = f"{q} {slug} {ev_title}".strip()
+    identity = f"{q} {slug} {ev_title} {ev_slug}".strip()
     return _evaluate_election_contest(identity, is_tag_102289=is_tag_102289)
 
 
@@ -509,7 +528,7 @@ def _parse_polymarket_tokens(item: dict[str, Any]) -> tuple[list[str], list[str]
 
 def fetch_polymarket_markets(
     rate_limiter: RateLimiter,
-    base_url: str = "https://gamma-api.polymarket.com/events",
+    base_url: str = "https://gamma-api.polymarket.com/events/keyset",
     opener: Any = None,
     exclusion_samples: dict[str, list[str]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
@@ -520,17 +539,27 @@ def fetch_polymarket_markets(
     if exclusion_samples is None:
         exclusion_samples = {}
 
+    seen_cursors: set[str] = set()
+    seen_page_identities: set[tuple[tuple[str, tuple[str, ...]], ...]] = set()
+    next_cursor = ""
+
     limit = 100
-    offset = 0
     tag_id = 102289
 
     while True:
-        params = {
+        if next_cursor in seen_cursors:
+            raise FetchError(f"Polymarket pagination loop detected: repeated cursor {next_cursor}")
+        if next_cursor:
+            seen_cursors.add(next_cursor)
+
+        params: dict[str, Any] = {
             "tag_id": tag_id,
             "closed": "false",
             "limit": limit,
-            "offset": offset,
         }
+        if next_cursor:
+            params["after_cursor"] = next_cursor
+
         url = f"{base_url}?{urllib.parse.urlencode(params)}"
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
 
@@ -547,59 +576,67 @@ def fetch_polymarket_markets(
                 data = json.loads(body_bytes.decode("utf-8"))
                 break
             except urllib.error.HTTPError as e:
-                if e.code == 422 and offset >= 2000:
-                    data = []
-                    break
                 if attempt < 4:
                     time.sleep((2 ** attempt) + random.uniform(0, 1))
                 else:
-                    raise FetchError(f"Polymarket HTTP {e.code} at offset {offset}: {e}") from e
+                    raise FetchError(f"Polymarket HTTP {e.code} at cursor {next_cursor}: {e}") from e
             except Exception as e:
                 if attempt < 4:
                     time.sleep((2 ** attempt) + random.uniform(0, 1))
                 else:
-                    raise FetchError(f"Polymarket request failed at offset {offset}: {e}") from e
+                    raise FetchError(f"Polymarket request failed at cursor {next_cursor}: {e}") from e
 
-        if not isinstance(data, list) and not isinstance(data, dict):
-            raise FetchError(f"Polymarket malformed response at offset {offset}: expected list or dict")
+        if not isinstance(data, dict):
+            raise FetchError(f"Polymarket malformed response at cursor {next_cursor}: expected dict")
 
-        if not data:
-            break
+        events = data.get("events")
+        if not isinstance(events, list):
+            raise FetchError(f"Polymarket malformed response at cursor {next_cursor}: expected 'events' list")
 
-        if isinstance(data, dict):
-            if "events" in data and isinstance(data["events"], list):
-                events = data["events"]
-            elif "data" in data and isinstance(data["data"], list):
-                events = [{"id": "ev-wrap", "title": "2026 Midterms", "slug": "2026-midterms", "markets": data["data"]}]
-            else:
-                raise FetchError(f"Polymarket malformed response at offset {offset}: expected list of events")
-        elif isinstance(data, list):
-            first = data[0] if data else {}
-            if isinstance(first, dict) and ("markets" in first or "title" in first and "id" in first and not "question" in first):
-                events = data
-            elif isinstance(first, dict) and ("question" in first or "tokens" in first or "clobTokenIds" in first):
-                events = [{"id": "ev-wrap", "title": "2026 Midterms", "slug": "2026-midterms", "markets": data}]
-            else:
-                events = data
-        else:
-            events = []
+        if events:
+            page_event_signatures: list[tuple[str, tuple[str, ...]]] = []
+            for ev in events:
+                if not isinstance(ev, dict):
+                    raise FetchError(f"Polymarket malformed response at cursor {next_cursor}: event must be a dict, got {type(ev).__name__}")
+                ev_raw_id = ev.get("id")
+                if ev_raw_id is None:
+                    raise FetchError(f"Polymarket malformed response at cursor {next_cursor}: event missing stable id")
+                ev_id = str(ev_raw_id).strip()
+                if not ev_id:
+                    raise FetchError(f"Polymarket malformed response at cursor {next_cursor}: event missing stable id")
 
-        if not events:
-            break
+                if "markets" not in ev:
+                    raise FetchError(f"Polymarket malformed response at cursor {next_cursor}: event missing 'markets' list")
+                if not isinstance(ev["markets"], list):
+                    raise FetchError(f"Polymarket malformed response at cursor {next_cursor}: 'markets' must be a list, got {type(ev['markets']).__name__}")
+
+                nested_market_ids: list[str] = []
+                for item in ev["markets"]:
+                    if not isinstance(item, dict):
+                        raise FetchError(f"Polymarket malformed response at cursor {next_cursor}: market item must be a dict")
+                    m_raw_id = item.get("id") or item.get("conditionId") or item.get("condition_id")
+                    if m_raw_id is None:
+                        raise FetchError(f"Polymarket malformed response at cursor {next_cursor}: market missing stable id")
+                    m_id = str(m_raw_id).strip()
+                    if not m_id:
+                        raise FetchError(f"Polymarket malformed response at cursor {next_cursor}: market missing stable id")
+                    nested_market_ids.append(m_id)
+
+                page_event_signatures.append((ev_id, tuple(sorted(nested_market_ids))))
+
+            page_identity = tuple(sorted(page_event_signatures))
+            if page_identity in seen_page_identities:
+                raise FetchError(f"Polymarket whole-page replay detected at cursor {next_cursor}")
+            seen_page_identities.add(page_identity)
 
         for ev in events:
-            if not isinstance(ev, dict):
-                continue
             ev_id = str(ev.get("id")) if ev.get("id") is not None else None
             ev_title = ev.get("title")
             ev_slug = ev.get("slug")
-            nested_markets = ev.get("markets") or []
-            if not isinstance(nested_markets, list):
-                continue
+
+            nested_markets = ev["markets"]
 
             for item in nested_markets:
-                if not isinstance(item, dict):
-                    continue
                 m_id = str(item.get("id") or item.get("conditionId") or item.get("condition_id") or "")
                 q_text = item.get("question") or item.get("slug") or m_id
                 if not m_id:
@@ -608,7 +645,10 @@ def fetch_polymarket_markets(
                         exclusion_samples["missing_id"].append(q_text)
                     continue
 
-                is_eligible, reason = is_2026_polymarket_market(item, parent_event=ev)
+                if m_id in markets_by_id:
+                    continue
+
+                is_eligible, reason = is_2026_polymarket_market(item, parent_event=ev, is_tag_102289=True)
                 if not is_eligible:
                     excluded_counts[reason] = excluded_counts.get(reason, 0) + 1
                     if len(exclusion_samples.setdefault(reason, [])) < 20:
@@ -655,9 +695,12 @@ def fetch_polymarket_markets(
                 }
                 markets_by_id[m_id] = market_record
 
-        offset += len(events)
-        if len(events) < limit:
+        if "next_cursor" not in data:
             break
+        returned_cursor = data["next_cursor"]
+        if not isinstance(returned_cursor, str) or not returned_cursor.strip():
+            raise FetchError(f"Polymarket malformed response: next_cursor must be a nonempty string, got {type(returned_cursor).__name__ if not isinstance(returned_cursor, str) else 'empty string'}")
+        next_cursor = returned_cursor
 
     return list(markets_by_id.values()), excluded_counts
 
@@ -666,26 +709,59 @@ def fetch_polymarket_markets(
 # Kalshi Fetcher
 # =====================================================================
 
+class _KalshiTransport:
+    """Own verified, reusable HTTPS connections for one fetch; never retry here."""
+
+    def __init__(self) -> None:
+        self._context = ssl.create_default_context()
+        self._connections: dict[str, http.client.HTTPSConnection] = {}
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def _discard(self, host: str) -> None:
+        connection = self._connections.pop(host, None)
+        if connection is not None:
+            connection.close()
+
+    def close(self) -> None:
+        for host in list(self._connections):
+            self._discard(host)
+
+    def request(self, host: str, path: str, timeout: float = 25.0) -> tuple[int, bytes]:
+        connection = self._connections.get(host)
+        if connection is None:
+            connection = http.client.HTTPSConnection(host, 443, context=self._context, timeout=timeout)
+            self._connections[host] = connection
+        try:
+            connection.request("GET", path, headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "application/json",
+            })
+            response = connection.getresponse()
+            # Drain error responses too: http.client requires this before reuse.
+            body = response.read()
+            if response.will_close:
+                self._discard(host)
+            return response.status, body
+        except BaseException:
+            # No poisoned/stale socket can be reused, even on interruption.
+            self._discard(host)
+            raise
+
+
 def _kalshi_request(
     host: str,
     path: str,
     timeout: float = 25.0,
 ) -> tuple[int, bytes]:
 
-    ctx = ssl.create_default_context()
-    conn = http.client.HTTPSConnection(host, 443, context=ctx, timeout=timeout)
-    try:
-        headers = {
-            "User-Agent": USER_AGENT,
-            "Accept": "application/json",
-            "Connection": "close",
-        }
-        conn.request("GET", path, headers=headers)
-        resp = conn.getresponse()
-        data = resp.read()
-        return resp.status, data
-    finally:
-        conn.close()
+    """One-shot diagnostic helper; production fetches own a reusable transport."""
+    with _KalshiTransport() as transport:
+        return transport.request(host, path, timeout)
 
 
 def fetch_kalshi_markets(
@@ -696,6 +772,20 @@ def fetch_kalshi_markets(
     exclusion_samples: dict[str, list[str]] | None = None,
 ) -> tuple[str, list[dict[str, Any]], dict[str, int]]:
     """Fetch active 2026 midterm markets from Kalshi Trade API v2."""
+    if requester is not None:
+        return _fetch_kalshi_markets(rate_limiter, primary_host, fallback_host, requester, exclusion_samples)
+    with _KalshiTransport() as transport:
+        return _fetch_kalshi_markets(rate_limiter, primary_host, fallback_host, transport.request, exclusion_samples)
+
+
+def _fetch_kalshi_markets(
+    rate_limiter: RateLimiter,
+    primary_host: str,
+    fallback_host: str,
+    requester: Any,
+    exclusion_samples: dict[str, list[str]] | None,
+) -> tuple[str, list[dict[str, Any]], dict[str, int]]:
+    """Traverse pages with the existing bounded retries and host fallback."""
     print("Fetching Kalshi markets...", flush=True)
     active_host = primary_host
     actual_serving_host = primary_host
@@ -728,10 +818,7 @@ def fetch_kalshi_markets(
         for attempt in range(5):  # 1 initial + up to 4 retries
             rate_limiter.wait()
             try:
-                if requester is not None:
-                    status, body = requester(active_host, path)
-                else:
-                    status, body = _kalshi_request(active_host, path)
+                status, body = requester(active_host, path)
 
                 if status == 200:
                     page_data = json.loads(body.decode("utf-8"))
@@ -747,10 +834,7 @@ def fetch_kalshi_markets(
                     # Immediate attempt on fallback host with rate limiter
                     rate_limiter.wait()
                     try:
-                        if requester is not None:
-                            status, body = requester(active_host, path)
-                        else:
-                            status, body = _kalshi_request(active_host, path)
+                        status, body = requester(active_host, path)
                         if status == 200:
                             page_data = json.loads(body.decode("utf-8"))
                             break
