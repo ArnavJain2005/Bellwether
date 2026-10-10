@@ -355,4 +355,3 @@ class Harness:
 
     def kinds(self) -> list[str]:
         return [type(e).__name__ for e in self.events]
-
