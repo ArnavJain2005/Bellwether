@@ -444,6 +444,46 @@ def test_coverage_reporting_truncation_is_rejected() -> None:
         run(client.list_exchange_trades_page("36"))
 
 
+# `coverage` is optional (not in `required`) but its schema is a plain object, not
+# nullable: omitted is allowed, an explicit null is not. Inside a present object,
+# `projectedThroughSequence` is documented as integer or null.
+
+
+def test_omitted_coverage_is_none() -> None:
+    body = trades_body()
+    del body["coverage"]
+    client, _, _ = make_client(Router({TRADES: json_response(200, body)}))
+    assert run(client.list_exchange_trades_page("36")).coverage is None
+
+
+def test_explicit_null_coverage_is_rejected(caplog: pytest.LogCaptureFixture) -> None:
+    body = trades_body(coverage=None)
+    body["marketId"] = CODE_LIKE_KEY  # response text must not reach the error
+    error = leak_free(
+        Router({TRADES: json_response(200, body)}),
+        lambda c: c.list_exchange_trades_page("36"),
+        SigResponseError,
+        caplog,
+    )
+    assert "coverage" in str(error)
+
+
+def test_explicit_null_coverage_on_a_later_page_fails_the_tape() -> None:
+    pages = three_pages()
+    pages["c2"]["coverage"] = None
+    client, _, _ = make_client(Router({TRADES: by_cursor(pages)}))
+    with pytest.raises(SigResponseError, match="coverage"):
+        run(client.list_all_exchange_trades("36", page_limit=2))
+
+
+def test_coverage_object_with_a_null_checkpoint_is_kept() -> None:
+    body = trades_body(coverage={"complete": True, "projectedThroughSequence": None})
+    client, _, _ = make_client(Router({TRADES: json_response(200, body)}))
+    coverage = run(client.list_exchange_trades_page("36")).coverage
+    assert coverage is not None
+    assert coverage.complete is True and coverage.projectedThroughSequence is None
+
+
 # --- GET /exchanges/{id}/trades: identity, window and order --------------------------------
 
 

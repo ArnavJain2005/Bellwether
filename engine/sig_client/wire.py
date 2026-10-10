@@ -23,7 +23,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
 from pydantic_core import PydanticCustomError
 
 
@@ -386,4 +386,13 @@ class ExchangeTradesPage(WireModel):
     to: str
     data: list[ExchangeTrade]
     pagination: ExchangeTradesPagination
-    coverage: TradeCoverage | None = None  # documented as optional (not in `required`)
+    # Documented as optional (not in `required`) but not nullable: None here means only
+    # that SIG omitted it. An explicit null is rejected; the default is not validated.
+    coverage: TradeCoverage | None = None
+
+    @field_validator("coverage", mode="before")
+    @classmethod
+    def _coverage_not_null(cls, value: object) -> object:
+        if value is None:
+            raise PydanticCustomError("coverage_null", "coverage may be omitted but not null")
+        return value
