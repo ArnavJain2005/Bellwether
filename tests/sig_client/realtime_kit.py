@@ -289,14 +289,17 @@ class Harness:
         policy: RealtimeFeedPolicy | None = None,
         tournament: TournamentRef = TOURNAMENT,
         token_responses: list[Any] | None = None,
+        transport: FakeTransport | None = None,
     ) -> None:
         self.clock = ManualClock()
+        self.market_ids = market_ids
         self.router = router or Router()
         self.router.routes.setdefault(
             "/api/v1/realtime/token", token_responses or [json_response(200, token_body())]
         )
-        self.transport = FakeTransport()
+        self.transport = transport or FakeTransport()
         self.events: list[FeedEvent] = []
+        self.observed: list[tuple[str, bool]] = []
         self.limiter = RateLimiter(clock=self.clock, sleep=self.clock.sleep)
         config = SigConfig(api_key=ApiKey(SENTINEL_KEY), tournament=tournament, base_url=BASE_URL)
         mock = httpx.MockTransport(self.router)
@@ -322,12 +325,17 @@ class Harness:
             self.transport,
             list(market_ids),
             policy=policy or RealtimeFeedPolicy(tick_s=1.0),
-            sink=self.events.append,
+            sink=self._sink,
             clock=self.clock,
             sleep=self.clock.sleep,
             wall_clock=self.clock.wall,
         )
         self.task: asyncio.Task[None] | None = None
+
+    def _sink(self, event: FeedEvent) -> None:
+        # Synchronous, like a real sink: records what is_ready() said during the callback.
+        self.events.append(event)
+        self.observed.append((type(event).__name__, self.feed.is_ready(event.market_id)))
 
     def topic(self, market_id: str = MARKET) -> str:
         return self.feed.topic(market_id)
@@ -336,6 +344,11 @@ class Harness:
         self.task = asyncio.create_task(self.feed.run())
         await settle()
         if subscribe:
+            # Start-up steps take several loop turns each; wait until every topic is joined.
+            for _ in range(50):
+                if len(self.feed_market_ids()) == len(self.market_ids) or self.task.done():
+                    break
+                await settle()
             for market_id in self.feed_market_ids():
                 self.transport.subscribed(self.topic(market_id))
             await settle()
@@ -355,3 +368,11 @@ class Harness:
 
     def kinds(self) -> list[str]:
         return [type(e).__name__ for e in self.events]
+
+
+WATCHDOG_S = 5.0  # real seconds, independent of ManualClock
+
+
+async def watchdog(awaitable: Any, seconds: float = WATCHDOG_S) -> Any:
+    """Await with a real-time limit, so a hang fails the test instead of stalling it."""
+    return await asyncio.wait_for(awaitable, timeout=seconds)

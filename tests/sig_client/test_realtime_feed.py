@@ -166,7 +166,7 @@ def test_duplicates_and_overlaps_cost_no_rest_reads() -> None:
     [
         ({"resyncRequired": True, "delivery": {"revision": 9, "previousRevision": 8}},
          StaleReason.RESYNC_REQUIRED),
-        (batch(9, 8, trades=[trade(None, None)], books=[book(5)]), StaleReason.NULL_TRADE_SEQUENCE),
+        # A null-sequence trade also resyncs, but it blocks readiness: test_realtime_f1.py.
         ({"delivery": "broken"}, StaleReason.MALFORMED),
         (batch(9, 8, book_dirty=[{"exchangeId": 36, "marketId": "26",
                                   "tournamentId": TOURNAMENT.id, "at": "x"}]),
