@@ -89,6 +89,8 @@ class Router:
             f"{API}/exchanges/36/orderbook": json_response(200, fixture("exchange_orderbook")),
             f"{API}/markets/26/orderbook": json_response(200, fixture("market_orderbook")),
             f"{API}/orders": json_response(200, fixture("orders_page")),
+            f"{API}/markets/26": json_response(200, fixture("market")),
+            f"{API}/exchanges/36/trades": json_response(200, fixture("exchange_trades")),
         }
         self.routes.update(overrides or {})
 

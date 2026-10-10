@@ -1,13 +1,20 @@
-"""Read-only SIG REST client (S1-T2-B).
+"""Read-only SIG REST client (S1-T2-B; market detail and trade tape added in S1-T3-B).
 
-Scope: six documented GET endpoints, always pinned to the configured tournament. There
+Scope: eight documented GET endpoints, always pinned to the configured tournament. There
 are no write methods (orders, cancels, realtime tokens) and no public way to issue an
 arbitrary request.
 
 Tournament scoping: before any scoped read, the client calls GET /tournaments/{slug}
 once and checks that SIG reports the configured slug and UUID. A mismatch is permanent
-for the client's lifetime. UUID-scoped reads always send `tournamentId`, and the market
-orderbook's echoed context is checked as well.
+for the client's lifetime. UUID-scoped reads always send `tournamentId`, and the echoed
+context of the market orderbook and the market detail is checked as well. The trade
+tape echoes no tournament, so its scope rests on the `tournamentId` sent.
+
+Reporting projection: the trade tape (like /orders) may carry `coverage`, metadata about
+SIG's reporting projection. It is kept exactly as sent, per page. A complete cursor walk
+shows only that every page of the projection was read; it does not show that the
+projection has caught up with the trading engine, and `projectedThroughSequence` is never
+compared here with any realtime sequence.
 
 Transport and credentials:
 - The caller injects an `httpx.AsyncClient`. The SIG client closes it only when it was
@@ -65,6 +72,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Protocol, Self, TypeVar
 from urllib.parse import quote
@@ -103,17 +111,24 @@ from engine.sig_client.rate_limiter import (
     check_positive_int,
     check_positive_seconds,
 )
+from engine.sig_client.realtime_wire import epoch_seconds, parse_instant
 from engine.sig_client.wire import (
     BulkExchangePrices,
     CombinedMarketOrderbook,
     ExchangeOrderbook,
+    ExchangeTrade,
+    ExchangeTradesPage,
+    Market,
     MarketOrderbook,
+    MarketOrderbookContext,
+    MarketPricingContext,
     Order,
     OrderbookLevel,
     OrdersPage,
     Tournament,
     TournamentMarket,
     TournamentMarketsPage,
+    TradeCoverage,
 )
 
 logger = logging.getLogger(__name__)
@@ -121,6 +136,7 @@ logger = logging.getLogger(__name__)
 # Documented limits (docs/api/openapi.json).
 MARKETS_PAGE_MAX = 100  # #/paths/~1tournaments~1{slug}~1markets/get/parameters/1
 ORDERS_PAGE_MAX = 200  # #/paths/~1orders/get/parameters/3
+TRADES_PAGE_MAX = 200  # #/paths/~1exchanges~1{id}~1trades/get/parameters/4
 BULK_PRICE_IDS_MAX = 100  # #/paths/~1exchanges~1prices/get/parameters/0
 ORDERBOOK_DEPTH_MAX = 200  # #/paths/~1exchanges~1{id}~1orderbook/get/parameters/1
 DEFAULT_ORDERBOOK_DEPTH = 20
@@ -187,6 +203,26 @@ class ReadRetryPolicy:
     def backoff(self, attempt: int) -> float:
         # The exponent is capped so a large attempt number cannot overflow.
         return min(self.max_backoff_s, self.base_backoff_s * 2 ** min(attempt - 1, 60))
+
+
+@dataclass(frozen=True)
+class ExchangeTradeHistory:
+    """A complete trade tape for one exchange and window, as SIG reported it.
+
+    `trades` is newest first, across every page. `window_from`/`window_to` are the
+    window SIG echoed on every page (inclusive / exclusive), as sent. `page_coverage`
+    holds each page's `coverage` exactly as sent, in page order: None where SIG omitted
+    it, and a None `projectedThroughSequence` where SIG reported no checkpoint. Pages
+    may report different checkpoints. None of this shows that the reporting projection
+    has caught up with the trading engine.
+    """
+
+    exchange_id: str
+    market_id: str
+    window_from: str
+    window_to: str
+    trades: tuple[ExchangeTrade, ...]
+    page_coverage: tuple[TradeCoverage | None, ...]
 
 
 class _Page(Protocol):
@@ -282,6 +318,42 @@ def _check_cursor(cursor: object) -> str | None:
     if cursor is not None and (not isinstance(cursor, str) or not cursor):
         raise SigArgumentError("cursor must be a non-empty string or None")
     return cursor
+
+
+def _check_instant(name: str, value: object) -> datetime | None:
+    """A timezone-aware datetime in whole milliseconds, returned in UTC, or None."""
+    if value is None:
+        return None
+    if not isinstance(value, datetime) or value.utcoffset() is None:
+        raise SigArgumentError(f"{name} must be a timezone-aware datetime or None")
+    try:
+        moment = value.astimezone(UTC)
+    except (OverflowError, ValueError):
+        raise SigArgumentError(f"{name} is out of range in UTC") from None
+    # [client policy] SIG's documented examples carry milliseconds; a finer value would
+    # be truncated or rejected somewhere we cannot see, moving the window's edge.
+    if moment.microsecond % 1000:
+        raise SigArgumentError(f"{name} must be a whole number of milliseconds")
+    return moment
+
+
+def _format_instant(moment: datetime) -> str:
+    """A UTC datetime as the spec's example format, e.g. 2026-01-01T00:00:00.000Z."""
+    return (
+        f"{moment.year:04d}-{moment.month:02d}-{moment.day:02d}T"
+        f"{moment.hour:02d}:{moment.minute:02d}:{moment.second:02d}."
+        f"{moment.microsecond // 1000:03d}Z"
+    )
+
+
+def _response_instant(path: str, field: str, text: str) -> Decimal:
+    """A response timestamp as exact epoch seconds; the value is never echoed."""
+    try:
+        return parse_instant(text)
+    except ValueError:
+        raise SigResponseError(
+            method="GET", path=path, reason=f"{field} is not an ISO-8601 timestamp with an offset"
+        ) from None
 
 
 def _segment(value: str) -> str:
@@ -491,6 +563,51 @@ class SigRestClient:
             key=lambda market: market.id,
         )
 
+    async def get_market(self, market_id: str) -> Market:
+        """GET /markets/{id} in the configured tournament (the authoritative market state).
+
+        `contexts` must be exactly the configured tournament, and the top-level scope
+        fields must agree with it. Read them from `Market.tournament_context()`.
+        """
+        market_id = _check_numeric_id("market_id", market_id)
+        await self.verify_tournament()
+        path = f"/markets/{_segment(market_id)}"
+        params = {"tournamentId": self._config.tournament.id}
+        market = await self._get_model(path, params, Market)
+        # [client policy] the echoed market id must be the one requested.
+        if market.id != market_id:
+            raise SigResponseError(
+                method="GET", path=path, reason="market detail is for a different market"
+            )
+        self._check_single_context(path, market.contexts)
+        self._check_market_scope(path, market)
+        return market
+
+    @staticmethod
+    def _check_market_scope(path: str, market: Market) -> None:
+        # [documented] the top-level status, settlement and exchange prices are "in the
+        # request's scope" / "the resolved context", and each context carries its own.
+        # [client policy] with one explicit tournament context the two must agree, so
+        # no caller can read a value that disagrees with the tournament context.
+        def bad(reason: str) -> SigResponseError:
+            return SigResponseError(method="GET", path=path, reason=reason)
+
+        context = market.tournament_context()
+        if (market.status, market.settledWith, market.settledOn) != (
+            context.status,
+            context.settledWith,
+            context.settledOn,
+        ):
+            raise bad("top-level status or settlement differs from the tournament context")
+        top = {exchange.id: exchange.latestPrice for exchange in market.exchanges}
+        scoped = {exchange.id: exchange.latestPrice for exchange in context.exchanges}
+        if len(top) != len(market.exchanges) or len(scoped) != len(context.exchanges):
+            raise bad("duplicate exchange ids in the market detail")
+        if top.keys() != scoped.keys():
+            raise bad("market exchanges differ from the tournament context's exchanges")
+        if top != scoped:
+            raise bad("an exchange latestPrice differs from the tournament context's")
+
     # --- prices and orderbooks ----------------------------------------------------------
 
     async def get_exchange_prices(self, exchange_ids: Sequence[str]) -> BulkExchangePrices:
@@ -561,23 +678,26 @@ class SigRestClient:
         path = f"/markets/{_segment(market_id)}/orderbook"
         params = {"depth": depth, "tournamentId": self._config.tournament.id}
         book = await self._get_model(path, params, MarketOrderbook)
-        self._check_market_context(path, book)
+        self._check_single_context(path, book.contexts)
         for combined in (book, book.tournament_orderbook()):
             self._check_combined(path, combined, depth)
         return book
 
-    def _check_market_context(self, path: str, book: MarketOrderbook) -> None:
-        # [documented] "Pass tournamentId for one explicit context."
-        # [client policy] that context must name the configured slug and UUID.
+    def _check_single_context(
+        self, path: str, contexts: Sequence[MarketOrderbookContext | MarketPricingContext]
+    ) -> None:
+        # [documented] the orderbook: "Pass tournamentId for one explicit context"; the
+        # market detail: the same explicit tournament scope as GET /markets.
+        # [client policy] exactly one context, naming the configured slug and UUID.
         # Reported ids and slugs are response data and are not repeated in errors.
         expected = self._config.tournament
-        if len(book.contexts) != 1:
+        if len(contexts) != 1:
             raise SigContextMismatchError(
                 method="GET",
                 path=path,
-                reason=f"expected exactly one context, got {len(book.contexts)}",
+                reason=f"expected exactly one context, got {len(contexts)}",
             )
-        context = book.contexts[0]
+        context = contexts[0]
         tournament = context.tournament
         if context.type != "tournament" or tournament is None:
             raise SigContextMismatchError(
@@ -686,6 +806,152 @@ class SigRestClient:
             key=lambda order: order.id,
         )
 
+    # --- trade tape ---------------------------------------------------------------------
+
+    async def list_exchange_trades_page(
+        self,
+        exchange_id: str,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        limit: int = TRADES_PAGE_MAX,
+        cursor: str | None = None,
+    ) -> ExchangeTradesPage:
+        """One page of GET /exchanges/{id}/trades in the configured tournament, newest first.
+
+        `since` (inclusive) and `until` (exclusive) are timezone-aware datetimes in whole
+        milliseconds; omitted, SIG uses the start of the exchange's history and now. The
+        response echoes no tournament, so the scope rests on the `tournamentId` sent.
+        `coverage` is kept exactly as sent; see the module docstring.
+        """
+        # Every argument is validated before verification, so bad input sends nothing.
+        exchange_id = _check_numeric_id("exchange_id", exchange_id)
+        since_utc = _check_instant("since", since)
+        until_utc = _check_instant("until", until)
+        if since_utc is not None and until_utc is not None and since_utc >= until_utc:
+            raise SigArgumentError("since must be earlier than until")
+        limit = _check_int("limit", limit, 1, TRADES_PAGE_MAX)
+        cursor = _check_cursor(cursor)
+        await self.verify_tournament()
+        path = f"/exchanges/{_segment(exchange_id)}/trades"
+        params: dict[str, str | int] = {
+            "tournamentId": self._config.tournament.id,
+            "limit": limit,
+        }
+        if since_utc is not None:
+            params["from"] = _format_instant(since_utc)
+        if until_utc is not None:
+            params["to"] = _format_instant(until_utc)
+        if cursor is not None:
+            params["cursor"] = cursor
+        page = await self._get_model(path, params, ExchangeTradesPage)
+        self._check_page_size(path, len(page.data), limit)
+        self._check_trades_page(path, page, exchange_id, since_utc, until_utc)
+        return page
+
+    @staticmethod
+    def _check_trades_page(
+        path: str,
+        page: ExchangeTradesPage,
+        exchange_id: str,
+        since: datetime | None,
+        until: datetime | None,
+    ) -> None:
+        def bad(reason: str) -> SigResponseError:
+            return SigResponseError(method="GET", path=path, reason=reason)
+
+        # [client policy] the echoed exchange id must be the one requested.
+        if page.exchangeId != exchange_id:
+            raise bad("trade tape is for a different exchange")
+        # [documented] `complete` is "always true because cursor pagination exposes the
+        # full requested trade history without window truncation". [client policy] a
+        # page that reports otherwise is not returned.
+        if page.coverage is not None and page.coverage.complete is not True:
+            raise bad("coverage.complete is false")
+        # [documented] `from` is inclusive and `to` exclusive. [client policy] the echoed
+        # window must be the one requested, and must not be inverted.
+        window_from = _response_instant(path, "from", page.from_)
+        window_to = _response_instant(path, "to", page.to)
+        if since is not None and window_from != epoch_seconds(since):
+            raise bad("echoed from differs from the requested since")
+        if until is not None and window_to != epoch_seconds(until):
+            raise bad("echoed to differs from the requested until")
+        if window_from > window_to:
+            raise bad("echoed from is later than echoed to")
+        # [documented] newest first. [client policy] every trade inside the window.
+        times = [_response_instant(path, "createdAt", trade.createdAt) for trade in page.data]
+        if any(newer < older for newer, older in itertools.pairwise(times)):
+            raise bad("trades are not sorted newest first")
+        if any(not window_from <= moment < window_to for moment in times):
+            raise bad("a trade lies outside the echoed from/to window")
+
+    async def list_all_exchange_trades(
+        self,
+        exchange_id: str,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        page_limit: int = TRADES_PAGE_MAX,
+        max_pages: int = DEFAULT_MAX_PAGES,
+    ) -> ExchangeTradeHistory:
+        """Every trade in the window, newest first, or an error. Never a partial tape.
+
+        Each page has its own read deadline; there is no deadline for the whole tape.
+        Every page must echo the same market and window [client policy]. If SIG moved an
+        omitted `until` ("now") between pages the walk fails, so pass `until` for a long
+        tape. Coverage is returned per page, exactly as sent: a complete walk does not
+        show that SIG's reporting projection has caught up with the trading engine.
+        """
+        path = f"/exchanges/{_segment(_check_numeric_id('exchange_id', exchange_id))}/trades"
+        firsts: list[ExchangeTradesPage] = []  # the first page, once read
+        coverage: list[TradeCoverage | None] = []
+        last_time: Decimal | None = None
+
+        def on_page(page: ExchangeTradesPage) -> None:
+            nonlocal last_time
+
+            def fail(reason: str) -> SigPaginationError:
+                return SigPaginationError(method="GET", path=path, reason=reason)
+
+            if not firsts:
+                firsts.append(page)
+            else:
+                first = firsts[0]
+                # Market ids are response data and are not repeated in the error.
+                if page.marketId != first.marketId:
+                    raise fail("a page reports a different market")
+                if _response_instant(path, "from", page.from_) != _response_instant(
+                    path, "from", first.from_
+                ) or _response_instant(path, "to", page.to) != _response_instant(
+                    path, "to", first.to
+                ):
+                    raise fail("a page reports a different from/to window")
+            if page.data:
+                newest = _response_instant(path, "createdAt", page.data[0].createdAt)
+                if last_time is not None and newest > last_time:
+                    raise fail("a page holds trades newer than the previous page's")
+                last_time = _response_instant(path, "createdAt", page.data[-1].createdAt)
+            coverage.append(page.coverage)
+
+        trades = await self._collect(
+            path,
+            lambda cursor: self.list_exchange_trades_page(
+                exchange_id, since=since, until=until, limit=page_limit, cursor=cursor
+            ),
+            max_pages=max_pages,
+            key=lambda trade: trade.id,
+            on_page=on_page,
+        )
+        first = firsts[0]  # _collect reads at least one page or raises
+        return ExchangeTradeHistory(
+            exchange_id=first.exchangeId,
+            market_id=first.marketId,
+            window_from=first.from_,
+            window_to=first.to,
+            trades=tuple(trades),
+            page_coverage=tuple(coverage),
+        )
+
     # --- pagination ---------------------------------------------------------------------
 
     @staticmethod
@@ -703,9 +969,11 @@ class SigRestClient:
         *,
         max_pages: int,
         key: Callable[[Any], object],
+        on_page: Callable[[Any], None] | None = None,
     ) -> list[Any]:
         # [documented] follow nextCursor while hasMore. [client policy] fail on a
         # repeated cursor, a cursor on the last page, a duplicate item or the page cap.
+        # `on_page` sees every page, in order, before its items are taken; it may raise.
         max_pages = _check_int("max_pages", max_pages, 1, 10_000)
 
         def fail(reason: str) -> SigPaginationError:
@@ -717,6 +985,8 @@ class SigRestClient:
         cursor: str | None = None
         for _ in range(max_pages):
             page = await fetch(cursor)
+            if on_page is not None:
+                on_page(page)
             for item in page.data:
                 item_key = key(item)
                 if item_key in keys:

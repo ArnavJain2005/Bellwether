@@ -1,0 +1,49 @@
+{
+  "provenance": "synthetic, spec-derived: market, exchange 36, thumbnail and tournament-context examples; exchange 37 (NO, null latestPrice) and the creator (id and null username) are placeholders; the context id/slug are set to match tournament.json",
+  "openapi": [
+    "#/paths/~1markets~1{id}/get/responses/200/content/application~1json/schema",
+    "#/components/schemas/Market",
+    "#/components/schemas/Exchange",
+    "#/components/schemas/MarketPricingContext",
+    "#/components/schemas/MarketReadContextDescriptor",
+    "#/components/schemas/MarketContextExchange",
+    "#/components/schemas/MarketTournamentContext"
+  ],
+  "body": {
+    "id": "26",
+    "title": "Will US unemployment rate be below 4% on Jan 1, 2026?",
+    "thumbnailUrl": "https://media.thesuper.market/market-thumbnails/platform/123e4567-e89b-12d3-a456-426614174000.webp",
+    "status": "open",
+    "createdAt": "2025-06-14T00:19:53.022Z",
+    "settlementDate": "2026-01-01T04:59:00.000Z",
+    "settledWith": null,
+    "settledOn": null,
+    "categories": ["Economic Indicator"],
+    "isComposite": false,
+    "isMultiOutcome": false,
+    "exchanges": [
+      {"id": "36", "option": "YES", "latestPrice": 0.42, "initialPrice": 0.5},
+      {"id": "37", "option": "NO", "latestPrice": null, "initialPrice": 0.5}
+    ],
+    "contexts": [
+      {
+        "type": "tournament",
+        "tournament": {
+          "id": "550e8400-e29b-41d4-a716-446655440000",
+          "slug": "alpha-tournament",
+          "name": "SIG Quarterly Season",
+          "currencyName": "SIG Coins",
+          "isOngoingPlay": false
+        },
+        "status": "open",
+        "settledWith": null,
+        "settledOn": null,
+        "exchanges": [
+          {"id": "36", "latestPrice": 0.42},
+          {"id": "37", "latestPrice": null}
+        ]
+      }
+    ],
+    "creator": {"id": "11111111-1111-4111-8111-111111111111", "username": null}
+  }
+}
