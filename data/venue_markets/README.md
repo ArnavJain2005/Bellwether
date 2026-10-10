@@ -160,6 +160,8 @@ The output JSON file contains:
 
 - **TLS / SSL**: Standard strict certificate verification is enforced. No `CERT_NONE` or legacy renegotiation flags.
 - **Kalshi Fallback**: Tries `api.elections.kalshi.com` first, and gracefully falls back to `external-api.kalshi.com` on connection errors with jittered backoff.
+- **Kalshi Connection Reuse**: Each fetch owns one verified TLS context and reuses healthy HTTPS connections per host. Every response body is fully read before reuse, including HTTP errors. Request, header, or body failures discard the connection; server-requested closure causes a fresh connection on the next attempt. All owned connections close when the fetch finishes or fails. `_kalshi_request()` remains a one-shot helper for diagnostics.
 - **Rate Limiting**: Shared per-venue limiter enforces $\le 4$ requests per second across all request attempts, retries, and host fallbacks.
 - **Failure Resilience**: Connection errors retry with exponential backoff and jitter. Failed runs preserve previous outputs byte-for-byte.
+- **Bounded Recovery**: Connection reuse adds no retries. The existing initial attempt plus at most four retry rounds per page, immediate primary-to-fallback attempt, rate-limiter waits, timeouts and cursor retention remain in force. This reduces fresh TLS handshakes but cannot guarantee access when the network or upstream repeatedly resets connections.
 - **Git Hygiene**: `data/venue_markets/output/` is git-ignored. Raw market data dumps are never committed.

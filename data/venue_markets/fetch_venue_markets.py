@@ -22,7 +22,7 @@ import urllib.parse
 import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 USER_AGENT = "bellwether/0.1 (research)"
 MIN_REQUEST_INTERVAL = 0.3  # at most 4 requests per second per venue
@@ -709,26 +709,59 @@ def fetch_polymarket_markets(
 # Kalshi Fetcher
 # =====================================================================
 
+class _KalshiTransport:
+    """Own verified, reusable HTTPS connections for one fetch; never retry here."""
+
+    def __init__(self) -> None:
+        self._context = ssl.create_default_context()
+        self._connections: dict[str, http.client.HTTPSConnection] = {}
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def _discard(self, host: str) -> None:
+        connection = self._connections.pop(host, None)
+        if connection is not None:
+            connection.close()
+
+    def close(self) -> None:
+        for host in list(self._connections):
+            self._discard(host)
+
+    def request(self, host: str, path: str, timeout: float = 25.0) -> tuple[int, bytes]:
+        connection = self._connections.get(host)
+        if connection is None:
+            connection = http.client.HTTPSConnection(host, 443, context=self._context, timeout=timeout)
+            self._connections[host] = connection
+        try:
+            connection.request("GET", path, headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "application/json",
+            })
+            response = connection.getresponse()
+            # Drain error responses too: http.client requires this before reuse.
+            body = response.read()
+            if response.will_close:
+                self._discard(host)
+            return response.status, body
+        except BaseException:
+            # No poisoned/stale socket can be reused, even on interruption.
+            self._discard(host)
+            raise
+
+
 def _kalshi_request(
     host: str,
     path: str,
     timeout: float = 25.0,
 ) -> tuple[int, bytes]:
 
-    ctx = ssl.create_default_context()
-    conn = http.client.HTTPSConnection(host, 443, context=ctx, timeout=timeout)
-    try:
-        headers = {
-            "User-Agent": USER_AGENT,
-            "Accept": "application/json",
-            "Connection": "close",
-        }
-        conn.request("GET", path, headers=headers)
-        resp = conn.getresponse()
-        data = resp.read()
-        return resp.status, data
-    finally:
-        conn.close()
+    """One-shot diagnostic helper; production fetches own a reusable transport."""
+    with _KalshiTransport() as transport:
+        return transport.request(host, path, timeout)
 
 
 def fetch_kalshi_markets(
@@ -739,6 +772,20 @@ def fetch_kalshi_markets(
     exclusion_samples: dict[str, list[str]] | None = None,
 ) -> tuple[str, list[dict[str, Any]], dict[str, int]]:
     """Fetch active 2026 midterm markets from Kalshi Trade API v2."""
+    if requester is not None:
+        return _fetch_kalshi_markets(rate_limiter, primary_host, fallback_host, requester, exclusion_samples)
+    with _KalshiTransport() as transport:
+        return _fetch_kalshi_markets(rate_limiter, primary_host, fallback_host, transport.request, exclusion_samples)
+
+
+def _fetch_kalshi_markets(
+    rate_limiter: RateLimiter,
+    primary_host: str,
+    fallback_host: str,
+    requester: Any,
+    exclusion_samples: dict[str, list[str]] | None,
+) -> tuple[str, list[dict[str, Any]], dict[str, int]]:
+    """Traverse pages with the existing bounded retries and host fallback."""
     print("Fetching Kalshi markets...", flush=True)
     active_host = primary_host
     actual_serving_host = primary_host
@@ -771,10 +818,7 @@ def fetch_kalshi_markets(
         for attempt in range(5):  # 1 initial + up to 4 retries
             rate_limiter.wait()
             try:
-                if requester is not None:
-                    status, body = requester(active_host, path)
-                else:
-                    status, body = _kalshi_request(active_host, path)
+                status, body = requester(active_host, path)
 
                 if status == 200:
                     page_data = json.loads(body.decode("utf-8"))
@@ -790,10 +834,7 @@ def fetch_kalshi_markets(
                     # Immediate attempt on fallback host with rate limiter
                     rate_limiter.wait()
                     try:
-                        if requester is not None:
-                            status, body = requester(active_host, path)
-                        else:
-                            status, body = _kalshi_request(active_host, path)
+                        status, body = requester(active_host, path)
                         if status == 200:
                             page_data = json.loads(body.decode("utf-8"))
                             break

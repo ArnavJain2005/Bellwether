@@ -453,6 +453,9 @@ KALSHI_IDS = {"CONTROLS-26-D", "CONTROLH-26-D"} | {f"SENATE-26-{i}" for i in ran
 
 
 class _FakeResponse:
+    status = 200
+    will_close = False
+
     def __init__(self, body: bytes) -> None:
         self._body = body
 
@@ -524,8 +527,24 @@ def _install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, poly: dict, kalshi
     def blocked(*_a: object, **_k: object) -> None:
         raise UnexpectedRequest("real network access attempted")
 
+    class FakeKalshiConnection:
+        def __init__(self, host: str, _port: int, *, context: object, timeout: float) -> None:
+            self.host = host
+            self.body = b""
+
+        def request(self, method: str, path: str, headers: dict) -> None:
+            if method != "GET":
+                raise UnexpectedRequest(f"unexpected Kalshi method: {method}")
+            _status, self.body = fake_kalshi(self.host, path)
+
+        def getresponse(self) -> _FakeResponse:
+            return _FakeResponse(self.body)
+
+        def close(self) -> None:
+            pass
+
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(fvm, "_kalshi_request", fake_kalshi)
+    monkeypatch.setattr(fvm.http.client, "HTTPSConnection", FakeKalshiConnection)
     monkeypatch.setattr(socket.socket, "connect", blocked)
     monkeypatch.setattr(socket, "create_connection", blocked)
     monkeypatch.setattr(socket, "getaddrinfo", blocked)
