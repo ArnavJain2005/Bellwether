@@ -331,6 +331,7 @@ class Harness:
             wall_clock=self.clock.wall,
         )
         self.task: asyncio.Task[None] | None = None
+        self.baseline_tasks: set[asyncio.Task[Any]] = set()
 
     def _sink(self, event: FeedEvent) -> None:
         # Synchronous, like a real sink: records what is_ready() said during the callback.

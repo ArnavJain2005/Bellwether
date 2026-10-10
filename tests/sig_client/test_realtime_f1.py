@@ -49,7 +49,10 @@ QUIET = RealtimeFeedPolicy(tick_s=1e6)  # the timer never fires within these tes
 
 def run(scenario: Any, **kwargs: Any) -> Harness:
     async def main() -> Harness:
+        # Tasks that exist before the scenario (on Python 3.11 this includes the
+        # watchdog's own wrapper task): only tasks created after this are the feed's.
         h = Harness(**kwargs)
+        h.baseline_tasks = set(asyncio.all_tasks())
         try:
             await scenario(h)
         finally:
@@ -63,6 +66,11 @@ def run(scenario: Any, **kwargs: Any) -> Harness:
 
 def iso(delta_s: float) -> str:
     return (T0 + timedelta(seconds=delta_s)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def new_tasks(h: Harness) -> set[asyncio.Task[Any]]:
+    """Tasks still alive that the scenario created (the current one excluded)."""
+    return set(asyncio.all_tasks()) - h.baseline_tasks - {asyncio.current_task()}
 
 
 def stale_reasons(h: Harness) -> list[StaleReason]:
@@ -431,8 +439,7 @@ async def _close_and_check(h: Harness) -> None:
     await watchdog(h.task)  # run() returns: no exception, no hang
     assert h.task.exception() is None
     assert h.transport.closed
-    leftover = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-    assert leftover == []
+    assert new_tasks(h) == set()
     calls, posts = list(h.transport.calls), h.count(TOKEN)
     await h.clock.advance(10_000.0)  # nothing new starts after shutdown
     await settle()
@@ -513,7 +520,7 @@ def test_cancelling_run_during_connect_cleans_up() -> None:
         with pytest.raises(asyncio.CancelledError):
             await watchdog(h.task)
         assert transport.cancelled == ["connect"] and transport.closed
-        assert [t for t in asyncio.all_tasks() if t is not asyncio.current_task()] == []
+        assert new_tasks(h) == set()
 
     run(scenario, policy=QUIET, transport=transport)
 
