@@ -72,7 +72,7 @@ from urllib.parse import quote
 import httpx
 from pydantic import BaseModel, ValidationError
 
-from engine.config import SigConfig
+from engine.config import SigConfig, TournamentRef
 from engine.sig_client.errors import (
     SigApiError,
     SigArgumentError,
@@ -386,6 +386,16 @@ class SigRestClient:
     @property
     def closed(self) -> bool:
         return self._closed
+
+    @property
+    def limiter(self) -> RateLimiter:
+        """The rate limiter this client admits through (share it across the account)."""
+        return self._limiter
+
+    @property
+    def tournament(self) -> TournamentRef:
+        """The configured tournament every scoped read is pinned to."""
+        return self._config.tournament
 
     # --- tournament ---------------------------------------------------------------------
 
