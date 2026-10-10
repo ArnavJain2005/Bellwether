@@ -164,12 +164,17 @@ def test_no_public_write_or_arbitrary_request_methods() -> None:
         "get_exchange_prices",
         "get_market_orderbook",
         "get_tournament",
+        "limiter",  # read-only accessor (S1-T3-A: the feed checks the shared budget)
         "list_all_orders",
         "list_all_tournament_markets",
         "list_orders_page",
         "list_tournament_markets_page",
+        "tournament",  # read-only accessor for the configured TournamentRef
         "verify_tournament",
     }
+    for accessor in ("limiter", "tournament"):
+        assert isinstance(getattr(SigRestClient, accessor), property)
+        assert getattr(SigRestClient, accessor).fset is None
     source = Path(rest.__file__).read_text(encoding="utf-8")
     for verb in ('"POST"', '"DELETE"', '"PUT"', '"PATCH"'):
         assert verb not in source
