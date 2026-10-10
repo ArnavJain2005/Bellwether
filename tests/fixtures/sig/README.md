@@ -13,9 +13,9 @@ example `"cursor-page-2"` or `"Placeholder market B"`).
 Each file is `{"provenance": ..., "openapi": [JSON pointers], "body": <response JSON>}`.
 Tests load `body` and serve it through `httpx.MockTransport`.
 
-They stay alongside the recorded fixtures below. For `GET /orders`, error envelopes and
-later markets pages they are still the only evidence, so there the client is checked
-against the spec's shapes, not against SIG's actual behaviour.
+They stay alongside the recorded fixtures below. For order items and error envelopes
+they are still the only evidence, so there the client is checked against the spec's
+shapes, not against SIG's actual behaviour.
 
 ## Fixtures derived from recorded responses: `recorded/<run id>/`
 
@@ -33,9 +33,10 @@ recorded/<run id>/
 
 - **`source-provenance.json`** is **sanitized** provenance derived from the capture
   manifest. It is **not** the byte-exact capture manifest: its `format` is
-  `bellwether.sig-source-provenance/1`, and its `label` and `sanitization` fields say so. It keeps the capture identity, code and spec provenance,
-  the recorded requests, step outcomes, pagination and coverage. Every other field holds
-  the capture manifest's value, with these exceptions:
+  `bellwether.sig-source-provenance/1`, and its `label` and `sanitization` fields say so.
+  It keeps the capture identity, code and spec provenance, the recorded requests, step
+  outcomes, pagination and coverage. Every other field holds the capture manifest's
+  value, with these exceptions:
   - The original SHA-256 and size of each **redacted** body are omitted. They would let
     anyone verify guesses of the redacted values.
   - The capture manifest's own SHA-256 is not recorded anywhere, because it could verify a
@@ -56,8 +57,19 @@ recorded/<run id>/
   must never be described as byte-exact.
 - **Redactions** name each JSON path and its replacement value, never the original value.
 
-Tests: `tests/sig_client/test_sig_recorded_replay.py` serves these bodies through
-`SigRestClient` with `httpx.MockTransport`, only for the exact recorded path and query.
+Tests (`tests/sig_client/`):
+- `test_sig_recorded_integrity.py` checks every directory: fixture and provenance hashes,
+  sanitization, redaction placeholders, accounted-for hashes, and line endings.
+- `test_sig_recorded_replay.py` (capture `fa008a`) and `test_sig_recorded_replay_fb88c9.py`
+  serve the bodies through `SigRestClient` with `httpx.MockTransport` (helpers in
+  `recorded_kit.py`). Each body is served only for its exact recorded path and query, so
+  pages of one collection are told apart by their cursor.
+
+The same placeholders are used in every directory: `$.myBalance` → `12345.67`,
+`$.isPendingEnrolment` → `true`, market `creator.id` → `11111111-1111-4111-8111-111111111111`,
+`creator.username` → `redacted-creator-1`, and the shared first UUID segment of
+`thumbnailUrl` → `22222222-2222-4222-8222-222222222222`. These are fixed test values;
+they say nothing about the account.
 
 ### `recorded/20261009T122244Z-fa008a/`
 
@@ -97,14 +109,61 @@ on the exact `tournamentId` sent, which `fixtures.json` records.
 (CRLF on that Windows checkout). The committed blob is LF-only with identical content, so
 an LF checkout hashes differently.
 
-### Coverage
+### `recorded/20261009T190027Z-fb88c9/`
 
-- **Response envelopes:** five endpoints recorded: tournament, markets page, bulk prices,
-  exchange orderbook and market orderbook. **`GET /orders` is not recorded.**
-- **Pagination:** markets has the first page only (`hasMore: true`, cursor present, total
-  237); the cursor was never followed and no last page was seen, so full pagination is
-  **not** covered. Orders pagination is not covered.
-- **Item variants not seen** (coverage gaps, not extra acceptance requirements): settled
-  or closed markets; a null `latestPrice`, `creator` or `username`; markets with more than
-  one exchange; null `bestBid`, `bestAsk` or `spread`; a non-empty `missingIds`; an empty
-  book side; any order item.
+A read-only capture of 2026-10-09 (code `36aebfe`, clean): the same tournament, exchange
+`947` and market `258`, depth 5, markets page limit 100 with up to 3 pages, and orders
+with status `all`, page limit 50 and up to 3 pages.
+
+| Fixture | Endpoint | Label | Redacted paths |
+| --- | --- | --- | --- |
+| `01-tournament-a1.json` | `GET /tournaments/{slug}` | derived, redacted | `$.myBalance`, `$.isPendingEnrolment` |
+| `02-tournament-markets-p1-a1.json` | `GET /tournaments/{slug}/markets` (page 1) | derived, redacted | `$.data[0..99].creator.id`, `.creator.username`, `.thumbnailUrl` (shared segment) |
+| `03-tournament-markets-p2-a1.json` | `GET /tournaments/{slug}/markets` (page 2) | derived, redacted | `$.data[0..99]`, the same three paths |
+| `04-tournament-markets-p3-a1.json` | `GET /tournaments/{slug}/markets` (page 3) | derived, redacted | `$.data[0..36]`, the same three paths |
+| `05-exchange-prices-a1.json` | `GET /exchanges/prices` | unmodified | none |
+| `06-exchange-orderbook-947-a1.json` | `GET /exchanges/{id}/orderbook` | unmodified | none |
+| `07-market-orderbook-258-a1.json` | `GET /markets/{id}/orderbook` | unmodified | none |
+| `08-orders-p1-a1.json` | `GET /orders` | unmodified | none |
+
+That is 713 redactions in all, each listed in `fixtures.json`. `source-provenance.json`
+omits the original hash and size of `01` to `04` and the capture manifest's own hash.
+
+**Markets pagination.** Each page's `nextCursor` is exactly the cursor sent for the next
+page. Pages hold 100, 100 and 37 markets, 237 unique ids in all (matching `total`), and
+the last page has `hasMore: false` and `nextCursor: null`. The replay tests drive
+`list_all_tournament_markets` over this exact chain, and check that a two-page cap raises
+an error rather than returning part of the list.
+
+**Orders.** One page with `data: []`, `hasMore: false` and `nextCursor: null`. The optional
+`coverage` object is present with `complete: true` and an integer
+`projectedThroughSequence`; the tests check only that it is the integer SIG sent, and
+infer nothing about what it means. **This covers the `/orders` envelope only. No order
+item and no orders cursor-following were observed, so neither is tested.**
+
+**Exchange 947 belongs to market 258**, which the full markets list shows as "Will the
+Democratic Party win the Georgia Senate?" with `947` as its only exchange. Prices and the
+exchange book both report `marketId: "258"`, and the market book has one `tournament`
+context naming the configured slug and UUID.
+
+The markets list also holds the three Independent-candidate markets and four markets in a
+`Freeform` category. `thumbnailUrl` appears on all 237 markets, and timestamps follow
+the same formats as in the first capture.
+
+### Coverage across both captures
+
+- **Response envelopes:** all six endpoints the client uses: tournament, markets page,
+  bulk prices, exchange orderbook, market orderbook and orders. `/orders` is covered
+  only as an empty page.
+- **Pagination:** markets is covered in full (three pages, cursor chain, a final page
+  with `hasMore: false`). For orders only a single final page was seen;
+  **orders cursor-following is not covered.**
+- **Item variants not seen** (coverage gaps, not extra acceptance requirements):
+  - **any order item**, so the individual order shape is still checked only against
+    synthetic fixtures;
+  - settled or closed markets;
+  - a null `latestPrice`, `creator` or `username`;
+  - markets with more than one exchange;
+  - null `bestBid`, `bestAsk` or `spread`;
+  - a non-empty `missingIds`;
+  - an empty book side.
