@@ -50,6 +50,7 @@ from engine.sig_client.realtime_topic import BookSource, StaleReason
 
 ORDERBOOK = f"/markets/{MARKET}/orderbook"
 EX = "36"
+DIRTY = {"exchangeId": 36, "marketId": MARKET, "tournamentId": TOURNAMENT.id, "at": "x"}
 
 
 def orderbook(sequence: int | None, at: str = "2026-10-10T12:00:00.5+00:00", bid: str = "0.41"):
@@ -136,8 +137,10 @@ def test_missed_batch_triggers_a_rest_resync() -> None:
         assert not h.feed.is_ready(MARKET)
         assert stale_reasons(h) == [StaleReason.REVISION_GAP]
         await h.clock.advance(2.0)  # min_resync_interval_s
-        assert h.count(ORDERBOOK) == 2
-        assert h.feed.is_ready(MARKET)
+        assert h.count(ORDERBOOK) == 2  # the resync ran and refreshed the books ...
+        # ... but a book read cannot restore market-state or trade continuity (S1-T3-A-F2).
+        assert not h.feed.is_ready(MARKET)
+        assert h.feed.blockers(MARKET) == {StaleReason.REVISION_GAP}
         assert h.feed.last_revision(MARKET) == 4
         trades = [e.trade.id for e in h.events if isinstance(e, TradeReceived)]
         assert trades == ["t1", "t2"]  # nothing from the gap batch
@@ -166,7 +169,7 @@ def test_duplicates_and_overlaps_cost_no_rest_reads() -> None:
     [
         ({"resyncRequired": True, "delivery": {"revision": 9, "previousRevision": 8}},
          StaleReason.RESYNC_REQUIRED),
-        (batch(9, 8, trades=[trade(None, None)], books=[book(5)]), StaleReason.NULL_TRADE_SEQUENCE),
+        # A null-sequence trade also resyncs, but it blocks readiness: test_realtime_f1.py.
         ({"delivery": "broken"}, StaleReason.MALFORMED),
         (batch(9, 8, book_dirty=[{"exchangeId": 36, "marketId": "26",
                                   "tournamentId": TOURNAMENT.id, "at": "x"}]),
@@ -180,7 +183,9 @@ def test_batch_level_triggers_resync(payload: Any, reason: StaleReason) -> None:
         await settle()
         assert stale_reasons(h) == [reason] and not h.feed.is_ready(MARKET)
         await h.clock.advance(2.0)
-        assert h.count(ORDERBOOK) == 2 and h.feed.is_ready(MARKET)
+        # The books are refreshed, but these messages may have hidden events (F2).
+        assert h.count(ORDERBOOK) == 2 and not h.feed.is_ready(MARKET)
+        assert h.feed.blockers(MARKET) == {reason}
         await h.stop()
 
     run(scenario)
@@ -387,19 +392,20 @@ def test_trigger_during_resync_discards_readiness_and_reruns() -> None:
         await h.start()
         assert h.count(ORDERBOOK) == 1 and not h.feed.is_ready(MARKET)
         topic = h.topic()
-        h.transport.batch(topic, batch(1, 0, books=[book(50)], book_dirty=[]))
-        h.transport.batch(topic, batch(5, 3, books=[book(60)]))  # a gap while in flight
-        h.transport.batch(topic, {"resyncRequired": True, "delivery": {"revision": 6,
-                                                                     "previousRevision": 5}})
+        h.transport.batch(topic, batch(1, 0, books=[book(50)]))
+        h.transport.batch(topic, batch(2, 1, books=[book(60)]))
+        # Two non-blocking triggers while the read is in flight.
+        h.transport.batch(topic, DIRTY, event="book_dirty")
+        h.transport.subscribed(topic)
         await settle()
         gate["release"].set()
         await settle()
-        # The snapshot was requested before the gap, so it cannot make the market ready,
-        # and the null-asOf REST book does not replace the book pushed meanwhile.
+        # The snapshot was requested before the triggers, so it cannot make the market
+        # ready, and the null-asOf REST book does not replace the book pushed meanwhile.
         assert not h.feed.is_ready(MARKET)
         assert h.feed.books(MARKET)[EX].as_of.sequence == 60
         await h.clock.advance(2.0)
-        assert h.count(ORDERBOOK) == 2  # three triggers, one follow-up
+        assert h.count(ORDERBOOK) == 2  # two triggers, one follow-up
         gate["release"].set()
         await settle()
         assert h.feed.is_ready(MARKET)
@@ -414,8 +420,9 @@ def test_stale_versioned_snapshot_does_not_replace_a_newer_push() -> None:
         h.router.routes[f"/api/v1{ORDERBOOK}"] = [orderbook(50), orderbook(80, bid="0.30")]
         await h.start()
         assert h.feed.books(MARKET)[EX].as_of.sequence == 50
-        h.transport.batch(h.topic(), batch(2, 0, books=[book(90)], book_dirty=[]))
-        h.transport.batch(h.topic(), batch(5, 3, books=[book(95)]))  # gap
+        h.transport.batch(h.topic(), batch(2, 0, books=[book(90)]))
+        h.transport.batch(h.topic(), batch(3, 2, books=[book(95)]))
+        h.transport.batch(h.topic(), DIRTY, event="book_dirty")  # a non-blocking trigger
         await h.clock.advance(2.0)
         assert h.count(ORDERBOOK) == 2 and h.feed.is_ready(MARKET)
         held = h.feed.books(MARKET)[EX]
@@ -479,6 +486,8 @@ def test_book_expiry_triggers_a_refetch() -> None:
     async def scenario(h: Harness) -> None:
         await h.start()
         expiry = (T0 + timedelta(seconds=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # SIG reads the book half a second after the expiry, by its own clock.
+        h.router.routes[f"/api/v1{ORDERBOOK}"] = orderbook(9, at="2026-10-10T12:00:30.5+00:00")
         h.transport.batch(h.topic(), batch(1, 0, books=[book(9, next_expiry=expiry)]))
         await h.clock.advance(29.0)
         assert h.count(ORDERBOOK) == 1

@@ -24,37 +24,77 @@ Lifecycle
    every market: a token refresh requires authoritative REST resynchronization.
 
 Ready (`is_ready(market_id)`) means all of:
-- the token has not expired;
+- the token is still valid on the clock (checked when asked, not only by the timer);
 - the transport reports the topic SUBSCRIBED, with no channel or socket error since;
 - a REST resync was requested after the most recent trigger and has completed;
-- no further trigger arrived while it ran.
+- no further trigger arrived while it ran;
+- no held book's known `nextExpiryAt` has passed (checked when asked);
+- no blocker is outstanding (below).
+The same token and expiry checks gate starting a resync and publishing MarketReady.
+A message that needs recovery marks the market not ready (and publishes MarketStale)
+before any BookUpdated, TradeReceived or SettlementSignal from that message is
+published, so a sink never sees a ready market for data that has invalidated it.
 Pushed books and trades keep flowing while a market is not ready, but downstream code
 must not act on a market until it is ready again. Each HeldBook also says whether it is
 `complete` (a REST side may be cut off at the requested depth) and whether its order
 expiry time is known (REST books carry no `nextExpiryAt`).
 
-Resync budget [client policy]: every resync is one REST read on the account's shared
-budget. At most one resync runs per market at a time; triggers that arrive meanwhile
-coalesce into one follow-up. Resync starts per market are at least
-`min_resync_interval_s` apart, and all resyncs together are capped at
-`resync_reads_per_minute`, below the account's read budget, so a storm of gaps cannot
-starve other readers. Transient REST failures back off; permanent ones (auth, scope,
-tournament mismatch, a closed client) stop the feed with that error.
+Blockers: a settlement requires the authoritative market state, and a trade without a
+sequence requires the exchange's price and trade tape over REST. A revision gap, a batch
+flagged `resyncRequired`, a malformed message or a batch missing a named book may have
+hidden either. This slice reads neither the market state nor the trade tape, so those
+reasons stay in `blockers(market_id)` and the market is not ready again for the life of
+the feed. An orderbook resync refreshes the books but never clears a blocker.
+Restarting the feed only discards this in-memory state: it does not reconcile the market
+state or the trades that may have been missed, so a restart is not a recovery
+procedure. Until the reconciliation reads exist, nothing establishes that a blocked
+market is safe to act on again.
+
+Order expiry: a REST read clears a known `nextExpiryAt` only when it is shown to have
+been made at or after it (see realtime_topic.py); otherwise the expiry stays outstanding,
+the market stays not ready and is read again on the normal resync schedule. A versioned
+read is shown by SIG's own `asOf.at`. An unversioned read can be shown only through
+`expiry_skew_margin_s`, an operator-configured bound on how far the local clock may run
+ahead of SIG's; it is unset (None) by default, and then an unversioned read never clears
+a known expiry. No clock synchronization is attempted.
+
+Closing: once `aclose()` begins, `is_ready()` is False for every market, and a resync
+whose response arrives afterwards applies nothing and publishes nothing.
+
+Retry waits: a valid Retry-After on a failed mint or resync is a minimum wait; backoff
+limits (`max_retry_s`) never shorten it. A Retry-After too large to hold safely stops
+the feed with that error instead of retrying early.
+
+Resync budget [client policy]: `resync_reads_per_minute` caps logical resync *starts*
+across the feed. One start is one `SigRestClient.get_market_orderbook` call, which may
+make several HTTP attempts under its own ReadRetryPolicy (up to `max_attempts`, each on
+the shared account limiter). The cap therefore bounds, but does not fix, the reads the
+feed spends, and it reserves nothing for other readers: the shared limiter has no
+priorities. At most one resync runs per market at a time; triggers that arrive meanwhile
+coalesce into one follow-up, and starts per market are at least `min_resync_interval_s`
+apart. Transient REST failures back off; permanent ones (auth, scope, tournament
+mismatch, a closed client) stop the feed with that error.
+
+Shutdown: `aclose()` stops `run()` at any point, including tournament verification,
+minting and its retry waits, connecting and subscribing. Work in flight is cancelled and
+nothing new (no token request, no subscription, no resync) starts afterwards.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
-from collections.abc import Callable, Coroutine, Sequence
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 
 from engine.sig_client.errors import (
+    SigApiError,
     SigArgumentError,
     SigAuthError,
     SigBadRequestError,
@@ -62,6 +102,7 @@ from engine.sig_client.errors import (
     SigClientError,
     SigContextMismatchError,
     SigNotFoundError,
+    SigRateLimitedError,
     SigResponseError,
 )
 from engine.sig_client.rate_limiter import (
@@ -73,6 +114,7 @@ from engine.sig_client.rate_limiter import (
     check_positive_seconds,
 )
 from engine.sig_client.realtime_token import (
+    DEFAULT_RATE_LIMITED_WAIT_S,
     DOCUMENTED_TOKEN_LIFETIME_S,
     TOKEN_PATH,
     RealtimeCredentials,
@@ -81,6 +123,7 @@ from engine.sig_client.realtime_token import (
     RealtimeTokenClient,
 )
 from engine.sig_client.realtime_topic import (
+    BLOCKING_REASONS,
     DEFAULT_TRADE_ID_MEMORY,
     HeldBook,
     MarketTopic,
@@ -92,6 +135,7 @@ from engine.sig_client.rest import ORDERBOOK_DEPTH_MAX, SigRestClient
 
 logger = logging.getLogger(__name__)
 
+T = TypeVar("T")
 WallClock = Callable[[], datetime]
 
 
@@ -204,6 +248,28 @@ class RealtimeFeedError(SigClientError):
     """The feed cannot continue (for example, the realtime endpoint changed)."""
 
 
+class _Closed(Exception):
+    """aclose() was called while run() was waiting."""
+
+
+def _server_wait(error: SigClientError) -> float | None:
+    """The minimum wait SIG asked for before the next attempt, or None.
+
+    Looks at the error and, for a retry or deadline error, at the attempt it wraps. A
+    Retry-After too large to hold re-raises the error: it is never retried early.
+    """
+    api = error if isinstance(error, SigApiError) else getattr(error, "last_error", None)
+    if not isinstance(api, SigApiError):
+        return None
+    if api.retry_after_oversized:
+        raise error
+    if api.retry_after is not None:
+        return api.retry_after
+    if isinstance(api, SigRateLimitedError):
+        return DEFAULT_RATE_LIMITED_WAIT_S  # the documented default for a 429
+    return None
+
+
 # Errors a retry cannot fix: they stop the feed.
 _PERMANENT: tuple[type[BaseException], ...] = (
     SigAuthError,
@@ -228,6 +294,10 @@ class RealtimeFeedPolicy:
     max_retry_s: float = 120.0
     tick_s: float = 1.0
     trade_id_memory: int = DEFAULT_TRADE_ID_MEMORY
+    # [client policy] A bound, in seconds, on how far the local wall clock may run ahead of
+    # SIG's. None (the default) means unknown: an unversioned REST book then never clears
+    # a known order expiry. Set it only with evidence that the bound holds.
+    expiry_skew_margin_s: float | None = None
 
     def __post_init__(self) -> None:
         if check_positive_int("snapshot_depth", self.snapshot_depth) > ORDERBOOK_DEPTH_MAX:
@@ -242,6 +312,14 @@ class RealtimeFeedPolicy:
             "tick_s",
         ):
             check_positive_seconds(name, getattr(self, name))
+        bound = self.expiry_skew_margin_s
+        if bound is not None and (
+            isinstance(bound, bool)
+            or not isinstance(bound, (int, float))
+            or not math.isfinite(bound)
+            or bound < 0
+        ):
+            raise ValueError("expiry_skew_margin_s must be None or a finite number >= 0")
         check_positive_int("resync_reads_per_minute", self.resync_reads_per_minute)
         check_positive_int("trade_id_memory", self.trade_id_memory)
         if self.refresh_margin_s >= DOCUMENTED_TOKEN_LIFETIME_S:
@@ -252,7 +330,8 @@ class RealtimeFeedPolicy:
 class _Market:
     topic: MarketTopic
     subscribed: bool = False
-    ready: bool = False
+    ready: bool = False  # MarketReady published and not yet withdrawn
+    blockers: set[StaleReason] = field(default_factory=set)
     wanted: int = 0  # resync requests so far
     done: int = 0  # the request number the last completed resync covered
     last_start: float | None = None
@@ -325,6 +404,9 @@ class RealtimeMarketFeed:
         self._group: asyncio.TaskGroup | None = None
         self._tasks: set[asyncio.Task[None]] = set()
         self._started = False
+        self._closing = asyncio.Event()
+        bound = self._policy.expiry_skew_margin_s
+        self._skew_margin = None if bound is None else Decimal(str(bound))
 
     # --- public state -------------------------------------------------------------------
 
@@ -332,7 +414,12 @@ class RealtimeMarketFeed:
         return self._markets[market_id].topic.topic
 
     def is_ready(self, market_id: str) -> bool:
-        return self._markets[market_id].ready
+        """Whether downstream code may act on the market now (see the module docstring)."""
+        return self._ready_now(self._markets[market_id])
+
+    def blockers(self, market_id: str) -> frozenset[StaleReason]:
+        """Recovery an orderbook resync cannot provide; the market stays not ready."""
+        return frozenset(self._markets[market_id].blockers)
 
     def books(self, market_id: str) -> dict[str, HeldBook]:
         """Every book held for the market (check `is_ready` before acting on them)."""
@@ -348,12 +435,14 @@ class RealtimeMarketFeed:
             raise RuntimeError("run() may be called only once")
         self._started = True
         try:
-            await self._rest.verify_tournament()
-            credentials = await self._mint()
-            await self._transport.connect(credentials.endpoint, credentials.token)
+            await self._until_closed(self._rest.verify_tournament())
+            credentials = await self._until_closed(self._mint())
+            await self._until_closed(
+                self._transport.connect(credentials.endpoint, credentials.token)
+            )
             self._install(credentials)
             for market in self._markets.values():
-                await self._transport.subscribe(market.topic.topic)
+                await self._until_closed(self._transport.subscribe(market.topic.topic))
             try:
                 async with asyncio.TaskGroup() as group:
                     self._group = group
@@ -365,6 +454,8 @@ class RealtimeMarketFeed:
                 if len(failure.exceptions) == 1:
                     raise failure.exceptions[0] from None
                 raise
+        except _Closed:
+            return  # aclose() during start-up
         finally:
             self._group = None
             for market in self._markets.values():
@@ -373,8 +464,29 @@ class RealtimeMarketFeed:
             await self._transport.close()
 
     async def aclose(self) -> None:
-        """Stop the feed: `run()` returns once the transport reports it is closed."""
+        """Stop the feed. `run()` returns promptly, wherever it is waiting."""
+        self._closing.set()
         await self._transport.close()
+
+    async def _until_closed(self, step: Awaitable[T]) -> T:
+        """Await `step`, or cancel it and raise _Closed as soon as aclose() is called."""
+        if self._closing.is_set():
+            if asyncio.iscoroutine(step):
+                step.close()
+            raise _Closed
+        work = asyncio.ensure_future(step)
+        closer = asyncio.ensure_future(self._closing.wait())
+        try:
+            await asyncio.wait({work, closer}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            # Also runs when run() itself is cancelled: nothing is left behind.
+            closer.cancel()
+            if not work.done():
+                work.cancel()
+            await asyncio.gather(work, closer, return_exceptions=True)
+        if work.cancelled():
+            raise _Closed
+        return work.result()
 
     def _spawn(self, coro: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
         assert self._group is not None
@@ -389,12 +501,16 @@ class RealtimeMarketFeed:
 
     async def _receive_loop(self) -> None:
         while True:
-            event = await self._transport.receive()
+            try:
+                event = await self._until_closed(self._transport.receive())
+            except _Closed:
+                return
             if event is None:
                 return
             self._handle(event)
 
     def _handle(self, event: TransportEvent) -> None:
+        self._note_token_expiry()
         if isinstance(event, SocketEvent):
             reason = (
                 StaleReason.SOCKET_ERROR
@@ -417,18 +533,25 @@ class RealtimeMarketFeed:
                 self._want_resync(market, _CHANNEL_REASONS[event.status])
             return
         outcome = market.topic.on_message(event.event, event.payload)
+        # A pushed book may arrive with its nextExpiryAt already passed.
+        expired = market.topic.take_due_expiry(self._wall_epoch())
+        reason = outcome.resync or (StaleReason.BOOK_EXPIRY if expired else None)
+        # Invalidate first: every callback below must already see the market not ready.
+        market.blockers |= outcome.blockers
+        if reason is not None:
+            self._want_resync(market, reason)
         for book in outcome.books:
             self._emit(BookUpdated(market.market_id, book))
         for trade in outcome.trades:
             self._emit(TradeReceived(market.market_id, trade))
         for settlement in outcome.settlements:
             self._emit(SettlementSignal(market.market_id, settlement))
-        if outcome.resync is not None:
-            self._want_resync(market, outcome.resync)
 
     # --- readiness and resync -----------------------------------------------------------
 
     def _set_stale(self, market: _Market, reason: StaleReason) -> None:
+        if reason in BLOCKING_REASONS:
+            market.blockers.add(reason)
         if market.ready:
             market.ready = False
             logger.info("realtime market %s not ready: %s", market.market_id, reason)
@@ -439,8 +562,33 @@ class RealtimeMarketFeed:
         self._set_stale(market, reason)
         self._start_resync(market)
 
+    def _wall_epoch(self) -> Decimal:
+        return epoch_seconds(self._wall_clock())
+
+    def _token_valid(self) -> bool:
+        """The installed token has not expired on the clock (timer or not)."""
+        return (
+            not self._token_expired
+            and self._expires_mono is not None
+            and self._clock() < self._expires_mono
+        )
+
+    def _ready_now(self, market: _Market) -> bool:
+        return (
+            not self._closing.is_set()
+            and market.ready
+            and not market.blockers
+            and self._token_valid()
+            and not market.topic.has_expired_book(self._wall_epoch())
+        )
+
     def _can_resync(self, market: _Market) -> bool:
-        return market.subscribed and not self._token_expired and market.done < market.wanted
+        return (
+            market.subscribed
+            and self._token_valid()
+            and market.done < market.wanted
+            and not self._closing.is_set()
+        )
 
     def _start_resync(self, market: _Market) -> None:
         if market.task is None and self._group is not None and self._can_resync(market):
@@ -461,35 +609,57 @@ class RealtimeMarketFeed:
                 request = market.wanted
                 started_at = market.topic.stamp()
                 market.last_start = self._clock()
+                requested_epoch = self._wall_epoch()
                 try:
                     snapshot = await self._rest.get_market_orderbook(
                         market.market_id, depth=self._policy.snapshot_depth
                     )
+                    if self._closing.is_set():
+                        break  # closing began while the read was in flight
                     changed = market.topic.apply_snapshot(
                         snapshot.tournament_orderbook().exchanges,
                         depth=self._policy.snapshot_depth,
                         started_at=started_at,
+                        now_epoch=self._wall_epoch(),
+                        requested_epoch=requested_epoch,
+                        skew_margin=self._skew_margin,
                     )
                 except _PERMANENT:
                     raise
                 except (SigClientError, SnapshotError) as exc:
+                    floor = _server_wait(exc) if isinstance(exc, SigClientError) else None
+                    wait = max(delay, floor or 0.0)
                     logger.warning(
                         "realtime market %s resync failed (%s); retrying in %.1fs",
                         market.market_id,
                         type(exc).__name__,
-                        delay,
+                        wait,
                     )
-                    await self._sleep(delay)
+                    await self._sleep(wait)
                     delay = min(delay * 2, self._policy.max_retry_s)
                     continue
                 delay = self._policy.resync_retry_s
+                market.done = request
+                self._note_token_expiry()
+                if market.topic.has_expired_book(self._wall_epoch()):
+                    # The read was older than the expired book it had to replace.
+                    self._want_resync(market, StaleReason.BOOK_EXPIRY)
                 for book in changed:
                     self._emit(BookUpdated(market.market_id, book))
-                market.done = request
-                if market.wanted == request and market.subscribed and not self._token_expired:
-                    market.ready = True
-                    logger.info("realtime market %s ready", market.market_id)
-                    self._emit(MarketReady(market.market_id))
+                if market.wanted != request or not market.subscribed or not self._token_valid():
+                    continue
+                if market.blockers:
+                    logger.warning(
+                        "realtime market %s stays not ready: needs %s",
+                        market.market_id,
+                        ", ".join(sorted(market.blockers)),
+                    )
+                    continue
+                if self._closing.is_set():
+                    break
+                market.ready = True
+                logger.info("realtime market %s ready", market.market_id)
+                self._emit(MarketReady(market.market_id))
         finally:
             market.task = None
 
@@ -510,8 +680,10 @@ class RealtimeMarketFeed:
             except _PERMANENT:
                 raise
             except SigClientError as exc:
-                logger.warning("realtime token mint failed: %s; retrying in %.0fs", exc, delay)
-                await self._sleep(delay)
+                # SIG's Retry-After is a floor; the backoff cap never shortens it.
+                wait = max(delay, _server_wait(exc) or 0.0)
+                logger.warning("realtime token mint failed: %s; retrying in %.0fs", exc, wait)
+                await self._sleep(wait)
                 delay = min(delay * 2, self._policy.max_retry_s)
 
     def _lifetime(self, credentials: RealtimeCredentials) -> float:
@@ -558,24 +730,29 @@ class RealtimeMarketFeed:
             await self._sleep(self._policy.tick_s)
             self._tick()
 
-    def _tick(self) -> None:
-        now = self._clock()
+    def _note_token_expiry(self) -> None:
+        """Withdraw readiness everywhere once the token's lifetime has run out."""
         if (
             self._expires_mono is not None
-            and now >= self._expires_mono
+            and self._clock() >= self._expires_mono
             and not self._token_expired
         ):
             self._token_expired = True
             logger.warning("realtime token expired before it was refreshed")
             for market in self._markets.values():
                 self._want_resync(market, StaleReason.TOKEN_EXPIRED)
+
+    def _tick(self) -> None:
+        if self._closing.is_set():
+            return
+        self._note_token_expiry()
         if (
             self._refresh_mono is not None
-            and now >= self._refresh_mono
+            and self._clock() >= self._refresh_mono
             and self._refresh_task is None
         ):
             self._refresh_task = self._spawn(self._refresh())
-        wall = epoch_seconds(self._wall_clock())
+        wall = self._wall_epoch()
         for market in self._markets.values():
             if market.topic.take_due_expiry(wall):
                 self._want_resync(market, StaleReason.BOOK_EXPIRY)
