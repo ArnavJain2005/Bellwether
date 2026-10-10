@@ -1,12 +1,15 @@
-"""Bounded, read-only SIG fixture recorder (S1-T4-A).
+"""Bounded, read-only SIG fixture recorder (S1-T4-A; market detail and trades S1-T3-B-B).
 
     python -m engine.sig_client.record_fixtures --help
 
 Without `--capture` the command only prints the planned reads and output paths. It reads
 no credentials, creates no files and sends no requests. With `--capture` it records one
-small, bounded sample of the six GET routes SigRestClient implements, through that
-client, into a new local run directory. RECORDER.md (next to this file) describes the
-capture format and the review required before any capture becomes a committed fixture.
+small, bounded sample of six GET routes SigRestClient implements, through that client,
+into a new local run directory. Two more routes are read only on explicit request:
+GET /markets/{id} (`--include-market-detail`) and GET /exchanges/{id}/trades
+(`--include-trades`, over a fixed from/to window). RECORDER.md (next to this file)
+describes the capture format and the review required before any capture becomes a
+committed fixture.
 
 How responses are observed. rest.py is not modified. The recorder builds the httpx
 client with the same settings as SigRestClient.create (per-phase timeout,
@@ -18,9 +21,10 @@ follow_redirects=False, trust_env=False), wraps its transport, and adds two hook
   inside the client's send(), so the read stays under the client's read deadline.
 - The request hook runs before anything is sent. It refuses every request that is not a
   GET to one of the planned paths under the configured base URL, every scoped read whose
-  `tournamentId` is not the configured tournament, any URL holding the active
-  credential, and every request at all once SIG has answered 429 in this run. It reads
-  the method and URL only, never headers.
+  `tournamentId` is not the configured tournament, a trade-tape read without exactly the
+  planned `from`, `to` and `limit`, any URL holding the active credential, and every
+  request at all once SIG has answered 429 in this run. It reads the method and URL
+  only, never headers.
 - The response hook keeps the status, allowlisted headers and (for 2xx only) the
   already bounded, decoded body bytes in memory, and notes any 429. Bodies are written
   after the client call returns or fails, and only after the credential check.
@@ -34,6 +38,14 @@ and nothing else here. A body, kept header, cursor or URL holding the key, as ra
 or in any decoded JSON key or string (so escaped forms count), is never written. The
 step fails with a fixed message and the run stops with a nonzero result. Every manifest
 string is checked again before it is written.
+
+Trade tape. Each page goes through the client's page method and its validation. The
+recorder follows `nextCursor` up to the page cap and records, per tape, the cursor sent
+for every page read and the last `nextCursor`, so the chain can be replayed exactly. A
+stop at the cap is `truncated`, never `complete`. Each page's `coverage` is kept with
+that page. `complete` means only that the walk reached `hasMore: false`: it says nothing
+about whether SIG's reporting projection has caught up with the trading engine, and the
+manifest says so (`projection_freshness: unknown`).
 """
 
 from __future__ import annotations
@@ -83,6 +95,7 @@ from engine.sig_client.errors import (
     known_code,
 )
 from engine.sig_client.rate_limiter import Clock, RateLimiter, RequestKind, Sleep
+from engine.sig_client.realtime_wire import parse_instant
 from engine.sig_client.rest import (
     MARKET_STATUSES,
     MARKETS_PAGE_MAX,
@@ -90,6 +103,7 @@ from engine.sig_client.rest import (
     ReadRetryPolicy,
     SigRestClient,
 )
+from engine.sig_client.wire import ExchangeTradesPage, TradeCoverage
 
 CAPTURE_FORMAT = "bellwether.sig-capture/1"
 RECORDER_VERSION = "1"
@@ -107,6 +121,8 @@ ORDERS_LIMIT_MAX = 50
 DEFAULT_ORDERS_LIMIT = 10
 DEPTH_MAX = 20
 DEFAULT_DEPTH = 5
+TRADES_LIMIT_MAX = 50
+DEFAULT_TRADES_LIMIT = 10
 # The recorder's limiter is its own: it cannot see the bot or any other client of the
 # same account and coordinates nothing with them. Capture standalone, with every other
 # same-account client stopped. A burst of 1 spaces reads evenly (one every 4 s); with a
@@ -133,16 +149,40 @@ CREDENTIAL_REASON = (
     "stopped. Treat the key as exposed and review the run before anything else."
 )
 WITHHELD = "<withheld: matched the active credential>"
+PROJECTION_NOTE = (
+    "complete means only that the cursor walk reached hasMore false for this window. "
+    "It does not show that SIG's reporting projection has caught up with the trading "
+    "engine; coverage is kept per page exactly as sent, and projectedThroughSequence is "
+    "not compared with anything."
+)
 
 _NUMERIC_ID = re.compile(r"[0-9]{1,20}")
+# The instant format the client sends (UTC, whole milliseconds).
+_INSTANT_VALUE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z")
+# Command-line instants: extended ISO-8601 with an explicit offset; no dates alone.
+_INSTANT_ARG = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,6})?(Z|[+-][0-9]{2}:[0-9]{2})"
+)
 _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 _MEDIA_TYPE = re.compile(r"[a-z0-9][a-z0-9!#$&^_.+-]{0,63}/[a-z0-9][a-z0-9!#$&^_.+-]{0,63}")
 _DELTA_SECONDS = re.compile(r"[0-9]{1,15}(\.[0-9]{1,9})?")
 _CURSOR_VALUE = re.compile(r"[\x21-\x7e]{1,512}")
 _PARAM_VALUE = re.compile(r"[A-Za-z0-9,_-]{1,2200}")
 _SAFE_PARAM_NAMES = frozenset(
-    {"cursor", "depth", "exchangeId", "ids", "limit", "marketId", "status", "tournamentId"}
+    {
+        "cursor",
+        "depth",
+        "exchangeId",
+        "from",
+        "ids",
+        "limit",
+        "marketId",
+        "status",
+        "to",
+        "tournamentId",
+    }
 )
+_PARAM_PATTERNS = {"cursor": _CURSOR_VALUE, "from": _INSTANT_VALUE, "to": _INSTANT_VALUE}
 
 Now = Callable[[], datetime]
 
@@ -274,9 +314,41 @@ def _check_choice(name: str, value: object, choices: frozenset[str]) -> str:
     return value  # type: ignore[return-value]
 
 
+def _check_instant(name: str, value: object) -> datetime:
+    """A timezone-aware datetime in whole milliseconds, returned in UTC."""
+    if not isinstance(value, datetime) or value.utcoffset() is None:
+        raise RecorderArgumentError(f"{name} must be a timezone-aware datetime")
+    try:
+        moment = value.astimezone(UTC)
+    except (OverflowError, ValueError):
+        raise RecorderArgumentError(f"{name} is out of range in UTC") from None
+    if moment.microsecond % 1000:
+        raise RecorderArgumentError(f"{name} must be a whole number of milliseconds")
+    return moment
+
+
+def parse_instant_arg(name: str, text: str) -> datetime:
+    """A command-line instant, e.g. 2026-10-01T00:00:00.000Z. Never echoes the text."""
+    if not isinstance(text, str) or not _INSTANT_ARG.fullmatch(text):
+        raise RecorderArgumentError(
+            f"{name} must be an ISO-8601 date and time with an offset, "
+            "e.g. 2026-10-01T00:00:00.000Z"
+        )
+    try:
+        moment = datetime.fromisoformat(text)  # 3.11+ accepts "Z"
+    except ValueError:
+        raise RecorderArgumentError(f"{name} is not a valid date and time") from None
+    return _check_instant(name, moment)
+
+
 @dataclass(frozen=True)
 class CapturePlan:
-    """What one run reads. Every field is validated before any request is possible."""
+    """What one run reads. Every field is validated before any request is possible.
+
+    Market detail and the trade tape are off unless requested. The trade tape needs an
+    explicit window, `trades_from` (inclusive) to `trades_to` (exclusive), so every page
+    asks for the same fixed range instead of SIG's moving default of "now".
+    """
 
     tournament: TournamentRef
     exchange_ids: tuple[str, ...]
@@ -290,6 +362,12 @@ class CapturePlan:
     orders_page_limit: int = DEFAULT_ORDERS_LIMIT
     orders_max_pages: int = DEFAULT_PAGES
     depth: int = DEFAULT_DEPTH
+    include_market_detail: bool = False
+    include_trades: bool = False
+    trades_from: datetime | None = None
+    trades_to: datetime | None = None
+    trades_page_limit: int = DEFAULT_TRADES_LIMIT
+    trades_max_pages: int = DEFAULT_PAGES
 
     def __post_init__(self) -> None:
         if not isinstance(self.tournament, TournamentRef):
@@ -308,17 +386,39 @@ class CapturePlan:
         _check_int("orders page limit", self.orders_page_limit, 1, ORDERS_LIMIT_MAX)
         _check_int("orders max pages", self.orders_max_pages, 1, MAX_PAGES)
         _check_int("depth", self.depth, 1, DEPTH_MAX)
+        for name in ("include_market_detail", "include_trades"):
+            if not isinstance(getattr(self, name), bool):
+                raise RecorderArgumentError(f"{name} must be a bool")
+        _check_int("trades page limit", self.trades_page_limit, 1, TRADES_LIMIT_MAX)
+        _check_int("trades max pages", self.trades_max_pages, 1, MAX_PAGES)
+        if not self.include_trades:
+            if self.trades_from is not None or self.trades_to is not None:
+                raise RecorderArgumentError("a trades window needs include_trades")
+            return
+        if self.trades_from is None or self.trades_to is None:
+            raise RecorderArgumentError("include_trades needs both trades_from and trades_to")
+        start = _check_instant("trades_from", self.trades_from)
+        end = _check_instant("trades_to", self.trades_to)
+        if start >= end:
+            raise RecorderArgumentError("trades_from must be earlier than trades_to")
+        set_("trades_from", start)
+        set_("trades_to", end)
 
 
 @dataclass(frozen=True)
 class PlannedRead:
-    """One planned GET. A paginated read may run up to `max_pages` pages."""
+    """One planned GET. A paginated read may run up to `max_pages` pages.
+
+    `pinned` names parameters the request hook requires exactly as planned, once each.
+    """
 
     name: str
     route: str
     path: str
     params: Mapping[str, str]
     max_pages: int = 1
+    paginated: bool = False
+    pinned: tuple[str, ...] = ()
 
     def as_manifest(self) -> dict[str, Any]:
         return {
@@ -343,6 +443,7 @@ def planned_reads(plan: CapturePlan) -> list[PlannedRead]:
             f"/tournaments/{slug}/markets",
             {"limit": str(plan.markets_page_limit), "status": plan.markets_status},
             max_pages=plan.markets_max_pages,
+            paginated=True,
         ),
         PlannedRead(
             "exchange-prices",
@@ -381,8 +482,41 @@ def planned_reads(plan: CapturePlan) -> list[PlannedRead]:
                     "tournamentId": tid,
                 },
                 max_pages=plan.orders_max_pages,
+                paginated=True,
             )
         )
+    # Opt-in reads come last, so a default run's steps and body names never move.
+    if plan.include_market_detail:
+        reads += [
+            PlannedRead(
+                f"market-detail-{market_id}",
+                "GET /markets/{id}",
+                f"/markets/{market_id}",
+                {"tournamentId": tid},
+            )
+            for market_id in plan.market_ids
+        ]
+    if plan.include_trades:
+        assert plan.trades_from is not None and plan.trades_to is not None  # plan-checked
+        # In the order the client sends them; `cursor` is added on later pages.
+        window = {
+            "tournamentId": tid,
+            "limit": str(plan.trades_page_limit),
+            "from": _stamp(plan.trades_from),
+            "to": _stamp(plan.trades_to),
+        }
+        reads += [
+            PlannedRead(
+                f"exchange-trades-{exchange_id}",
+                "GET /exchanges/{id}/trades",
+                f"/exchanges/{exchange_id}/trades",
+                window,
+                max_pages=plan.trades_max_pages,
+                paginated=True,
+                pinned=("limit", "from", "to"),
+            )
+            for exchange_id in plan.exchange_ids
+        ]
     return reads
 
 
@@ -401,15 +535,27 @@ def render_preview(plan: CapturePlan, *, base_url: str = SIG_BASE_URL) -> str:
         "Planned GET requests, in order:",
     ]
     for number, read in enumerate(reads, 1):
-        query = f"?{urlencode(dict(read.params))}" if read.params else ""
+        query = f"?{urlencode(dict(read.params), safe=':')}" if read.params else ""
         line = f"  {number:2d}. GET {read.path}{query}"
         if read.max_pages > 1:
             line += f"  (up to {read.max_pages} pages; later pages add cursor=<nextCursor>)"
-        elif read.name in ("tournament-markets", "orders"):
+        elif read.paginated:
             line += "  (1 page only; a longer collection is recorded as truncated)"
         lines.append(line)
     if not plan.include_orders:
         lines.append("  (GET /orders skipped: --skip-orders)")
+    if plan.include_trades:
+        assert plan.trades_from is not None and plan.trades_to is not None  # plan-checked
+        lines += [
+            "",
+            (
+                f"Trade window (fixed, UTC): from {_stamp(plan.trades_from)} (inclusive) "
+                f"to {_stamp(plan.trades_to)} (exclusive)."
+            ),
+            "Every trades page asks for this same window, which must not end after the",
+            "capture starts. Coverage is kept per page; a complete cursor walk does not",
+            "show that SIG's reporting projection has caught up with the trading engine.",
+        ]
     lines += [
         "",
         (
@@ -443,7 +589,7 @@ def _safe_params(url: httpx.URL) -> tuple[dict[str, str], int]:
     kept: dict[str, str] = {}
     omitted = 0
     for name, value in url.params.multi_items():
-        pattern = _CURSOR_VALUE if name == "cursor" else _PARAM_VALUE
+        pattern = _PARAM_PATTERNS.get(name, _PARAM_VALUE)
         if name in _SAFE_PARAM_NAMES and name not in kept and pattern.fullmatch(value):
             kept[name] = value
         else:
@@ -652,7 +798,7 @@ class _Observer:
         self._origin = (base.scheme, base.host, base.port)
         self._prefix = base.path.rstrip("/")
         self._tournament_id = config.tournament.id
-        self._paths = {read.path: "tournamentId" in read.params for read in reads}
+        self._paths = {read.path: read for read in reads}
         self._now = now
         self._guard = guard
         self.current: _Step | None = None
@@ -681,10 +827,14 @@ class _Observer:
         path = url.path[len(self._prefix) :]
         if request.method != "GET":
             raise self._refuse("the recorder sends GET requests only")
-        if path not in self._paths:
+        read = self._paths.get(path)
+        if read is None:
             raise self._refuse("request path is not one of the planned reads")
-        if self._paths[path] and url.params.get_list("tournamentId") != [self._tournament_id]:
+        scoped = "tournamentId" in read.params
+        if scoped and url.params.get_list("tournamentId") != [self._tournament_id]:
             raise self._refuse("scoped read without exactly the configured tournamentId")
+        if any(url.params.get_list(name) != [read.params[name]] for name in read.pinned):
+            raise self._refuse("read without exactly the planned limit and from/to window")
         step = self.current
         if step is None:
             raise self._refuse("request outside a recording step")
@@ -837,6 +987,64 @@ class _StopRun(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+# --- pages and the trade tape -----------------------------------------------------------
+
+
+def _describe_page(page: Any) -> dict[str, Any]:
+    return {
+        "items": len(page.data),
+        "has_more": page.pagination.hasMore,
+        "next_cursor_present": page.pagination.nextCursor is not None,
+    }
+
+
+def _coverage_info(coverage: TradeCoverage | None) -> dict[str, Any]:
+    """One page's `coverage`, as sent. `present: false` means SIG omitted it."""
+    if coverage is None:
+        return {"present": False}
+    return {
+        "present": True,
+        "complete": coverage.complete,
+        "projectedThroughSequence": coverage.projectedThroughSequence,
+    }
+
+
+def _describe_trades_page(page: ExchangeTradesPage) -> dict[str, Any]:
+    return {**_describe_page(page), "coverage": _coverage_info(page.coverage)}
+
+
+class _TradeTape:
+    """Recorder-side checks across the pages of one exchange's trade tape.
+
+    The client checks each page on its own (exchange, echoed window, order, coverage);
+    the page method compares nothing across pages. These checks only label the sample:
+    a failure is an anomaly that ends the walk. They never change what the client
+    accepts. Market ids and trade ids are response data and are not repeated.
+    """
+
+    def __init__(self) -> None:
+        self._market_id: str | None = None
+        self._trade_ids: set[str] = set()
+        self._oldest: Decimal | None = None
+
+    def check(self, page: ExchangeTradesPage) -> str | None:
+        if self._market_id is None:
+            self._market_id = page.marketId
+        elif page.marketId != self._market_id:
+            return "a trades page reports a different market"
+        ids = [trade.id for trade in page.data]
+        if len(set(ids)) != len(ids) or not self._trade_ids.isdisjoint(ids):
+            return "a trade id appeared more than once in the tape"
+        if page.data:
+            # The client parsed every createdAt on this page before returning it.
+            newest = parse_instant(page.data[0].createdAt)
+            if self._oldest is not None and newest > self._oldest:
+                return "a trades page holds trades newer than the previous page's"
+            self._oldest = parse_instant(page.data[-1].createdAt)
+        self._trade_ids.update(ids)
+        return None
 
 
 # --- files ------------------------------------------------------------------------------
@@ -1074,6 +1282,12 @@ class _Recorder:
                 "orders_page_limit": plan.orders_page_limit,
                 "orders_max_pages": plan.orders_max_pages,
                 "depth": plan.depth,
+                "include_market_detail": plan.include_market_detail,
+                "include_trades": plan.include_trades,
+                "trades_from": None if plan.trades_from is None else _stamp(plan.trades_from),
+                "trades_to": None if plan.trades_to is None else _stamp(plan.trades_to),
+                "trades_page_limit": plan.trades_page_limit,
+                "trades_max_pages": plan.trades_max_pages,
             },
             "limits": {
                 "recorder_read_limit_per_minute": RECORDER_READ_LIMIT,
@@ -1249,7 +1463,11 @@ class _Recorder:
         key: str,
         read: PlannedRead,
         fetch: Callable[[str | None], Awaitable[Any]],
+        tape: _TradeTape | None = None,
     ) -> None:
+        """Follow `nextCursor` up to the page cap. With `tape`, also record the trade
+        tape's cursor chain and per-page coverage, and check the pages against each
+        other."""
         summary: dict[str, Any] = {
             "max_pages": read.max_pages,
             "pages_fetched": 0,
@@ -1257,6 +1475,19 @@ class _Recorder:
             "truncated": False,
             "note": None,
         }
+        if tape is not None:
+            summary.update(
+                {
+                    # The cursor sent for each page read, in order (None: the first).
+                    "cursor_chain": [],
+                    # nextCursor of the last page read: None once hasMore is false; at
+                    # the page cap, the cursor that was not followed.
+                    "last_next_cursor": None,
+                    "coverage_per_page": [],
+                    "projection_freshness": "unknown",
+                    "projection_note": PROJECTION_NOTE,
+                }
+            )
         self._collections[key] = summary
         seen: set[str] = set()
         cursor: str | None = None
@@ -1270,11 +1501,7 @@ class _Recorder:
                     read,
                     params,
                     functools.partial(fetch, cursor),
-                    describe=lambda page: {
-                        "items": len(page.data),
-                        "has_more": page.pagination.hasMore,
-                        "next_cursor_present": page.pagination.nextCursor is not None,
-                    },
+                    describe=_describe_page if tape is None else _describe_trades_page,
                 )
             except _StopRun:
                 summary["note"] = f"page {number} failed and the run stopped: incomplete"
@@ -1285,6 +1512,10 @@ class _Recorder:
             summary["pages_fetched"] = number
             has_more = page.pagination.hasMore
             next_cursor = page.pagination.nextCursor
+            if tape is not None:
+                summary["cursor_chain"].append(cursor)
+                summary["last_next_cursor"] = None  # set below only once it is checked
+                summary["coverage_per_page"].append(_coverage_info(page.coverage))
             anomaly = None
             if not has_more and next_cursor is not None:
                 anomaly = "hasMore is false but nextCursor is set"
@@ -1292,6 +1523,8 @@ class _Recorder:
                 anomaly = "hasMore is true but nextCursor is null"
             elif has_more and next_cursor in seen:
                 anomaly = "SIG repeated a pagination cursor"
+            elif tape is not None:
+                anomaly = tape.check(page)
             if anomaly is not None:
                 summary["note"] = anomaly
                 self._anomalies.append(f"{key} page {number}: {anomaly}")
@@ -1304,6 +1537,8 @@ class _Recorder:
                 self._credential_found = True
                 summary["note"] = "the next cursor held the active credential: not sent"
                 raise _StopRun(CREDENTIAL_REASON)
+            if tape is not None:
+                summary["last_next_cursor"] = next_cursor  # checked just above
             seen.add(next_cursor)
             cursor = next_cursor
         summary["truncated"] = True
@@ -1360,6 +1595,38 @@ class _Recorder:
                     status=plan.orders_status, limit=plan.orders_page_limit, cursor=cursor
                 ),
             )
+        if plan.include_market_detail:
+            for market_id in plan.market_ids:
+                read = reads[f"market-detail-{market_id}"]
+                await self._step(
+                    read.name,
+                    read,
+                    read.params,
+                    functools.partial(client.get_market, market_id),
+                )
+        if plan.include_trades:
+            for exchange_id in plan.exchange_ids:
+                await self._paginate(
+                    f"exchange_trades_{exchange_id}",
+                    reads[f"exchange-trades-{exchange_id}"],
+                    self._trades_fetch(exchange_id),
+                    tape=_TradeTape(),
+                )
+
+    def _trades_fetch(self, exchange_id: str) -> Callable[[str | None], Awaitable[Any]]:
+        """One trades page of the planned, fixed window through the client's page method."""
+        plan = self._plan
+
+        def fetch(cursor: str | None) -> Awaitable[ExchangeTradesPage]:
+            return self._client.list_exchange_trades_page(
+                exchange_id,
+                since=plan.trades_from,
+                until=plan.trades_to,
+                limit=plan.trades_page_limit,
+                cursor=cursor,
+            )
+
+        return fetch
 
     def _final_status(self) -> str:
         failed = any(step.outcome != "passed" for step in self._steps)
@@ -1437,11 +1704,15 @@ async def record(
     With `transport` left as None the run talks to `config.base_url` and is labelled a
     genuine recording. Any injected transport makes the run "synthetic", whatever it
     serves, so a test can never produce a capture labelled as recorded.
-    `max_body_bytes` may only lower the decoded body limit.
+    `max_body_bytes` may only lower the decoded body limit. A trades window must not end
+    after `now()`: a window reaching into the future is not a fixed tape, since trades
+    could still arrive while its pages are read.
     """
     if plan.tournament != config.tournament:
         raise RecorderArgumentError("the plan and the config name different tournaments")
     _check_int("max_body_bytes", max_body_bytes, 1, MAX_BODY_BYTES)
+    if plan.trades_to is not None and plan.trades_to > now():
+        raise RecorderArgumentError("the trades window must not end after the capture starts")
     if run_id is None:
         run_id = _new_run_id(now)
     elif not isinstance(run_id, str) or not _RUN_ID.fullmatch(run_id):
@@ -1577,6 +1848,35 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"orderbook levels per side, 1-{DEPTH_MAX} (default {DEFAULT_DEPTH})",
     )
     parser.add_argument(
+        "--include-market-detail",
+        action="store_true",
+        help="also read GET /markets/{id} for every --market-id (off by default)",
+    )
+    parser.add_argument(
+        "--include-trades",
+        action="store_true",
+        help=(
+            "also read GET /exchanges/{id}/trades for every --exchange-id (off by default; "
+            "needs --trades-from and --trades-to)"
+        ),
+    )
+    parser.add_argument(
+        "--trades-from", metavar="ISO-8601",
+        help="trade window start, inclusive, with an offset, e.g. 2026-10-01T00:00:00.000Z",
+    )
+    parser.add_argument(
+        "--trades-to", metavar="ISO-8601",
+        help="trade window end, exclusive, whole milliseconds; not after the capture starts",
+    )
+    parser.add_argument(
+        "--trades-page-limit", type=int, default=DEFAULT_TRADES_LIMIT,
+        help=f"trades per page, 1-{TRADES_LIMIT_MAX} (default {DEFAULT_TRADES_LIMIT})",
+    )
+    parser.add_argument(
+        "--trades-max-pages", type=int, default=DEFAULT_PAGES,
+        help=f"trades pages per exchange, 1-{MAX_PAGES} (default {DEFAULT_PAGES})",
+    )
+    parser.add_argument(
         "--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT,
         help=f"parent of the per-run directory (default {DEFAULT_OUTPUT_ROOT}/)",
     )
@@ -1589,6 +1889,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def plan_from_args(args: argparse.Namespace) -> CapturePlan:
+    # Parsed here, not by argparse, so a rejected value is never echoed.
+    def instant(name: str, text: str | None) -> datetime | None:
+        return None if text is None else parse_instant_arg(name, text)
+
     return CapturePlan(
         tournament=TournamentRef(slug=args.tournament_slug, id=args.tournament_id),
         exchange_ids=tuple(args.exchange_id),
@@ -1602,6 +1906,12 @@ def plan_from_args(args: argparse.Namespace) -> CapturePlan:
         orders_page_limit=args.orders_page_limit,
         orders_max_pages=args.orders_max_pages,
         depth=args.depth,
+        include_market_detail=args.include_market_detail,
+        include_trades=args.include_trades,
+        trades_from=instant("--trades-from", args.trades_from),
+        trades_to=instant("--trades-to", args.trades_to),
+        trades_page_limit=args.trades_page_limit,
+        trades_max_pages=args.trades_max_pages,
     )
 
 
@@ -1622,6 +1932,8 @@ def render_summary(result: RunResult) -> str:
         lines.append(f"  -- {name:<32} not run")
     for key, summary in manifest["collections"].items():
         state = "complete" if summary["complete"] else "NOT complete"
+        if "projection_freshness" in summary:
+            state += " (pagination only; projection freshness unknown)"
         note = f": {summary['note']}" if summary["note"] else ""
         lines.append(f"Collection {key}: {summary['pages_fetched']} page(s), {state}{note}")
     if result.stop_reason:
