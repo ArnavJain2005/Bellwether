@@ -61,20 +61,25 @@ A market is kept only with affirmative evidence of a **2026 U.S. Senate, House, 
 | --- | --- | --- |
 | 1 | Market is strictly open/active (Polymarket `closed` is exactly `False`, `active` is exactly `True`; Kalshi status `open`/`active`) | `market_closed`, `market_inactive` |
 | 2 | Not a resignation, appointment, confirmation, nomination, impeachment, retirement, or unrelated event | `unrelated_political_event` |
-| 3 | No foreign country/demonym or foreign political entity in the identity text (U.S. state names masked first). Foreign elections such as foreign parliament elections are excluded. If U.S. evidence is also present, the subject is contradictory | `foreign_election`, `conflicting_jurisdiction` |
-| 4 | Not a state legislature contest ("state senate", "state house", "legislature", ...) | `state_legislative_contest` |
-| 5 | At most one U.S. state named (multi-state comparisons such as "Florida or South Carolina" are classified as `other` or rejected if multi-seat) | `conflicting_state_context` |
-| 6 | Primary identity names no year other than 2026. Any conflicting primary year (e.g. 2028 or 2024) is rejected | `non_2026_primary_contest` |
-| 7 | Explicit 2026 election cycle evidence present (from question/slug/parent event for Polymarket, or title/year-bearing symbol for Kalshi) | `lacks_2026_contest_year` |
-| 8 | An office (Senate, House, governor, Congress) and contest term (win, election, race, seat, control, majority, midterm, balance of power), or a recognised structured symbol | `lacks_election_evidence` |
-| 9 | Positive U.S. jurisdiction or cycle evidence | `lacks_us_jurisdiction`, `ambiguous_jurisdiction` |
+| 3 | Not a Lieutenant Governor contest ("lieutenant governor", "lt. governor", "ltgov", ...) | `lieutenant_governor_contest` |
+| 4 | No foreign country/demonym or foreign political entity in the identity text (U.S. state names masked first). Foreign elections such as foreign parliament elections are excluded. If U.S. evidence is also present, the subject is contradictory | `foreign_election`, `conflicting_jurisdiction` |
+| 5 | Not a state legislature contest ("state senate", "state house", "legislature", state supermajority, ...) | `state_legislative_contest` |
+| 6 | At most one U.S. state named (multi-state comparisons such as "Florida or South Carolina" are classified as `other` or rejected if multi-seat) | `conflicting_state_context` |
+| 7 | Primary identity names no year other than 2026. Any conflicting primary year (e.g. 2028 or 2024) is rejected | `non_2026_primary_contest` |
+| 8 | Explicit 2026 election cycle evidence present (from question/slug/parent event for Polymarket, or title/year-bearing symbol for Kalshi) | `lacks_2026_contest_year` |
+| 9 | An office (Senate, House, governor, Congress) and contest term (win, election, race, seat, control, majority, midterm, balance of power), or a recognised structured symbol | `lacks_election_evidence` |
+| 10 | Positive U.S. jurisdiction or cycle evidence | `lacks_us_jurisdiction`, `ambiguous_jurisdiction` |
 
 **Election-Cycle & Jurisdiction Evidence:**
 - Explicit 2026 election cycle evidence is strictly required for all markets. A numeric tag ID (`tag_id=102289`) or recognized Kalshi series alone must **not** establish the year 2026.
-- For Polymarket, 2026 evidence must be established from relevant market or parent-event identity text (question, market slug, parent event title, parent event slug). Source tag context (`tag_id=102289`) establishes U.S. jurisdiction when explicitly supplied by the fetcher, but does not waive the requirement for explicit 2026 cycle evidence.
+- For Polymarket, 2026 evidence must be established from relevant market or parent-event identity text (question, market slug, parent event title, parent event slug). Source tag context (`tag_id=102289`) establishes U.S. jurisdiction when explicitly supplied by the fetcher, but does not waive the requirement for explicit 2026 cycle evidence. Note that Polymarket currently scans one selected Gamma tag (`tag_id=102289`); tag traversal yields tag-filtered results and does not claim complete coverage of all 2026 election markets across Polymarket.
 - For Kalshi, recognized structured symbols establish office and U.S. jurisdiction, but 2026 cycle evidence is strictly required from relevant titles or recognized year-bearing market/event symbols. Arbitrary numeric suffixes, district numbers, and ambiguous components in a ticker must not establish a year. A cycle year is only extracted from a valid position following a recognized prefix.
+- State-specific contest evidence takes precedence over broad chamber-control phrasing (e.g. "win the Senate" in Wyoming is classified as `senate`, not `control`). Genuine national control is reserved for chamber-level series (`CONTROLS`, `CONTROLH`).
+- State extraction uses anchored, boundary-validated parsing so symbol substrings such as `WITHIN` in `KXSENATEWITHIN5` never falsely fabricate a state (like Wisconsin). If evidence is insufficient, state extraction returns unknown (`None`).
 - Georgia and Washington count as valid U.S. states whenever the text names a Senate, governor, or House race, unless a foreign term is present. Country parliamentary elections (e.g. Georgia parliamentary election) remain excluded under `foreign_election`.
-- Kept markets are classified as `senate`, `house`, `governor`, `control`, or `other` (seat counts, balance-of-power combos) using the parent event title as well as the question, and labeled with `race_type`.
+- Kept markets are classified as `senate`, `house`, `governor`, `control`, or `other` (seat counts, balance-of-power combos) using parent event context (`event_title`) and questions/titles. Saved Kalshi records retain `event_title` to guarantee fetch-time and validation-time classifications agree.
+- Candidate and outcome labels (`yes_sub_title`, candidate `subtitle`) never establish jurisdiction or the election cycle, even when a label is exactly a state name or abbreviation (e.g. Washington). State extraction uses structured contest symbols and market/parent-event contest context. The targeted exclusion of Lieutenant Governor primary-office subtitles remains in place.
+- Explicit U.S., United States, or federal Senate/House wording identifies federal seat-count contracts without requiring the particular phrase "in the U.S. Senate" or "U.S. congressional elections". Explicit state-legislature wording and recognised state-legislature series remain excluded.
 
 **Recognised structured Kalshi symbols:** `CONTROLS`/`CONTROLH` and state-validated `SENATE<ST>`, `SENATEPARTY<ST>`, `GOV<ST>`/`GOVPARTY<ST>`, `HOUSE<ST><district|AL>` (optionally `KX`-prefixed, where `<ST>` is a real two-letter U.S. state code). Generic Kalshi SENATE/HOUSE/GOV prefixes are recognized by year extraction; they do not alone supply the office/jurisdiction evidence that the structured eligibility helper requires.
 
@@ -135,6 +140,7 @@ The output JSON file contains:
       "series_ticker": "CONTROLS",
       "title": "Will Democrats win the U.S. Senate in 2026?",
       "subtitle": "Democratic Party",
+      "event_title": "2026 U.S. Senate Elections",
       "snapshot_prices": {
         "is_snapshot": true,
         "yes_bid_dollars": "0.6200",
