@@ -39,6 +39,9 @@ recorded/<run id>/
   value, with these exceptions:
   - The original SHA-256 and size of each **redacted** body are omitted. They would let
     anyone verify guesses of the redacted values.
+  - A body that was captured but **not promoted** keeps its request and outcome, but its
+    hash and size are omitted too, and its body record carries `"promoted": false`.
+    `fixtures.json` lists it under `not_promoted`.
   - The capture manifest's own SHA-256 is not recorded anywhere, because it could verify a
     reconstruction.
   - Original hashes are kept only for bodies committed unmodified.
@@ -59,9 +62,10 @@ recorded/<run id>/
 
 Tests (`tests/sig_client/`):
 - `test_sig_recorded_integrity.py` checks every directory: fixture and provenance hashes,
-  sanitization, redaction placeholders, accounted-for hashes, and line endings.
-- `test_sig_recorded_replay.py` (capture `fa008a`) and `test_sig_recorded_replay_fb88c9.py`
-  serve the bodies through `SigRestClient` with `httpx.MockTransport` (helpers in
+  sanitization (including bodies not promoted), redaction placeholders, accounted-for
+  hashes, trade-tape collection records against the committed pages, and line endings.
+- `test_sig_recorded_replay.py` (capture `fa008a`), `test_sig_recorded_replay_fb88c9.py`
+  and `test_sig_recorded_replay_12ab20.py` serve the bodies through `SigRestClient` with `httpx.MockTransport` (helpers in
   `recorded_kit.py`). Each body is served only for its exact recorded path and query, so
   pages of one collection are told apart by their cursor.
 
@@ -150,14 +154,70 @@ The markets list also holds the three Independent-candidate markets and four mar
 `Freeform` category. `thumbnailUrl` appears on all 237 markets, and timestamps follow
 the same formats as in the first capture.
 
-### Coverage across both captures
+### `recorded/20261011T211201Z-12ab20/`
 
-- **Response envelopes:** all six endpoints the client uses: tournament, markets page,
-  bulk prices, exchange orderbook, market orderbook and orders. `/orders` is covered
-  only as an empty page.
+A read-only capture of 2026-10-11 (code `35f4552`, clean): the same tournament, exchange
+`947` and market `258`, depth 5, markets page limit 10 with one page, `--skip-orders`,
+`--include-market-detail`, and `--include-trades` over the fixed window
+`2026-10-01T00:00:00.000Z` (inclusive) to `2026-10-10T00:00:00.000Z` (exclusive), page
+limit 50, up to 3 pages. All nine reads passed. Five are committed:
+
+| Fixture | Endpoint | Label | Redacted paths |
+| --- | --- | --- | --- |
+| `01-tournament-a1.json` | `GET /tournaments/{slug}` | derived, redacted | `$.myBalance`, `$.isPendingEnrolment` |
+| `06-market-detail-258-a1.json` | `GET /markets/{id}` | derived, redacted | `$.creator.id`, `$.creator.username`, `$.thumbnailUrl` (shared segment) |
+| `07-exchange-trades-947-p1-a1.json` | `GET /exchanges/{id}/trades` (page 1) | unmodified | none |
+| `08-exchange-trades-947-p2-a1.json` | `GET /exchanges/{id}/trades` (page 2) | unmodified | none |
+| `09-exchange-trades-947-p3-a1.json` | `GET /exchanges/{id}/trades` (page 3) | unmodified | none |
+
+Steps 2–5 (markets page, prices, exchange book, market book) were captured but **not
+promoted**: the earlier captures already cover those endpoints. `source-provenance.json`
+keeps their requests and outcomes, without hash or size.
+
+**Market 258.** `06` names market `258` with `947` (`YES`) as its only exchange, and one
+`tournament` context with the configured slug and UUID. `thumbnailUrl` is a documented
+`Market` field (unlike on a markets page), so there is no observed extra field here.
+`latestPrice` is `0.945` both at the top level and in the context.
+
+**The trade tape is a truncated sample.** Three pages of 50 trades, every one with
+`hasMore: true`. Each page's `nextCursor` is exactly the cursor sent for the next page;
+the third page's `nextCursor` was **never followed** and is kept as `last_next_cursor`.
+The 150 trades are unique, newest first within and across pages, and lie between
+`2026-10-09T09:43:11.765Z` and `2026-10-09T22:33:16.692Z`, all inside the window. Nothing
+is known about older trades in the window. The replay tests serve exactly these three
+pages and check that `list_all_exchange_trades` raises at a three-page cap without a
+fourth request, and that a fourth request is refused rather than answered.
+
+Every trade has `id`, `createdAt`, `price`, `size`, `side` and `volume`, and no account
+or counterparty field. Prices are `0.94`, `0.945` or `0.95`; sizes are integers.
+
+**Observations, not client requirements:**
+- `volume` equals the side's price (`price` for YES, `1 - price` for NO) times `size`
+  computed in binary floating point, so some values carry float noise, for example
+  `0.7800000000000007`. The client keeps the exact decimal SIG sent; nothing should use
+  `volume` for accounting.
+- `coverage` was present on every page with `complete: true`, and
+  `projectedThroughSequence` differed between pages (`133949521`, `133950141`,
+  `133950511`). The values are kept as sent. They do not show that SIG's reporting
+  projection had caught up with the trading engine: **projection freshness is unknown.**
+
+Neither observation says anything about order or fill contracts.
+
+**Spec hash.** As for the earlier captures, the spec SHA-256 is of the CRLF checkout of
+`docs/api/openapi.json`; the committed LF blob has identical content.
+
+### Coverage across all three captures
+
+- **Response envelopes:** all eight read endpoints the client uses: tournament, markets
+  page, bulk prices, exchange orderbook, market orderbook, orders, market detail and the
+  exchange trade tape. `/orders` is covered only as an empty page.
+- **Trade items:** 150 recorded trades on one exchange over about 13 hours of one day,
+  including both sides and trades with equal timestamps (inside a page only).
 - **Pagination:** markets is covered in full (three pages, cursor chain, a final page
   with `hasMore: false`). For orders only a single final page was seen;
-  **orders cursor-following is not covered.**
+  **orders cursor-following is not covered.** For trades, cursor-following is covered
+  across three pages, but **no final trade page** (`hasMore: false`) was seen.
+- **Projection freshness:** unknown for every `coverage` object recorded.
 - **Item variants not seen** (coverage gaps, not extra acceptance requirements):
   - **any order item**, so the individual order shape is still checked only against
     synthetic fixtures;
@@ -166,4 +226,7 @@ the same formats as in the first capture.
   - markets with more than one exchange;
   - null `bestBid`, `bestAsk` or `spread`;
   - a non-empty `missingIds`;
-  - an empty book side.
+  - an empty book side;
+  - a trade with null `price` or `volume`, an empty trade page, an omitted trade
+    `coverage`, or a null `projectedThroughSequence`;
+  - a trade page boundary that splits equal timestamps.

@@ -28,10 +28,16 @@ from recorded_kit import (
 
 runs = pytest.mark.parametrize("run_dir", RUNS, ids=[r.name for r in RUNS])
 MARKETS_PAGE = re.compile(r"tournament-markets-p[0-9]+")
+MARKET_DETAIL = re.compile(r"market-detail-[0-9]+")
+TRADES_COLLECTION = re.compile(r"exchange_trades_([0-9]+)")
 
 
 def test_recorded_runs_are_the_reviewed_ones() -> None:
-    assert [r.name for r in RUNS] == ["20261009T122244Z-fa008a", "20261009T190027Z-fb88c9"]
+    assert [r.name for r in RUNS] == [
+        "20261009T122244Z-fa008a",
+        "20261009T190027Z-fb88c9",
+        "20261011T211201Z-12ab20",
+    ]
 
 
 @runs
@@ -66,7 +72,37 @@ def test_source_provenance_is_sanitized_and_labelled(run_dir: Path) -> None:
     assert source["not_run"] == []
     assert source["target"]["tournament"] == {"slug": TOURNAMENT.slug, "id": TOURNAMENT.id}
     steps = {s["index"]: s for s in source["steps"]}
-    assert sorted(f["source"]["capture_step"] for f in manifest["fixtures"]) == sorted(steps)
+    # Every captured step is either a committed fixture or listed as not promoted.
+    promoted = sorted(f["source"]["capture_step"] for f in manifest["fixtures"])
+    not_promoted = manifest.get("not_promoted", [])
+    held_back = sorted(n["capture_step"] for n in not_promoted)
+    assert sorted(promoted + held_back) == sorted(steps)
+    assert not set(promoted) & set(held_back)
+    sanitization = source["sanitization"]
+    if not_promoted:
+        assert sanitization["not_promoted"]["steps"] == held_back
+        assert sanitization["not_promoted"]["names"] == [n["name"] for n in not_promoted]
+    else:
+        assert "not_promoted" not in sanitization
+    committed = {p.relative_to(run_dir).as_posix() for p in (run_dir / "bodies").iterdir()}
+    for n in not_promoted:
+        step = steps[n["capture_step"]]
+        (attempt,) = step["attempts"]
+        assert step["name"] == n["name"] and step["outcome"] == "passed"
+        # Captured, but neither its bytes nor its original hash or size are committed.
+        assert attempt["body"]["promoted"] is False
+        assert attempt["body"]["omitted"] == ["sha256", "bytes"]
+        assert "sha256" not in attempt["body"] and "bytes" not in attempt["body"]
+        assert attempt["body"]["file"] not in committed
+    # The sanitization list names exactly the body hashes and sizes that were removed.
+    removed = [
+        f"$.steps[{i}].attempts[0].body.{field}"
+        for i, step in enumerate(source["steps"])
+        if "omitted" in step["attempts"][0]["body"]
+        for field in ("sha256", "bytes")
+    ]
+    assert sanitization["omitted"][0].startswith("manifest SHA-256")
+    assert sanitization["omitted"][1:] == removed
     for f in manifest["fixtures"]:
         step = steps[f["source"]["capture_step"]]
         (attempt,) = step["attempts"]
@@ -77,6 +113,7 @@ def test_source_provenance_is_sanitized_and_labelled(run_dir: Path) -> None:
         assert attempt["path"] == f["request"]["path"]
         assert attempt["params"] == f["request"]["params"]
         assert attempt["http_status"] == f["response"]["http_status"]
+        assert "promoted" not in attempt["body"]
         # ...but only unmodified fixtures keep the original hash, and equal it.
         if f["label"] == UNMODIFIED:
             assert f["redactions"] == []
@@ -114,7 +151,11 @@ def resolve(body: Any, path: str) -> Any:
 @runs
 def test_redactions_hold_their_documented_placeholders(run_dir: Path) -> None:
     for f in effective_manifest(run_dir)["fixtures"]:
-        redacted = f["name"] == "tournament" or MARKETS_PAGE.fullmatch(f["name"])
+        redacted = (
+            f["name"] == "tournament"
+            or MARKETS_PAGE.fullmatch(f["name"])
+            or MARKET_DETAIL.fullmatch(f["name"])
+        )
         assert f["label"] == (REDACTED if redacted else UNMODIFIED), f["name"]
         body = raw_body(run_dir, f["name"])
         for redaction in f["redactions"]:
@@ -130,10 +171,12 @@ def test_redactions_hold_their_documented_placeholders(run_dir: Path) -> None:
                 for i in range(len(body["data"]))
                 for field in ("creator.id", "creator.username", "thumbnailUrl")
             )
+        elif MARKET_DETAIL.fullmatch(f["name"]):
+            assert paths == ["$.creator.id", "$.creator.username", "$.thumbnailUrl"]
 
 
 @runs
-def test_markets_pages_keep_thumbnail_shape_with_placeholders(run_dir: Path) -> None:
+def test_markets_keep_thumbnail_shape_with_placeholders(run_dir: Path) -> None:
     shape = re.compile(
         r"https://r2\.thesuper\.market/market-thumbnails/"
         + re.escape(THUMBNAIL_SEGMENT)
@@ -141,15 +184,63 @@ def test_markets_pages_keep_thumbnail_shape_with_placeholders(run_dir: Path) -> 
     )
     names = [f["name"] for f in effective_manifest(run_dir)["fixtures"]]
     pages = [name for name in names if MARKETS_PAGE.fullmatch(name)]
-    assert pages
-    for name in pages:
-        for market in raw_body(run_dir, name)["data"]:
-            assert shape.fullmatch(market["thumbnailUrl"])
-            assert (market["creator"]["id"], market["creator"]["username"]) == CREATOR
+    details = [name for name in names if MARKET_DETAIL.fullmatch(name)]
+    markets = [m for name in pages for m in raw_body(run_dir, name)["data"]]
+    markets += [raw_body(run_dir, name) for name in details]
+    assert markets
+    for market in markets:
+        assert shape.fullmatch(market["thumbnailUrl"])
+        assert (market["creator"]["id"], market["creator"]["username"]) == CREATOR
+    # thumbnailUrl is undocumented on a markets page; Market (market detail) lists it.
     observed = effective_manifest(run_dir)["observed_extra_fields"]
     assert [(o["fixture"], o["path"]) for o in observed] == [
         (name, "$.data[*].thumbnailUrl") for name in pages
     ]
+
+
+@runs
+def test_trade_tape_provenance_matches_the_committed_pages(run_dir: Path) -> None:
+    # The recorder's collection record is kept as captured: a page-capped walk stays
+    # truncated, with its cursor chain, unused final cursor and per-page coverage.
+    _, source = source_provenance(run_dir)
+    fixtures = {f["name"]: f for f in effective_manifest(run_dir)["fixtures"]}
+    for name, collection in source["collections"].items():
+        match = TRADES_COLLECTION.fullmatch(name)
+        if match is None:
+            continue
+        prefix = f"exchange-trades-{match.group(1)}-p"
+        steps = [s for s in source["steps"] if s["name"].startswith(prefix)]
+        pages = collection["pages_fetched"]
+        assert len(steps) == pages <= collection["max_pages"]
+        assert not (collection["complete"] and collection["truncated"])
+        assert collection["projection_freshness"] == "unknown"
+        chain = collection["cursor_chain"]
+        assert len(chain) == pages and chain[0] is None
+        next_cursors = [*chain[1:], collection["last_next_cursor"]]
+        for step, sent, coverage, following in zip(
+            steps, chain, collection["coverage_per_page"], next_cursors, strict=True
+        ):
+            assert step["params"].get("cursor") == sent
+            assert step["page"]["coverage"] == coverage
+            assert step["page"]["next_cursor_present"] is (following is not None)
+            if step["name"] not in fixtures:
+                continue
+            body = raw_body(run_dir, step["name"])
+            assert fixtures[step["name"]]["request"]["params"] == step["params"]
+            assert body["pagination"]["nextCursor"] == following
+            assert body["pagination"]["hasMore"] is step["page"]["has_more"]
+            if coverage["present"]:
+                expected = {k: v for k, v in coverage.items() if k != "present"}
+                assert body["coverage"] == expected
+            else:
+                assert "coverage" not in body
+        if collection["truncated"]:
+            # Every page read said there was more; the cursor left unfollowed is kept.
+            assert all(s["page"]["has_more"] for s in steps)
+            assert collection["last_next_cursor"] is not None
+        else:
+            assert collection["complete"] is True
+            assert collection["last_next_cursor"] is None
 
 
 @runs
