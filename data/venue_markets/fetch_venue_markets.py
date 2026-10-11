@@ -135,24 +135,26 @@ def extract_race_state(venue: str, market: dict[str, Any], race_type: str) -> st
     if race_type not in ("senate", "governor"):
         return None
 
+    ticker = (market.get("market_ticker") or market.get("ticker") or "").upper()
+    series = (market.get("series_ticker") or "").upper()
+
     if venue == "kalshi":
-        series = (market.get("series_ticker") or "").upper()
-        ticker = (market.get("market_ticker") or "").upper()
-        for prefix in ("GOVPARTY", "KXGOVPARTY", "SENATEPARTY-", "SENATEPARTY", "SENATE", "KXSENATE"):
-            if series.startswith(prefix):
-                abbr = series[len(prefix):][:2]
-                if abbr in STATE_ABBRS:
-                    return STATE_ABBRS[abbr]
-            if ticker.startswith(prefix):
-                abbr = ticker[len(prefix):][:2]
-                if abbr in STATE_ABBRS:
-                    return STATE_ABBRS[abbr]
+        # Check anchored, validated symbol patterns with proper boundaries
+        for sym in (series, ticker):
+            for kind, pattern in _KALSHI_STATE_CONTEST_RES:
+                if kind != race_type:
+                    continue
+                match = pattern.match(sym)
+                if match and match.group("st") in STATE_ABBRS:
+                    return STATE_ABBRS[match.group("st")]
 
     # Text extraction for Polymarket / Kalshi title fallback
     if venue == "polymarket":
         text = f"{market.get('question', '')} {market.get('slug', '')} {market.get('event_title', '')}"
     else:
-        text = f"{market.get('title', '')} {market.get('subtitle', '')}"
+        # Market subtitles are candidate/outcome labels, even when a label is
+        # exactly a state name. Parent-event context is retained in event_title.
+        text = f"{market.get('title', '')} {market.get('event_title', '')}"
 
     states = extract_states_from_text(text)
     # If comparison between 2 or more states (e.g. 'Florida or South Carolina'), return None
@@ -167,6 +169,13 @@ def extract_race_state(venue: str, market: dict[str, Any], race_type: str) -> st
         if re.search(rf"\b{full.upper()}\b", upper_text):
             return full
 
+    if venue == "kalshi" and _KALSHI_SUFFIX_STATE_SERIES_RE.match(series):
+        # Check ticker suffix for hyphen-delimited state code: e.g. -TX or -AK
+        # Allow suffix-derived states only through explicitly recognized, anchored series formats.
+        suffix_match = re.search(r"[-_](?P<st>[A-Z]{2})(?:[-_].*)?$", ticker)
+        if suffix_match and suffix_match.group("st") in STATE_ABBRS:
+            return STATE_ABBRS[suffix_match.group("st")]
+
     return None
 
 
@@ -177,6 +186,10 @@ def classify_race(venue: str, market: dict[str, Any], event_title: str | None = 
         q = (market.get("question") or "").lower()
         slug = (market.get("slug") or market.get("market_slug") or "").lower()
         text = f"{q} {slug} {ev_t}"
+        if _LT_GOV_RE.search(text):
+            return "other"
+        if _is_state_legislative_contest(text):
+            return "other"
         states = extract_states_from_text(text)
         if len(states) >= 2 or "closer" in text:
             return "other"
@@ -196,16 +209,45 @@ def classify_race(venue: str, market: dict[str, Any], event_title: str | None = 
     ticker = (market.get("market_ticker") or market.get("ticker") or "").upper()
     series = (market.get("series_ticker") or "").upper()
     title = (market.get("title") or "").lower()
+    subtitle = (market.get("subtitle") or market.get("yes_sub_title") or "").lower()
     text = f"{ticker} {series} {title} {ev_t}"
 
-    if any(k in series for k in ["CONTROLS", "CONTROLH"]) or any(k in text for k in ["win the senate", "win the house", "senate control", "house control", "chamber control"]):
+    # Valid structured state contest evidence takes precedence over broad wording
+    structured = _kalshi_structured_contest(series, ticker)
+    if structured in ("senate", "governor", "house"):
+        return structured
+
+    if _LT_GOV_RE.search(f"{text} {subtitle}") or "LTGOV" in ticker or "LTGOV" in series or "LIEUTENANTGOV" in series:
+        return "other"
+    if "STATESUPERMAJ" in series or "STATESUPERMAJ" in ticker or _is_state_legislative_contest(text, structured=structured):
+        return "other"
+
+    if structured == "control" or any(k in series for k in ["CONTROLS", "CONTROLH"]):
         return "control"
+
+    has_state = bool(
+        extract_race_state("kalshi", market, "senate")
+        or extract_race_state("kalshi", market, "governor")
+        or extract_states_from_text(text)
+    )
+
+    if not has_state:
+        if any(k in text for k in ["control the senate", "control the house", "senate control", "house control", "chamber control"]):
+            return "control"
+        if any(k in title for k in ["win the senate", "win the house"]):
+            return "control"
+
     if series.startswith("GOVPARTY") or "governor" in text or "gubernatorial" in text:
         return "governor"
     if series.startswith("SENATE") or "senate" in text:
         return "senate"
-    if series.startswith("HOUSE") or "house" in text or re.search(r"\b[a-z]{2}-\d{2}\b", title):
+    if series.startswith("HOUSE") or "house" in text or re.search(r"\b[a-z]{2}-\d{2}\b", title) or re.search(r"\b[a-z]{2}-\d{2}\b", subtitle):
         return "house"
+
+    saved_type = market.get("race_type")
+    if not ev_t and saved_type in ("senate", "house", "governor", "control") and "event_title" not in market:
+        return saved_type
+
     return "other"
 
 
@@ -242,10 +284,35 @@ _UNRELATED_RE = re.compile(
     r"|nominated|nomination to|impeach(?:ed|ment)?|retire(?:s|d|ment)?|cabinet|secretary of"
     r"|reconciliation bill|federal reserve board of)\b"
 )
-_STATE_LEGISLATURE_RE = re.compile(
-    r"\b(?:state senate|state house|state assembly|state legislature|statehouse|legislature"
-    r"|general assembly|house of delegates)\b"
+_LT_GOV_RE = re.compile(
+    r"\b(?:lieutenant\s+governor|lieutenant\s+gov|lt\s+governor|lt\s+gov|ltgov|lieutenantgov)\b",
+    re.IGNORECASE,
 )
+_EXPLICIT_STATE_LEGISLATURE_RE = re.compile(
+    r"\b(?:state\s+senate|state\s+house|state\s+assembly|state\s+legislature|statehouse|legislature"
+    r"|general\s+assembly|house\s+of\s+delegates|state\s+supermajority|statesupermaj)\b",
+    re.IGNORECASE,
+)
+_STATE_SEATS_RE = re.compile(
+    r"\b(?:" + "|".join(US_STATES) + r")\s+(?:senate|house(?:\s+of\s+representatives)?)\s+seats\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_FEDERAL_BODY_RE = re.compile(
+    r"\b(?:(?:u\.s\.?|us|united\s+states|federal)\s+(?:senate|house(?:\s+of\s+representatives)?|congress(?:ional)?)"
+    r"|congressional\s+elections?|in\s+congress)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_state_legislative_contest(text: str, structured: str | None = None) -> bool:
+    """Return True if contest text refers to a state legislature contest rather than a federal one."""
+    if _EXPLICIT_STATE_LEGISLATURE_RE.search(text):
+        return True
+    if _STATE_SEATS_RE.search(text):
+        return not (structured in ("senate", "house") or bool(_EXPLICIT_FEDERAL_BODY_RE.search(text)))
+    return False
+
+
 _US_WORDING_RE = re.compile(r"\b(?:us|usa|united states|midterms?)\b")
 _OFFICE_RE = re.compile(r"\b(?:senate|house|governor|governors|gubernatorial|congress)\b")
 _CONTEST_RE = re.compile(
@@ -259,8 +326,14 @@ _KALSHI_CONTROL_RE = re.compile(r"^(?:KX)?CONTROL[SH](?:[-_](?P<yr>20[23]\d|[23]
 _KALSHI_GENERIC_RE = re.compile(r"^(?:KX)?(?:SENATE(?:PARTY)?|HOUSE(?:PARTY)?|GOV(?:PARTY)?)(?:[-_](?P<yr>20[23]\d|[23]\d))?(?:[-_].*)?$")
 _KALSHI_STATE_CONTEST_RES = (
     ("senate", re.compile(r"^(?:KX)?SENATE(?:PARTY[-_]?)?(?P<st>[A-Z]{2})(?:[-_](?P<yr>20[23]\d|[23]\d))?(?:[-_].*)?$")),
+    ("senate", re.compile(r"^(?:KX)?(?P<st>[A-Z]{2})SENATE(?:PARTY)?(?:[-_](?P<yr>20[23]\d|[23]\d))?(?:[-_].*)?$")),
     ("governor", re.compile(r"^(?:KX)?GOV(?:PARTY)?[-_]?(?P<st>[A-Z]{2})(?:[-_](?P<yr>20[23]\d|[23]\d))?(?:[-_].*)?$")),
+    ("governor", re.compile(r"^(?:KX)?(?P<st>[A-Z]{2})GOV(?:PARTY)?(?:[-_](?P<yr>20[23]\d|[23]\d))?(?:[-_].*)?$")),
     ("house", re.compile(r"^(?:KX)?HOUSE(?:PARTY)?[-_]?(?P<st>[A-Z]{2})[-_]?(?:\d+|AL)(?:[-_](?P<yr>20[23]\d|[23]\d))?(?:[-_].*)?$")),
+    ("house", re.compile(r"^(?:KX)?(?P<st>[A-Z]{2})HOUSE(?:PARTY)?[-_]?(?:\d+|AL)?(?:[-_](?P<yr>20[23]\d|[23]\d))?(?:[-_].*)?$")),
+)
+_KALSHI_SUFFIX_STATE_SERIES_RE = re.compile(
+    r"^(?:KX)?(?:SENATEWITHIN\d*|CLOSEST(?:SENATE|GOVERNOR))$"
 )
 
 
@@ -336,6 +409,9 @@ def _evaluate_election_contest(
     if _UNRELATED_RE.search(text):
         return False, "unrelated_political_event"
 
+    if _LT_GOV_RE.search(text):
+        return False, "lieutenant_governor_contest"
+
     states = extract_states_from_text(text)
     explicit_us = bool(_US_WORDING_RE.search(text))
 
@@ -356,7 +432,7 @@ def _evaluate_election_contest(
         has_us_context = explicit_us or bool(firm_states) or structured is not None
         return False, "conflicting_jurisdiction" if has_us_context else "foreign_election"
 
-    if _STATE_LEGISLATURE_RE.search(text):
+    if _is_state_legislative_contest(text, structured=structured):
         return False, "state_legislative_contest"
     if len(states) >= 2:
         return False, "conflicting_state_context"
@@ -416,11 +492,32 @@ def is_2026_kalshi_market(
     event_ticker = (ev.get("event_ticker") or "").upper()
     m_title = m.get("title") or ev.get("title") or ""
     ev_title = ev.get("title") or ""
+    ev_subtitle = ev.get("sub_title") or ""
+    cand_subtitle = m.get("yes_sub_title") or m.get("subtitle") or ""
+
+    if "STATESUPERMAJ" in m_series or "STATESUPERMAJ" in m_ticker:
+        return False, "state_legislative_contest"
+
+    # Targeted exclusion for Lieutenant Governor across all subtitle sources
+    all_subtitles = f"{cand_subtitle} {ev_subtitle}".strip()
+    if (
+        "LTGOV" in m_series
+        or "LTGOV" in m_ticker
+        or "LIEUTENANTGOV" in m_series
+        or "LIEUTENANTGOV" in m_ticker
+        or bool(_LT_GOV_RE.search(all_subtitles))
+    ):
+        return False, "lieutenant_governor_contest"
 
     structured = _kalshi_structured_contest(m_series, m_ticker)
     symbol_years = _kalshi_symbol_years(m_ticker, m_series, event_ticker)
+
+    # Candidate/outcome labels never establish jurisdiction or the cycle year.
+    # Event subtitles describe the contest and remain part of its identity.
+    contest_identity = f"{m_title} {ev_subtitle} {ev_title}".strip()
+
     eligible, reason = _evaluate_election_contest(
-        f"{m_title} {ev_title}",
+        contest_identity,
         symbol_years=symbol_years,
         structured=structured,
         is_tag_102289=False,
@@ -691,8 +788,9 @@ def fetch_polymarket_markets(
                     "event_id": ev_id,
                     "event_title": ev_title,
                     "event_slug": ev_slug,
-                    "race_type": classify_race("polymarket", item, event_title=ev_title),
+                    "race_type": "",
                 }
+                market_record["race_type"] = classify_race("polymarket", market_record)
                 markets_by_id[m_id] = market_record
 
         if "next_cursor" not in data:
@@ -872,6 +970,12 @@ def _fetch_kalshi_markets(
             ev_subtitle = ev.get("sub_title") or ""
             ev_ticker = ev.get("event_ticker") or ""
 
+            full_ev_title = (
+                f"{ev_title} - {ev_subtitle}".strip(" -")
+                if ev_subtitle and ev_subtitle.lower() not in ev_title.lower()
+                else ev_title
+            )
+
             for m in ev.get("markets") or []:
                 m_ticker = m.get("ticker") or ""
                 if not m_ticker:
@@ -924,12 +1028,14 @@ def _fetch_kalshi_markets(
                     "series_ticker": m_series,
                     "title": m_title,
                     "subtitle": subtitle,
+                    "event_title": full_ev_title,
                     "snapshot_prices": snapshot_prices,
                     "close_time": m.get("close_time"),
                     "rules_text": rules_text,
                     "filter_note": filter_note,
-                    "race_type": classify_race("kalshi", m, event_title=ev_title),
+                    "race_type": "",
                 }
+                market_record["race_type"] = classify_race("kalshi", market_record)
                 markets_by_ticker[m_ticker] = market_record
 
         if page % 5 == 0 or not new_cursor:
@@ -946,6 +1052,18 @@ def _fetch_kalshi_markets(
 # =====================================================================
 # Validation & Atomic Output
 # =====================================================================
+
+def _safe_print(msg: str = "", file: Any = None, **kwargs: Any) -> None:
+    """Print message to target stream without failing on character encoding limitations."""
+    target = file if file is not None else sys.stdout
+    enc = getattr(target, "encoding", None) or "utf-8"
+    try:
+        msg.encode(enc)
+        safe_msg = msg
+    except UnicodeEncodeError:
+        safe_msg = msg.encode(enc, errors="backslashreplace").decode(enc)
+    print(safe_msg, file=target, **kwargs)
+
 
 def validate_dataset(data: dict[str, Any]) -> list[str]:
     """Inspect dataset and return a list of failure descriptions, or empty list if valid."""
@@ -986,6 +1104,55 @@ def validate_dataset(data: dict[str, Any]) -> list[str]:
     if not kalshi_has_house_ctrl:
         errors.append("Kalshi missing House Control market")
 
+    # Strengthened validation: Ineligible contest leaks
+    bad_poly_ltgov = [
+        m.get("market_id") for m in polymarket_markets
+        if _LT_GOV_RE.search(f"{m.get('question', '')} {m.get('slug', '')} {m.get('event_title', '')}")
+    ]
+    if bad_poly_ltgov:
+        errors.append(f"Polymarket contains {len(bad_poly_ltgov)} Lieutenant Governor contracts: {bad_poly_ltgov[:5]}")
+
+    bad_kalshi_ltgov = [
+        m.get("market_ticker") for m in kalshi_markets
+        if "LTGOV" in (m.get("market_ticker") or "") or "LTGOV" in (m.get("series_ticker") or "")
+        or "LIEUTENANTGOV" in (m.get("market_ticker") or "") or "LIEUTENANTGOV" in (m.get("series_ticker") or "")
+        or _LT_GOV_RE.search(f"{m.get('title', '')} {m.get('subtitle', '')} {m.get('event_title', '')}")
+    ]
+    if bad_kalshi_ltgov:
+        errors.append(f"Kalshi contains {len(bad_kalshi_ltgov)} Lieutenant Governor contracts: {bad_kalshi_ltgov[:5]}")
+
+    bad_kalshi_stateleg = [
+        m.get("market_ticker") for m in kalshi_markets
+        if "STATESUPERMAJ" in (m.get("series_ticker") or "") or "STATESUPERMAJ" in (m.get("market_ticker") or "")
+        or _is_state_legislative_contest(
+            f"{m.get('title', '')} {m.get('subtitle', '')} {m.get('event_title', '')}",
+            structured=_kalshi_structured_contest(m.get("series_ticker") or "", m.get("market_ticker") or ""),
+        )
+    ]
+    if bad_kalshi_stateleg:
+        errors.append(f"Kalshi contains {len(bad_kalshi_stateleg)} state-legislature contracts: {bad_kalshi_stateleg[:5]}")
+
+    bad_kalshi_ctrl = [
+        m.get("market_ticker") for m in kalshi_markets
+        if m.get("race_type") == "control"
+        and _kalshi_structured_contest(m.get("series_ticker") or "", m.get("market_ticker") or "") in ("senate", "house", "governor")
+    ]
+    if bad_kalshi_ctrl:
+        errors.append(f"Kalshi contains {len(bad_kalshi_ctrl)} state-specific contests misclassified as control: {bad_kalshi_ctrl[:5]}")
+
+    bad_within5_wi = []
+    for m in kalshi_markets:
+        s_ticker = m.get("series_ticker") or ""
+        m_ticker = m.get("market_ticker") or ""
+        if ("WITHIN" in s_ticker or "WITHIN" in m_ticker) and extract_race_state("kalshi", m, "senate") == "wisconsin":
+            text_corpus = f"{m.get('title', '')} {m.get('subtitle', '')} {m.get('event_title', '')}".lower()
+            has_wi_suffix = bool(re.search(r"[-_]WI(?:[-_].*)?$", m_ticker))
+            has_wi_text = "wisconsin" in text_corpus
+            if not (has_wi_suffix or has_wi_text):
+                bad_within5_wi.append(m_ticker)
+    if bad_within5_wi:
+        errors.append(f"Kalshi contains {len(bad_within5_wi)} WITHIN contracts falsely extracted as Wisconsin: {bad_within5_wi[:5]}")
+
     return errors
 
 
@@ -1016,7 +1183,7 @@ def publish_output(dated_file: Path, latest_file: Path, output_payload: dict[str
 def run_validation(latest_path: Path) -> int:
     """Validate and summarize the latest output file."""
     if not latest_path.exists():
-        print(f"Error: {latest_path} does not exist. Run fetch first.", file=sys.stderr)
+        _safe_print(f"Error: {latest_path} does not exist. Run fetch first.", file=sys.stderr)
         return 1
 
     with open(latest_path, "r", encoding="utf-8") as f:
@@ -1027,13 +1194,13 @@ def run_validation(latest_path: Path) -> int:
     polymarket_markets = data.get("polymarket", [])
     kalshi_markets = data.get("kalshi", [])
 
-    print("=" * 70)
-    print("VENUE MARKETS VALIDATION REPORT")
-    print("=" * 70)
-    print(f"Fetched At:   {fetched_at}")
-    print(f"Kalshi Host:  {kalshi_host}")
-    print(f"Total Counts: Polymarket: {len(polymarket_markets)}, Kalshi: {len(kalshi_markets)}")
-    print("-" * 70)
+    _safe_print("=" * 70)
+    _safe_print("VENUE MARKETS VALIDATION REPORT")
+    _safe_print("=" * 70)
+    _safe_print(f"Fetched At:   {fetched_at}")
+    _safe_print(f"Kalshi Host:  {kalshi_host}")
+    _safe_print(f"Total Counts: Polymarket: {len(polymarket_markets)}, Kalshi: {len(kalshi_markets)}")
+    _safe_print("-" * 70)
 
     # 1. Duplicate & Missing IDs
     poly_ids = [m.get("market_id") for m in polymarket_markets]
@@ -1044,10 +1211,10 @@ def run_validation(latest_path: Path) -> int:
     kalshi_missing = sum(1 for t in kalshi_ids if not t)
     kalshi_dupes = len(kalshi_ids) - len(set(filter(None, kalshi_ids)))
 
-    print("ID INTEGRITY:")
-    print(f"  Polymarket missing IDs: {poly_missing}, duplicates: {poly_dupes}")
-    print(f"  Kalshi missing IDs:     {kalshi_missing}, duplicates: {kalshi_dupes}")
-    print("-" * 70)
+    _safe_print("ID INTEGRITY:")
+    _safe_print(f"  Polymarket missing IDs: {poly_missing}, duplicates: {poly_dupes}")
+    _safe_print(f"  Kalshi missing IDs:     {kalshi_missing}, duplicates: {kalshi_dupes}")
+    _safe_print("-" * 70)
 
     # 2. Race Type Counts
     poly_types: dict[str, int] = {}
@@ -1060,10 +1227,10 @@ def run_validation(latest_path: Path) -> int:
         rtype = classify_race("kalshi", m)
         kalshi_types[rtype] = kalshi_types.get(rtype, 0) + 1
 
-    print("MARKET COUNTS BY RACE TYPE:")
+    _safe_print("MARKET COUNTS BY RACE TYPE:")
     for rtype in ["senate", "house", "governor", "control", "other"]:
-        print(f"  {rtype.capitalize():<10} -> Polymarket: {poly_types.get(rtype, 0):<5} | Kalshi: {kalshi_types.get(rtype, 0):<5}")
-    print("-" * 70)
+        _safe_print(f"  {rtype.capitalize():<10} -> Polymarket: {poly_types.get(rtype, 0):<5} | Kalshi: {kalshi_types.get(rtype, 0):<5}")
+    _safe_print("-" * 70)
 
     # 3. Chamber Control Presence
     poly_has_senate_ctrl = any("senate" in (m.get("question") or "").lower() and classify_race("polymarket", m) == "control" for m in polymarket_markets)
@@ -1071,12 +1238,12 @@ def run_validation(latest_path: Path) -> int:
     kalshi_has_senate_ctrl = any(("CONTROLS" in (m.get("series_ticker") or "") or "senate" in (m.get("title") or "").lower()) and classify_race("kalshi", m) == "control" for m in kalshi_markets)
     kalshi_has_house_ctrl = any(("CONTROLH" in (m.get("series_ticker") or "") or "house" in (m.get("title") or "").lower()) and classify_race("kalshi", m) == "control" for m in kalshi_markets)
 
-    print("CHAMBER CONTROL MARKETS:")
-    print(f"  Polymarket Senate Control Present: {'YES' if poly_has_senate_ctrl else 'NO'}")
-    print(f"  Polymarket House Control Present:  {'YES' if poly_has_house_ctrl else 'NO'}")
-    print(f"  Kalshi Senate Control Present:     {'YES' if kalshi_has_senate_ctrl else 'NO'}")
-    print(f"  Kalshi House Control Present:      {'YES' if kalshi_has_house_ctrl else 'NO'}")
-    print("-" * 70)
+    _safe_print("CHAMBER CONTROL MARKETS:")
+    _safe_print(f"  Polymarket Senate Control Present: {'YES' if poly_has_senate_ctrl else 'NO'}")
+    _safe_print(f"  Polymarket House Control Present:  {'YES' if poly_has_house_ctrl else 'NO'}")
+    _safe_print(f"  Kalshi Senate Control Present:     {'YES' if kalshi_has_senate_ctrl else 'NO'}")
+    _safe_print(f"  Kalshi House Control Present:      {'YES' if kalshi_has_house_ctrl else 'NO'}")
+    _safe_print("-" * 70)
 
     # 4. Distinct State Coverage
     poly_senate_states = {
@@ -1103,38 +1270,38 @@ def run_validation(latest_path: Path) -> int:
         if classify_race("kalshi", m) == "governor"
     } - {None}
 
-    print("DISTINCT STATE COVERAGE:")
-    print(f"  Polymarket States with Senate Markets:   {len(poly_senate_states)}")
-    print(f"  Polymarket States with Governor Markets: {len(poly_gov_states)}")
-    print(f"  Kalshi States with Senate Markets:       {len(kalshi_senate_states)}")
-    print(f"  Kalshi States with Governor Markets:     {len(kalshi_gov_states)}")
-    print("  (Note: Expected 35 Senate races (33 regular + Ohio and Florida specials) and 36 governor races)")
-    print("-" * 70)
+    _safe_print("DISTINCT STATE COVERAGE:")
+    _safe_print(f"  Polymarket States with Senate Markets:   {len(poly_senate_states)}")
+    _safe_print(f"  Polymarket States with Governor Markets: {len(poly_gov_states)}")
+    _safe_print(f"  Kalshi States with Senate Markets:       {len(kalshi_senate_states)}")
+    _safe_print(f"  Kalshi States with Governor Markets:     {len(kalshi_gov_states)}")
+    _safe_print("  (Note: Expected 35 Senate races (33 regular + Ohio and Florida specials) and 36 governor races)")
+    _safe_print("-" * 70)
 
     exclusion_samples = data.get("exclusion_samples", {})
     if exclusion_samples:
-        print("EXCLUSION SAMPLES (up to 20 per reason):")
+        _safe_print("EXCLUSION SAMPLES (up to 20 per reason):")
         for venue_name in ("polymarket", "kalshi"):
             venue_dict = exclusion_samples.get(venue_name, {})
             if not venue_dict:
                 continue
-            print(f"  Venue: {venue_name.capitalize()}")
+            _safe_print(f"  Venue: {venue_name.capitalize()}")
             for reason, samples in sorted(venue_dict.items()):
-                print(f"    [{reason}] ({len(samples)} sample{'s' if len(samples) != 1 else ''}):")
+                _safe_print(f"    [{reason}] ({len(samples)} sample{'s' if len(samples) != 1 else ''}):")
                 for s in samples[:20]:
-                    print(f"      - {s}")
-        print("=" * 70)
+                    _safe_print(f"      - {s}")
+        _safe_print("=" * 70)
     else:
-        print("=" * 70)
+        _safe_print("=" * 70)
 
     errors = validate_dataset(data)
     if errors:
-        print("VALIDATION FAILURES DETECTED:", file=sys.stderr)
+        _safe_print("VALIDATION FAILURES DETECTED:", file=sys.stderr)
         for err in errors:
-            print(f"  - {err}", file=sys.stderr)
+            _safe_print(f"  - {err}", file=sys.stderr)
         return 1
 
-    print("VALIDATION SUCCESSFUL: All checks passed.")
+    _safe_print("VALIDATION SUCCESSFUL: All checks passed.")
     return 0
 
 
@@ -1164,12 +1331,12 @@ def main() -> None:
         polymarket_markets, poly_excluded = fetch_polymarket_markets(rate_limiter, exclusion_samples=poly_samples)
         kalshi_host, kalshi_markets, kalshi_excluded = fetch_kalshi_markets(rate_limiter, exclusion_samples=kalshi_samples)
     except Exception as e:  # noqa: BLE001
-        print(f"\nFETCH FAILED: {e}", file=sys.stderr, flush=True)
-        print("Previous latest output preserved byte-for-byte; no output updated.", file=sys.stderr, flush=True)
+        _safe_print(f"\nFETCH FAILED: {e}", file=sys.stderr, flush=True)
+        _safe_print("Previous latest output preserved byte-for-byte; no output updated.", file=sys.stderr, flush=True)
         sys.exit(1)
 
-    print(f"Found {len(polymarket_markets)} eligible markets from Polymarket (exclusions: {poly_excluded})", flush=True)
-    print(f"Found {len(kalshi_markets)} eligible markets from Kalshi (exclusions: {kalshi_excluded})", flush=True)
+    _safe_print(f"Found {len(polymarket_markets)} eligible markets from Polymarket (exclusions: {poly_excluded})", flush=True)
+    _safe_print(f"Found {len(kalshi_markets)} eligible markets from Kalshi (exclusions: {kalshi_excluded})", flush=True)
 
     output_payload = {
         "fetched_at": datetime.now(UTC).isoformat(),
@@ -1186,17 +1353,17 @@ def main() -> None:
 
     errors = validate_dataset(output_payload)
     if errors:
-        print("\nVALIDATION FAILED ON NEW DATASET:", file=sys.stderr, flush=True)
+        _safe_print("\nVALIDATION FAILED ON NEW DATASET:", file=sys.stderr, flush=True)
         for err in errors:
-            print(f"  - {err}", file=sys.stderr, flush=True)
-        print("Previous latest output preserved byte-for-byte; no output updated.", file=sys.stderr, flush=True)
+            _safe_print(f"  - {err}", file=sys.stderr, flush=True)
+        _safe_print("Previous latest output preserved byte-for-byte; no output updated.", file=sys.stderr, flush=True)
         sys.exit(1)
 
     publish_output(dated_file, latest_file, output_payload)
-    print(f"Saved {len(polymarket_markets) + len(kalshi_markets)} markets to {dated_file}", flush=True)
-    print(f"Atomically updated {latest_file}", flush=True)
+    _safe_print(f"Saved {len(polymarket_markets) + len(kalshi_markets)} markets to {dated_file}", flush=True)
+    _safe_print(f"Atomically updated {latest_file}", flush=True)
 
-    print("\nRunning validation on published dataset...", flush=True)
+    _safe_print("\nRunning validation on published dataset...", flush=True)
     sys.exit(run_validation(latest_file))
 
 
