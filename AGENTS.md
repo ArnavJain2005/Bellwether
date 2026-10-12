@@ -61,10 +61,10 @@ and gate G-6 in the PRD.
    sources a task names (e.g. Polymarket's public price history).
 3. **Never read, print, log or commit `.env` or any key.**
 4. **The dashboard never places SIG trades and never calls SIG.** Every dashboard
-   command goes to the engine's control API, and the engine validates and carries it
-   out; no dashboard command bypasses the engine's risk checks, readiness checks or
-   configuration validation. The old `/kill`, `/resume`, `/mode` and `/override` command
-   set is superseded.
+   command goes to the engine's control API, and the engine authorizes, validates and
+   carries it out. No dashboard command bypasses the checks that apply to it: readiness
+   for resume, validation for configuration changes. Cancellation never places an order.
+   The old `/kill`, `/resume`, `/mode` and `/override` command set is superseded.
 5. **Risk limits and strategy settings change only through Arnav.** The PRD's pilot
    ceilings are provisional and not activated configuration. Never edit `config/risk.yaml`
    or use any control to change limits or settings yourself.
@@ -81,7 +81,9 @@ need exist yet. Eventual scope (REQ-8, REQ-9):
 - Monitoring of engine state, prices, orders, fills, positions, pauses and health.
 - Pause.
 - Resume, which the engine allows only after its readiness check passes.
-- Cancellation (all orders, or one market), carried out by the engine.
+- Cancellation (all orders, or one market), carried out by the engine. It must stay
+  available while the engine is paused or not ready for new trading (`CLAUDE.md` hard
+  rule 3).
 - Editing implemented strategy settings and risk limits, as proposed changes the engine
   validates, versions, writes to an audit log and assesses against existing positions and
   pending orders before they take effect.
@@ -100,10 +102,15 @@ are not confirmed requirements. Engine protections never depend on the dashboard
 - Prices in the shared schemas are Bellwether's internal units (ticks or milli), not SIG
   wire values; see the units notes in `shared/schemas.py` and do not infer API contracts
   from them.
-- Terminal-style design of our own: near-black background, monospace text, amber labels,
-  green up / red down, dense panels, keyboard-first (F1–F7, `/` command line). No
-  Bloomberg name, logo or copied layout. The detailed Oct 2 dashboard spec is a
-  historical draft; a dashboard task prompt will state the current design rules.
+- Design goals (confirmed): simple, intuitive, visually polished, fast and smooth.
+  Progressive disclosure (the essentials first, detail on demand) and clear controls,
+  whose effect and current state are obvious, guide the design.
+- F1–F7 keys and a command line may be offered as optional desktop shortcuts, never as
+  the only way to do something.
+- Our own design: no Bloomberg name, logo or copied layout. The Oct 2 dashboard spec
+  (dense, keyboard-first terminal style) is a historical draft, not a requirement.
+- Do not start UI implementation until a dashboard task (D1) is assigned; its task
+  prompt will state the detailed design rules.
 
 ## Data work (`data/`)
 
