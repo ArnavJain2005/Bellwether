@@ -9,12 +9,13 @@ the synthetic fixtures or the recorded fixtures in tests/fixtures/sig/recorded/.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
-from sig_testkit import BASE_URL, SENTINEL_KEY, TOURNAMENT, Router, json_response
+from sig_testkit import BASE_URL, SENTINEL_KEY, TOURNAMENT, Router, fixture, json_response
 
 from engine.config import ApiKey, SigConfig, TournamentRef
 from engine.sig_client.rate_limiter import RateLimiter
@@ -28,6 +29,7 @@ from engine.sig_client.realtime import (
     TransportEvent,
 )
 from engine.sig_client.realtime_token import RealtimeEndpoint, RealtimeSecret, RealtimeTokenClient
+from engine.sig_client.recovery import BootstrapDeclaration, RecoveryLedger, RecoveryPolicy
 from engine.sig_client.rest import SigRestClient
 
 T0 = datetime(2026, 10, 10, 12, 0, 0, tzinfo=UTC)
@@ -278,8 +280,45 @@ def token_body(
     }
 
 
+def test_bootstrap(market_ids: tuple[str, ...] = (MARKET,)) -> RecoveryLedger:
+    """A TEST-ONLY bootstrap ledger (D-3 is undecided; engine/ never creates one)."""
+    return RecoveryLedger.bootstrap(
+        BootstrapDeclaration(
+            market_ids=frozenset(market_ids),
+            declared_by="tests",
+            note="offline test fixture; not an adoption of D-3",
+        )
+    )
+
+
+def market_detail(
+    market_id: str = MARKET,
+    *,
+    status: str = "open",
+    settled_with: str | None = None,
+    settled_on: str | None = None,
+    tournament: TournamentRef = TOURNAMENT,
+) -> dict[str, Any]:
+    """The synthetic market-detail fixture for `market_id`, in one tournament context."""
+    body = copy.deepcopy(fixture("market"))
+    body["id"] = market_id
+    for scope in (body, body["contexts"][0]):
+        scope["status"] = status
+        scope["settledWith"] = settled_with
+        scope["settledOn"] = settled_on
+    body["contexts"][0]["tournament"]["slug"] = tournament.slug
+    body["contexts"][0]["tournament"]["id"] = tournament.id
+    return body
+
+
 class Harness:
-    """A feed wired to a Router (REST), a FakeTransport and a ManualClock."""
+    """A feed wired to a Router (REST), a FakeTransport and a ManualClock.
+
+    Unless `ledger` is given, the feed gets a TEST-ONLY bootstrap ledger declaring its
+    markets, so that tests of the ready path can reach it. Pass `ledger=RecoveryLedger()`
+    for production's default (unknown history). Every market gets a market-detail route
+    (open) unless the router already has one.
+    """
 
     def __init__(
         self,
@@ -290,13 +329,22 @@ class Harness:
         tournament: TournamentRef = TOURNAMENT,
         token_responses: list[Any] | None = None,
         transport: FakeTransport | None = None,
+        ledger: RecoveryLedger | None = None,
+        recovery: RecoveryPolicy | None = None,
+        clock: ManualClock | None = None,
     ) -> None:
-        self.clock = ManualClock()
+        self.clock = clock or ManualClock()
         self.market_ids = market_ids
         self.router = router or Router()
         self.router.routes.setdefault(
             "/api/v1/realtime/token", token_responses or [json_response(200, token_body())]
         )
+        for market_id in market_ids:
+            self.router.routes.setdefault(
+                f"/api/v1/markets/{market_id}",
+                json_response(200, market_detail(market_id, tournament=tournament)),
+            )
+        self.ledger = ledger if ledger is not None else test_bootstrap(market_ids)
         self.transport = transport or FakeTransport()
         self.events: list[FeedEvent] = []
         self.observed: list[tuple[str, bool]] = []
@@ -329,6 +377,9 @@ class Harness:
             clock=self.clock,
             sleep=self.clock.sleep,
             wall_clock=self.clock.wall,
+            ledger=self.ledger,
+            recovery=recovery,
+            recovery_jitter=lambda delay: delay,
         )
         self.task: asyncio.Task[None] | None = None
         self.baseline_tasks: set[asyncio.Task[Any]] = set()

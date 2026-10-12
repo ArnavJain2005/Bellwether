@@ -215,6 +215,8 @@ def test_settlement_is_signalled_and_resynced() -> None:
 def test_socket_error_waits_for_resubscription_then_resyncs() -> None:
     async def scenario(h: Harness) -> None:
         await h.start()
+        h.transport.batch(h.topic(), batch(1, 0))  # revision 1 accepted: the fence
+        await settle()
         h.transport.push(SocketEvent(SocketState.ERROR))
         await settle()
         assert stale_reasons(h) == [StaleReason.SOCKET_ERROR]
@@ -222,7 +224,13 @@ def test_socket_error_waits_for_resubscription_then_resyncs() -> None:
         assert h.count(ORDERBOOK) == 1  # nothing to resync onto while disconnected
         h.transport.subscribed(h.topic())  # the transport re-joined after reconnecting
         await settle()
-        assert h.count(ORDERBOOK) == 2 and h.feed.is_ready(MARKET)
+        assert h.count(ORDERBOOK) == 2
+        # M2-A (D-1 undecided): the books are back, but the unobserved window stays open
+        # until a clean batch advances past its fence.
+        assert not h.feed.is_ready(MARKET)
+        h.transport.batch(h.topic(), batch(2, 1))
+        await h.clock.advance(2.0)
+        assert h.count(ORDERBOOK) == 3 and h.feed.is_ready(MARKET)
         await h.stop()
 
     run(scenario)
@@ -239,12 +247,18 @@ def test_socket_error_waits_for_resubscription_then_resyncs() -> None:
 def test_channel_errors_mark_stale_until_rejoined(status: ChannelStatus, reason: StaleReason) -> None:
     async def scenario(h: Harness) -> None:
         await h.start()
+        h.transport.batch(h.topic(), batch(1, 0))  # revision 1 accepted: the fence
+        await settle()
         h.transport.push(ChannelStatusEvent(h.topic(), status))
         await settle()
         assert stale_reasons(h) == [reason] and not h.feed.is_ready(MARKET)
         h.transport.subscribed(h.topic())
         await h.clock.advance(2.0)
-        assert h.feed.is_ready(MARKET) and h.count(ORDERBOOK) == 2
+        assert h.count(ORDERBOOK) == 2
+        assert not h.feed.is_ready(MARKET)  # the window is open until a clean batch
+        h.transport.batch(h.topic(), batch(2, 1))
+        await h.clock.advance(2.0)
+        assert h.feed.is_ready(MARKET) and h.count(ORDERBOOK) == 3
         await h.stop()
 
     run(scenario)
@@ -276,6 +290,8 @@ def second_token(expires_hours: float = 6.0, **kwargs: Any) -> httpx.Response:
 def test_token_refresh_sets_auth_and_resyncs() -> None:
     async def scenario(h: Harness) -> None:
         await h.start()
+        h.transport.batch(h.topic(), batch(1, 0))  # revision 1 accepted: the fence
+        await settle()
         await h.clock.advance(3 * 3600 - 601)
         assert h.count("/realtime/token") == 1 and h.feed.is_ready(MARKET)
         await h.clock.advance(60)  # past the refresh point: 10 minutes before expiry
@@ -283,8 +299,12 @@ def test_token_refresh_sets_auth_and_resyncs() -> None:
         assert h.transport.calls[-1] == ("set_auth", "")
         assert h.transport.tokens == [TOKEN_VALUE, "rt-sentinel-token-2"]
         assert StaleReason.TOKEN_REFRESH in stale_reasons(h)
-        assert h.count(ORDERBOOK) == 2 and h.feed.is_ready(MARKET)
+        assert h.count(ORDERBOOK) == 2
         assert h.limiter.used(RequestKind.WRITE) == 1  # the first mint left the window
+        assert not h.feed.is_ready(MARKET)  # the refresh opened an unobserved window
+        h.transport.batch(h.topic(), batch(2, 1))
+        await h.clock.advance(2.0)
+        assert h.count(ORDERBOOK) == 3 and h.feed.is_ready(MARKET)
         await h.stop()
 
     run(
@@ -301,6 +321,8 @@ def test_failed_refresh_lets_the_token_expire_then_recovers() -> None:
         # Minted at t=1000 for 3 h: refresh due at 11200, expiry at 11800. Mints fail at
         # 11200, 11320 and 11560 (backoff 120, 240, 480) and succeed at 12040.
         await h.start()
+        h.transport.batch(h.topic(), batch(1, 0))  # revision 1 accepted: the fence
+        await settle()
         await h.clock.advance(3 * 3600 - 540)  # now 11260
         assert h.count("/realtime/token") == 2 and h.feed.is_ready(MARKET)
         reads = h.count(ORDERBOOK)
@@ -312,7 +334,11 @@ def test_failed_refresh_lets_the_token_expire_then_recovers() -> None:
         await h.clock.advance(300)  # now 12160
         assert h.count("/realtime/token") == 5
         assert h.transport.tokens[-1] == "rt-sentinel-token-2"
-        assert h.feed.is_ready(MARKET) and h.count(ORDERBOOK) == reads + 1
+        assert h.count(ORDERBOOK) == reads + 1
+        assert not h.feed.is_ready(MARKET)  # expiry and refresh left a window open
+        h.transport.batch(h.topic(), batch(2, 1))
+        await h.clock.advance(2.0)
+        assert h.feed.is_ready(MARKET) and h.count(ORDERBOOK) == reads + 2
         await h.stop()
 
     run(
@@ -397,6 +423,8 @@ def test_trigger_during_resync_discards_readiness_and_reruns() -> None:
         # Two non-blocking triggers while the read is in flight.
         h.transport.batch(topic, DIRTY, event="book_dirty")
         h.transport.subscribed(topic)
+        # The re-join opened a window (fence 2); a clean batch past it confirms it.
+        h.transport.batch(topic, batch(3, 2, books=[book(60)]))
         await settle()
         gate["release"].set()
         await settle()
@@ -575,9 +603,18 @@ def test_resync_from_the_recorded_capture_keeps_values_exact() -> None:
     replay = Replay(RECORDED / "20261009T190027Z-fb88c9")
     tournament_id = RECORDED_TOURNAMENT.id
 
+    # The lifecycle read (M2-A) is served the market detail recorded for 258 in capture
+    # 12ab20, byte for byte, and only for its exact tournament-scoped query.
+    detail = (RECORDED / "20261011T211201Z-12ab20/bodies/06-market-detail-258-a1.json")
+
     def route(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/realtime/token"):
             return json_response(200, token_body())
+        if request.url.path == "/api/v1/markets/258":
+            assert dict(request.url.params) == {"tournamentId": tournament_id}
+            return httpx.Response(
+                200, content=detail.read_bytes(), headers={"content-type": "application/json"}
+            )
         return replay(request)
 
     async def scenario(h: Harness) -> None:
@@ -587,6 +624,9 @@ def test_resync_from_the_recorded_capture_keeps_values_exact() -> None:
             ("/tournaments/midterm-elections", {}),
             ("/markets/258/orderbook", {"depth": "5", "tournamentId": tournament_id}),
         ]
+        lifecycle = h.feed.readiness("258").lifecycle
+        assert lifecycle is not None and lifecycle.current
+        assert (lifecycle.status, lifecycle.settled_with) == ("open", None)
         assert h.feed.topic("258") == f"tournament:{tournament_id}:market:258"
         assert h.feed.is_ready("258")
         held = h.feed.books("258")["947"]
