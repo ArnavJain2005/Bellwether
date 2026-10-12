@@ -60,15 +60,21 @@ clean batches alone advance the revision past the fence (recovery.py). Confirmat
 covers the revisioned stream only, never standalone events.
 
 Recovery attempts: one per market at a time, admitted through a feed-wide gate
-(RecoveryPolicy: 10 starts per rolling 60 s by default), each with one overall deadline
-(30 s) and one market-detail read through `SigRestClient.get_market`. The gate reserves
-no account budget: each HTTP attempt of the read still goes through the shared account
-RateLimiter, which has no priorities. Failed attempts back off exponentially with
-bounded jitter, never shorter than SIG's Retry-After; after `escalate_after` failures in
-a row the market is reported escalated and is still retried at the capped interval. A
-quarantined market is not retried. A response is applied only by the synchronous
-observe/commit step: if the feed has begun closing, the attempt was cancelled or its
-deadline has passed, it is dropped with no effect but a log line. Otherwise it may only
+(RecoveryPolicy: 10 starts per rolling 60 s by default), each with one market-detail
+read through `SigRestClient.get_market`. An attempt begins when it asks the gate for
+admission; its one overall deadline (30 s) covers that wait, shared account admission,
+the request and every retry wait, and is enforced actively. An admission that does not
+fit the deadline, or is granted after it, fails the attempt without starting a read.
+The gate reserves no account budget: each HTTP attempt of the read still goes through
+the shared account RateLimiter, which has no priorities. Failed attempts back off
+exponentially with bounded jitter, never shorter than SIG's Retry-After; after
+`escalate_after` failures in a row the market is reported escalated and is still retried
+at the capped interval. Escalation is scheduling metadata: it is dropped as soon as the
+market no longer wants recovery, and it never clears a blocker. A quarantined market is
+not retried. A response is applied only by the synchronous observe/commit step: if the
+feed has begun closing, the attempt was cancelled (including an external cancellation
+that the reader swallowed) or its deadline has passed, it is dropped with no effect but
+a log line, and a cancellation is propagated. Otherwise it may only
 restrict (a market detail showing `settled` or `closed` quarantines the market with
 LIFECYCLE_NOT_OPEN) or, when current, confirm a settlement (a MARKET_SETTLED instance
 whose label matches is quarantined). It never clears anything and never publishes
@@ -77,7 +83,8 @@ condition synchronously first.
 
 Readiness: `readiness(market_id)` returns a MarketReadiness (readiness.py) explaining
 every failing condition; `is_ready(market_id)` is exactly `readiness(...).status is
-READY`. Feed readiness never authorizes trading on its own, and protective cancellation
+READY`. Publication uses the same predicate, so MarketReady is never published while
+readiness says not ready. Feed readiness never authorizes trading on its own, and protective cancellation
 is never gated on it.
 
 Order expiry: a REST read clears a known `nextExpiryAt` only when it is shown to have
@@ -459,7 +466,7 @@ class RealtimeMarketFeed:
         self._closing = asyncio.Event()
         # Registering inherits the ledger's state: a replacement feed opens a window on
         # every market an earlier feed registered (fence = the retained revision).
-        self._ledger.attach(self, ids, clock())
+        self._ledger.attach(self, rest.tournament, ids, clock())
         if self._ledger.origin is not LedgerOrigin.UNKNOWN:
             # Only tests create bootstrap ledgers in M2-A (D-3 undecided); make any other
             # use visible.
@@ -542,16 +549,12 @@ class RealtimeMarketFeed:
         market = self._markets[market_id]
         closing = self._closing.is_set()
         reasons = ["feed closing"] if closing else []
+        # The same predicate gates publication in the orderbook-resync path.
         reasons += self._unmet(market)
         if not market.ready:
             reasons.append(
                 "not published ready: no orderbook resync has answered the latest trigger "
                 "with every other condition met"
-            )
-        if market.escalated:
-            reasons.append(
-                f"recovery escalated after {market.failures} consecutive failed attempts; "
-                "still retried at the capped interval"
             )
         if closing:
             status = ReadinessStatus.NOT_READY
@@ -745,6 +748,7 @@ class RealtimeMarketFeed:
         for settlement in outcome.settlements:
             self._emit(SettlementSignal(market.market_id, settlement))
         if confirmed:
+            self._drop_obsolete_escalation(market)
             self._request_publication(market)
 
     def _record_outcome(self, market: _Market, prior: int | None, outcome: TopicOutcome) -> bool:
@@ -821,7 +825,11 @@ class RealtimeMarketFeed:
         self._start_resync(market)
 
     def _unmet(self, market: _Market) -> list[str]:
-        """Every unmet readiness condition except closing and the published flag."""
+        """Every unmet readiness condition except closing and the published flag.
+
+        The one eligibility predicate: `readiness()` and every MarketReady publication
+        use it, so a market is never published ready while readiness says otherwise.
+        """
         market_id = market.market_id
         unmet = []
         if not market.subscribed:
@@ -835,6 +843,11 @@ class RealtimeMarketFeed:
             )
         unmet += [_instance_reason(i) for i in self._ledger.instances(market_id)]
         unmet += [_window_reason(w) for w in self._ledger.open_windows(market_id)]
+        if market.escalated:
+            unmet.append(
+                f"recovery escalated after {market.failures} consecutive failed attempts; "
+                "still retried at the capped interval"
+            )
         if self._ledger.declared(market_id):
             if not self._ledger.history_began(market_id):
                 unmet.append("history: bootstrap declared; first subscription pending")
@@ -955,7 +968,11 @@ class RealtimeMarketFeed:
             market.recovery_task = self._spawn(self._recover(market))
 
     async def _recover(self, market: _Market) -> None:
-        """One attempt at a time; triggers meanwhile coalesce into one follow-up."""
+        """One attempt at a time; triggers meanwhile coalesce into one follow-up.
+
+        Only the scheduling backoff waits outside an attempt. An attempt begins when it
+        asks the recovery gate for admission, and its overall deadline covers that wait.
+        """
         try:
             while self._wants_attempt(market):
                 if market.next_attempt is not None:
@@ -963,16 +980,55 @@ class RealtimeMarketFeed:
                     if wait > 0:
                         await self._sleep(wait)
                         continue
-                await self._recovery_gate.acquire(RequestKind.READ)
-                if not self._wants_attempt(market):
-                    break
                 await self._attempt(market)
         finally:
             market.recovery_task = None
             market.attempt = None
+            if not self._closing.is_set():
+                self._drop_obsolete_escalation(market)
+
+    def _drop_obsolete_escalation(self, market: _Market) -> None:
+        """Clear failure counts and escalation once no recovery is wanted any more.
+
+        Scheduling metadata only: no ledger instance, window or quarantine changes. It
+        keeps escalation from outliving its demand and stranding a market not ready with
+        no attempt scheduled.
+        """
+        market_id = market.market_id
+        if self._ledger.needs_recovery(market_id) and not self._ledger.quarantined(market_id):
+            return
+        market.failures = 0
+        market.escalated = False
+        market.next_attempt = None
+
+    @staticmethod
+    def _cancel_requested() -> bool:
+        """True if this task was asked to cancel, even if an awaited reader swallowed it."""
+        task = asyncio.current_task()
+        return task is not None and task.cancelling() > 0
+
+    def _raise_if_cancel_requested(self) -> None:
+        if self._cancel_requested():
+            raise asyncio.CancelledError
+
+    def _attempt_live(self, attempt: RecoveryAttempt) -> bool:
+        return (
+            not self._closing.is_set()
+            and not attempt.cancelled
+            and not self._cancel_requested()
+            and self._clock() < attempt.deadline_mono
+        )
 
     async def _attempt(self, market: _Market) -> None:
-        """Start one attempt (gate admission is its start), read, then observe/commit."""
+        """One attempt: admission through the recovery gate, the read, then observe/commit.
+
+        The overall deadline runs from the request for admission and covers the gate
+        wait, shared account admission, the request and every retry wait. It is enforced
+        actively, by the event loop's clock and by a timer on the injected clock, so a
+        hanging wait is cut off; an admission granted after it never starts a read. An
+        external cancellation always propagates, even if an awaited reader swallowed it
+        and returned a response: nothing is then recorded or published.
+        """
         market_id = market.market_id
         now = self._clock()
         self._attempt_ids += 1
@@ -986,26 +1042,42 @@ class RealtimeMarketFeed:
             started_seq=self._ledger.next_seq(),
         )
         market.attempt = attempt
+        phase = "recovery gate admission"
         try:
-            read_seq = self._ledger.next_seq()  # this attempt's own read, never reused
-            read_started = self._clock()
             try:
-                # The deadline actively cancels the read through this scope (on the
-                # injected clock); the observe/commit guard checks it again.
-                async with asyncio.timeout(None) as scope:
+                async with asyncio.timeout(self._recovery.attempt_deadline_s) as scope:
                     timer = self._spawn(self._deadline(attempt, scope))
                     try:
+                        await self._recovery_gate.acquire(
+                            RequestKind.READ, deadline=attempt.deadline_mono
+                        )
+                        self._raise_if_cancel_requested()
+                        if not self._attempt_live(attempt):
+                            # Admitted after the deadline (or closing began): no read.
+                            self._attempt_failed(market, attempt, "admitted too late", None)
+                            return
+                        phase = "market-detail read"
+                        read_seq = self._ledger.next_seq()  # this attempt's own read
+                        read_started = self._clock()
                         detail = await self._rest.get_market(market_id)
                     finally:
                         timer.cancel()
             except TimeoutError:
+                self._raise_if_cancel_requested()
                 if not scope.expired():
                     raise
-                self._attempt_failed(market, attempt, "attempt deadline passed", None)
+                self._attempt_failed(market, attempt, f"deadline passed during {phase}", None)
                 return
             except SigClientError as exc:
+                self._raise_if_cancel_requested()
                 floor = _server_wait(exc)  # an oversized Retry-After stops the feed
-                self._attempt_failed(market, attempt, type(exc).__name__, floor)
+                self._attempt_failed(market, attempt, f"{phase}: {type(exc).__name__}", floor)
+                return
+            # A reader may have swallowed a cancellation (an external one, or the
+            # deadline's) and returned anyway: neither may lead to a commit.
+            self._raise_if_cancel_requested()
+            if scope.expired():
+                self._attempt_failed(market, attempt, f"deadline passed during {phase}", None)
                 return
             # No await between the response and the step.
             self._observe_commit(
@@ -1015,10 +1087,11 @@ class RealtimeMarketFeed:
             market.attempt = None
 
     async def _deadline(self, attempt: RecoveryAttempt, scope: asyncio.Timeout) -> None:
+        """Expire the attempt's scope when the injected clock reaches its deadline."""
         wait = attempt.deadline_mono - self._clock()
         if wait > 0:
             await self._sleep(wait)
-        if scope.when() is None:  # still waiting for the read
+        if not scope.expired():  # still admitting or reading (cancelled once it ends)
             scope.reschedule(asyncio.get_running_loop().time())
 
     def _observe_commit(
@@ -1035,6 +1108,10 @@ class RealtimeMarketFeed:
         # 1. Guard: closing and cancellation drop the response with no effect at all.
         if self._closing.is_set() or attempt.cancelled:
             logger.info("realtime market %s recovery %s dropped: feed closing", market_id,
+                        attempt.attempt_id)
+            return
+        if self._cancel_requested():
+            logger.info("realtime market %s recovery %s dropped: cancelled", market_id,
                         attempt.attempt_id)
             return
         if self._clock() >= attempt.deadline_mono:
@@ -1078,7 +1155,7 @@ class RealtimeMarketFeed:
         self, market: _Market, attempt: RecoveryAttempt, why: str, floor: float | None
     ) -> None:
         """Back off; SIG's Retry-After is a floor that the cap never shortens."""
-        if self._closing.is_set() or attempt.cancelled:
+        if self._closing.is_set() or attempt.cancelled or self._cancel_requested():
             return
         market.failures += 1
         delay = self._recovery.backoff(market.failures)

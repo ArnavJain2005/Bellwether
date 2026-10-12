@@ -2,8 +2,10 @@
 
 The ledger is the engine's record of what the realtime feed may have missed for each
 market. The engine owns it and passes it to RealtimeMarketFeed; a replacement feed in the
-same process is given the same ledger and inherits everything in it. It is in memory only
-(persistence is a later slice, M2-C) and engine-internal: nothing here is a shared/ schema.
+same process is given the same ledger and inherits everything in it. Its first feed binds
+it to that feed's tournament (slug and UUID); a feed for any other tournament is refused
+before anything changes. It is in memory only (persistence is a later slice, M2-C) and
+engine-internal: nothing here is a shared/ schema.
 
 What it holds, per market:
 - **Blocker instances** (design 4.1). One record per blocking event, not a set member: two
@@ -59,6 +61,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol
 
+from engine.config import TournamentRef
 from engine.sig_client.rate_limiter import check_positive_int, check_positive_seconds
 from engine.sig_client.realtime_topic import StaleReason
 from engine.sig_client.realtime_wire import MarketSettled
@@ -260,8 +263,9 @@ class RecoveryPolicy:
       attempts under the REST client's ReadRetryPolicy, each on the shared account
       RateLimiter. The gate therefore bounds recovery's demand but reserves no account
       budget for anyone: the shared limiter has no priorities.
-    - `attempt_deadline_s` (30 s): one overall deadline per attempt from its start,
-      covering shared rate admission, the request and every retry wait.
+    - `attempt_deadline_s` (30 s): one overall deadline per attempt, from the moment it
+      asks the gate for admission, covering that wait, shared rate admission, the
+      request and every retry wait. An admission that cannot fit is a failed attempt.
     - Failed attempts back off exponentially from `backoff_base_s` (5 s) up to
       `backoff_cap_s` (120 s), with bounded jitter (between half and all of the delay).
       SIG's Retry-After is a floor: the cap never shortens it.
@@ -299,6 +303,10 @@ def bounded_jitter(delay: float, jittered: object) -> float:
     ):
         raise ValueError("recovery jitter must return a delay between half and all of its input")
     return float(jittered)
+
+
+class LedgerScopeError(ValueError):
+    """A feed for another tournament tried to use a ledger bound to one tournament."""
 
 
 class LedgerOwner(Protocol):
@@ -397,6 +405,7 @@ class RecoveryLedger:
     def __init__(self) -> None:
         self._origin = LedgerOrigin.UNKNOWN
         self._declaration: BootstrapDeclaration | None = None
+        self._tournament: TournamentRef | None = None
         self._records: dict[str, _Record] = {}
         self._owner: weakref.ref[LedgerOwner] | None = None
         self._seq = 0
@@ -420,6 +429,11 @@ class RecoveryLedger:
     def declaration(self) -> BootstrapDeclaration | None:
         return self._declaration
 
+    @property
+    def tournament(self) -> TournamentRef | None:
+        """The tournament the ledger is bound to (by its first attach), or None."""
+        return self._tournament
+
     def next_seq(self) -> int:
         """The next value of the ledger's local event counter (orders our own actions)."""
         self._seq += 1
@@ -437,17 +451,36 @@ class RecoveryLedger:
 
     # --- registration -------------------------------------------------------------------
 
-    def attach(self, owner: LedgerOwner, market_ids: Iterable[str], now_mono: float) -> None:
-        """Register a feed and its markets.
+    def attach(
+        self,
+        owner: LedgerOwner,
+        tournament: TournamentRef,
+        market_ids: Iterable[str],
+        now_mono: float,
+    ) -> None:
+        """Register a feed of `tournament` and its markets.
 
-        Refused while another feed using the ledger has not begun closing. A market new
-        to the ledger gets HISTORY_UNKNOWN unless the bootstrap declaration lists it. A
-        market an earlier feed registered gets an unobserved window (FEED_REPLACED) with
-        the retained revision as its fence.
+        The first attach binds the ledger to that tournament (slug and UUID): market ids,
+        revisions, windows and bootstrap evidence mean nothing in another tournament. A
+        feed for any other tournament is refused, and so is any feed while another one
+        using the ledger has not begun closing. Both checks come before any change to
+        the owner, the binding or a record. A market new to the ledger gets
+        HISTORY_UNKNOWN unless the bootstrap declaration lists it. A market an earlier
+        feed registered gets an unobserved window (FEED_REPLACED) with the retained
+        revision as its fence.
         """
+        if not isinstance(tournament, TournamentRef):
+            raise TypeError("tournament must be a TournamentRef")
+        if self._tournament is not None and tournament != self._tournament:
+            raise LedgerScopeError(
+                "the recovery ledger is bound to another tournament "
+                f"({self._tournament.slug} / {self._tournament.id})"
+            )
+        market_ids = list(market_ids)
         current = self._owner() if self._owner is not None else None
         if current is not None and current is not owner and not current.closing:
             raise RuntimeError("the recovery ledger is in use by a feed that is not closing")
+        self._tournament = tournament
         self._owner = weakref.ref(owner)
         for market_id in market_ids:
             record = self._records.get(market_id)

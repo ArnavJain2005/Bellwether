@@ -51,7 +51,7 @@ def declaration(*market_ids: str) -> BootstrapDeclaration:
 
 def attached(ledger: RecoveryLedger, *market_ids: str) -> Owner:
     owner = Owner()
-    ledger.attach(owner, market_ids or (MARKET,), 0.0)
+    ledger.attach(owner, TOURNAMENT, market_ids or (MARKET,), 0.0)
     return owner
 
 
@@ -168,10 +168,10 @@ def test_attach_is_refused_while_another_feed_is_live() -> None:
     ledger = RecoveryLedger.bootstrap(declaration())
     first = attached(ledger)
     with pytest.raises(RuntimeError):
-        ledger.attach(Owner(), (MARKET,), 1.0)
+        ledger.attach(Owner(), TOURNAMENT, (MARKET,), 1.0)
     first.closing = True
     second = Owner()
-    ledger.attach(second, (MARKET,), 1.0)  # allowed once the first has begun closing
+    ledger.attach(second, TOURNAMENT, (MARKET,), 1.0)  # allowed once the first has begun closing
 
 
 def test_replacement_opens_a_window_with_the_retained_fence() -> None:
@@ -180,7 +180,7 @@ def test_replacement_opens_a_window_with_the_retained_fence() -> None:
     ledger.note_revision(MARKET, None, 7, clean=True, why="")
     first.closing = True
     generation = ledger.generation(MARKET)
-    ledger.attach(Owner(), (MARKET,), 5.0)
+    ledger.attach(Owner(), TOURNAMENT, (MARKET,), 5.0)
     (window,) = ledger.open_windows(MARKET)
     assert (window.causes, window.fence, window.state) == (
         (WindowCause.FEED_REPLACED,),
