@@ -508,7 +508,7 @@ an acceptable outcome, unsafe trading is not.
 | A1 | Account state | **Contract and design review** of the account-state reads (next task, below) | P0 | Input to G-1, G-2, G-3, G-7 |
 | A2 | Account state | Raw tournament-scoped reads, keeping unresolved values exact and flagged | A1 reviewed by Arnav | G-7 |
 | A3 | Account state | `AccountSnapshot` that reports what it can and cannot vouch for | A2 | Input to G-3 |
-| M1 | Market data | **Recovery design:** blocker-specific recovery evidence; events that arrive during recovery reads; projection freshness of REST reads; how market readiness feeds engine readiness | P0 | G-8 |
+| M1 | Market data | **Recovery design:** blocker-specific recovery evidence; events that arrive during recovery reads; projection freshness of REST reads; how market readiness feeds engine readiness. Design note (draft, under review): [`design/market-data-recovery.md`](design/market-data-recovery.md) | P0 | G-8 |
 | M2 | Market data | Market-data reconciliation implementing M1 with the existing market-detail and trade-tape reads | M1 reviewed | G-8 |
 | M3 | Market data | Concrete socket adapter implementing `RealtimeTransport` | Existing interface | G-8; exercised in G-10 |
 | R1 | Reference data | S1-T6 race mapping (Antigravity) | S1-T5 output (merged) only | Input to G-1 classification |
