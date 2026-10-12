@@ -1,7 +1,9 @@
 # Market-data recovery design (M1)
 
 Oct 12, 2026 · Roadmap track M1 · Input to gate G-8 and open question OQ-E4 ·
-Status: **draft for independent design review**
+Status: **draft for independent design review** · Revised Oct 12 (M1-F1): continuity
+fence, unknown history across restarts, lifetime guards and the observe/commit step,
+blocker observability and quarantine
 
 This note designs how a realtime market that the feed has marked not ready could be
 shown safe to use again. It is a design only. It changes no code, no `shared/` schema
@@ -10,13 +12,15 @@ G-8's conditions, not the gate itself ([PRD, acceptance gates](../PRD.md#accepta
 
 **Bottom line.** With the documented API and the evidence recorded so far, **no
 realtime blocker can be cleared automatically with proof.** One outcome can be shown:
-a settlement signal can be *confirmed* by the market-state read, which moves the
-market to a terminal state that is never ready again. Every other blocker stays open,
-and the affected market stays not ready for the life of the feed, as it does today.
-Section 10 lists the exact guarantees that are missing as questions for SIG, and
-section 11 lists the policy decisions that are Arnav's. The smallest useful M2 slice
-(section 9) builds readiness results, recovery fencing and fail-closed lifecycle checks
-without clearing anything.
+a settlement signal can be *confirmed* by the market-state read. Under local policy
+the market is then quarantined: it stays blocked and is never ready again in this
+engine, which is not a claim that SIG cannot correct or reopen it. Every other blocker
+stays open, and the affected market stays not ready, as it does today. Blockers must
+also survive restarts: a process that cannot show its market history treats it as
+unknown and is never ready (section 4.2). Section 10 lists the exact guarantees that
+are missing as questions for SIG, and section 11 lists the policy decisions that are
+Arnav's. The smallest useful M2 slice (section 9) builds readiness results, recovery
+fencing, history tracking and fail-closed lifecycle checks without clearing anything.
 
 ## How to read this note
 
@@ -151,6 +155,8 @@ SUBSCRIBED status triggers an orderbook resync, and the market is published read
 that read completes. **A restart therefore clears every blocker without any evidence.**
 Nothing missed before or during the restart is reconciled. This is exactly the
 behaviour the PRD rules out as recovery ([PRD, market-data blockers](../PRD.md#risk-management)).
+Section 4.2 proposes how blockers survive a new feed object, and how a process that
+cannot show its history stays not ready.
 
 ### 1.6 Weaknesses found while reviewing the existing behaviour
 
@@ -197,7 +203,8 @@ None is changed by this note.
   (agreeing with what the feed itself received). Each property must rest on a documented
   guarantee or logged evidence, never on inference.
 - **E3. Unproven reads may only restrict.** A read whose freshness is not established can
-  add a blocker or confirm a terminal state. It can never clear a blocker or publish ready.
+  add a blocker, confirm a settlement or quarantine a market. It can never clear a
+  blocker or publish ready.
 - **E4. No atomic snapshot across endpoints.** Reads of different endpoints, and pages of
   one walk, are separate observations at different times. Nothing here treats them as one
   snapshot.
@@ -240,7 +247,9 @@ differs from the first (`rest.py:910`). It keeps each page's coverage exactly as
   reopened ([SETTLE] lists a `correction` type, which concerns our entries, not market
   state).
 - **Verdict [Proposed]:** never cleared to ready. A read showing `settled` with an equal
-  `settledWith` *confirms* the blocker as terminal (the market is never ready again). A
+  `settledWith` *confirms* the blocker, and the market is quarantined under local policy
+  (4.1): the instance stays blocking and visible, and the market is never ready again in
+  this engine. That is not proof that SIG cannot correct or reopen it (Q9). A
   read showing `open`, or a different label, is inconclusive: it cannot tell a stale read
   from a reversal, so the blocker stays open.
 
@@ -320,7 +329,7 @@ differs from the first (`rest.py:910`). It keeps each page's coverage exactly as
 
 | Blocker | Best documented evidence | Clearable today? | Missing (section 10) |
 | --- | --- | --- | --- |
-| `MARKET_SETTLED` | Market detail showing the same settlement | **No**; confirmable as terminal | Q1, Q2, Q9 |
+| `MARKET_SETTLED` | Market detail showing the same settlement | **No**; confirmable, then quarantined (local policy) | Q1, Q2, Q9 |
 | `NULL_TRADE_SEQUENCE` | Tape and price | **No** | Q3, Q4, Q5, Q6, Q11 |
 | `REVISION_GAP` | Market detail; tape over an unknown window | **No** | Q1, Q3, Q4, Q6, Q7, Q8 |
 | `RESYNC_REQUIRED` | As for a gap | **No** | as above, Q12 |
@@ -419,39 +428,212 @@ compares a local wall-clock time with a SIG timestamp (`asOf.at`, `executedAt`,
   `StaleReason`, the local monotonic time it was raised, the market's generation at that
   moment, the revision interval it concerns when known (none for an unattributable
   `MALFORMED`), the triggering item when one exists (for example the `marketSettled`
-  payload), its state (`open` or `terminal`) and the evidence collected for it. Two
-  settlements are two instances. `blockers(market_id)` keeps returning the set of open
-  reasons, so existing callers are unaffected.
-- **Generation.** Each market has a counter, starting at 0, raised synchronously by every
-  event in 4.2. It generalizes the existing fence for book resyncs (`request =
+  payload), its state and the evidence collected for it. Two settlements are two
+  instances. The state is `open` or `quarantined`. **Both states block.** No state means
+  "cleared" in M2-A, because nothing clears (4.6).
+- **Quarantine is local policy.** A quarantined instance records that this engine has seen
+  enough to stop treating the market as tradable and stops recovering it. It is **not**
+  evidence that SIG cannot correct, reverse or reopen the market (Q9). Nothing lifts a
+  quarantine automatically; whether an operator ever may is decision D-5.
+- **Recovery ledger.** Blocker instances, unobserved windows (4.3), the last accepted
+  revision per topic and the market's history state (4.2) live in a `RecoveryLedger` that
+  the engine owns and passes to the feed. The ledger outlives any one feed object: a
+  replacement feed in the same process is given the same ledger and inherits everything in
+  it. In M2-A the ledger is in memory only; persistence is a later slice (M2-C, D-4).
+- **Generation.** Each market has a counter in the ledger, starting at 0, raised by the
+  events in 4.4. It generalizes the existing fence for book resyncs (`request =
   market.wanted`, `realtime.py:609`, checked at `realtime.py:649`).
-- **Recovery attempt.** One per market at a time. It records the generation and the set of
-  open blocker instances when it starts, then makes its reads. It may commit only under
-  4.3. An attempt that loses the race is discarded, and the next one starts from scratch
-  (under the bounds in section 5).
+- **Recovery attempt.** One per market at a time. It records the generation, the set of
+  blocker instances it targets and its own deadline when it starts, then makes its reads.
+  Its responses are applied only through the observe/commit step (4.6).
 
-### 4.2 What raises the generation [Proposed]
+**Blocker observability: a reviewed compatibility change.** `blockers(market_id)` keeps its
+signature and return type (`frozenset[StaleReason]`). In M2-A it returns the reason of
+**every open and every quarantined instance**, so a quarantined settlement stays visible as
+`MARKET_SETTLED`. M2-A also adds new blocking reasons: `HISTORY_UNKNOWN` (4.2) and
+`LIFECYCLE_NOT_OPEN` (4.6); M2-B adds `REVISION_ANOMALY` (4.7). Callers are **not**
+unaffected:
+
+- A feed started without retained history reports `{HISTORY_UNKNOWN}` and is never ready,
+  where today it reports no blocker and becomes ready after its first orderbook read.
+- Code that enumerates `StaleReason` or `BLOCKING_REASONS` sees new members.
+- Existing tests that expect a market to become ready after its initial resync must
+  construct the feed with an explicit bootstrap ledger (4.2).
+
+[Code] No module in `engine/` calls `blockers()` today; only the feed defines it
+(`realtime.py:420`). This change needs the reviewer's approval as part of M2-A.
+
+### 4.2 History, bootstrap and restart [Proposed]
+
+**Unknown history.** A market's history is *unknown* when the ledger cannot show what
+happened to it before the current feed observed it: which blockers were raised and are
+unresolved, and which revision was last accepted. A market with unknown history carries a
+`HISTORY_UNKNOWN` instance, which blocks like any other and which nothing in M2-A resolves:
+not a lifecycle read showing `open`, not an orderbook resync, not a contiguous batch.
+
+Every ledger has an origin, set when it is created:
+
+| Origin | When | History of each market |
+| --- | --- | --- |
+| `unknown` | The default: a new ledger with nothing loaded, which is what every new process has in M2-A | Unknown: `HISTORY_UNKNOWN` on every market, never ready |
+| `bootstrap` | An explicit `BootstrapDeclaration` that history begins now and that no earlier history exists | Begins at the first subscription; the initial-state evidence it requires is decision D-3 |
+| `loaded` | A durable ledger reloaded at start (M2-C, D-4) | Whatever the loaded ledger holds, including open and quarantined instances and fences |
+
+Three situations are kept apart:
+
+- **Initial bootstrap** (D-3): history starts here, deliberately, under an explicit
+  declaration. There is no earlier revision to compare with, so the first subscription is
+  not an unobserved window with a fence; its acceptance is whatever D-3 decides.
+- **Reconnect and in-process restart recovery** (D-1): history is known. A socket or channel
+  break, a token refresh or expiry, or a replacement feed object sharing the ledger opens an
+  unobserved window with a captured fence (4.3). Retained blockers stay; nothing about the
+  new feed object resets them.
+- **Restart without retained history**: a new process with an `unknown` ledger. This is not
+  bootstrap, because the process cannot show that nothing came before it. Every market is
+  `HISTORY_UNKNOWN`.
+
+**Why M2-A is safe without persistence.** In production, M2-A creates only `unknown`
+ledgers. So every new process reports every market not ready, whatever its lifecycle reads
+and book resyncs show; and within a process, every replacement feed shares the ledger and
+inherits its blockers. A fresh feed object can therefore neither forget a known blocker nor
+produce `READY` from an empty history. The cost is that M2-A never produces `READY` in
+production; that is acceptable because no order path exists and trading is not activated.
+`BootstrapDeclaration` exists in M2-A only so that tests can exercise the ready path. No
+module in `engine/` creates one until Arnav decides D-3 and D-4, and an M2-A test checks
+that none does. Using it in tests is not an adoption of D-3.
+
+### 4.3 Revision continuity across an unobserved window [Proposed]
+
+This predicate is what D-1 would rely on. It is defined here so that it is correct whatever
+D-1 decides.
+
+**Epoch assumption.** Revisions of one topic are compared only with each other, and only
+under the assumption that SIG's revisions for that topic increase strictly and never reset,
+across SIG deploys and across our reconnects and restarts (Q7). No documented field names
+an epoch, so the assumption cannot be checked; the detectors in 4.7 open
+`REVISION_ANOMALY` when evidence contradicts it. For a fence carried across a restart
+(M2-C), the assumption also covers the ledger: the persisted value is the revision this
+engine last accepted.
+
+**Fence.** When an unobserved window opens (socket or channel error or close, a SUBSCRIBED
+re-join, token refresh or expiry, a replacement feed sharing the ledger), the feed
+captures, synchronously and in the same step that handles the event, the window's fence:
+`F` = the topic's last accepted revision in the ledger at that instant, with the window's
+id and the generation. If no batch has ever been accepted for the topic, there is no fence
+(`F` absent).
+
+**Clean advancing batch.** A `market_batch` processed after the fence was captured that is
+well-formed, is not flagged `resyncRequired`, names no exchange without its book, and is
+accepted by the existing rule *without a gap*: `revision` is greater than the last accepted
+revision at its arrival, and `previousRevision` is at or below it.
+
+**Confirmation.** A window with fence `F` is confirmed through revision `R` when the
+topic's last accepted revision has advanced from `F` to `R` (`R > F`) through clean
+advancing batches only, all processed after the fence was captured. Then every revision in
+(`F`, `R`] was carried by a well-formed, complete batch that this feed processed.
+
+**What never confirms a window:**
+
+- **A duplicate.** A batch whose `revision` is at or below the last accepted revision
+  advances nothing, whatever its `previousRevision`. Counterexample to the earlier wording:
+  last accepted 40, a socket close captures `F` = 40, and after the re-join a retried batch
+  with `previousRevision` 39 and `revision` 40 arrives. Its `previousRevision` is at or below
+  40, but it is old content and says nothing about revisions published after the
+  disconnection. It does not confirm the window (AT-30).
+- A batch that advances the revision but is not clean (`resyncRequired`, malformed with a
+  parsed `delivery`, missing a named book): the window stays unconfirmed, and the batch
+  raises its own blocker as today.
+- A gap (`previousRevision` above the last accepted revision): `REVISION_GAP` opens, as
+  today; the window stays unconfirmed.
+- Anything when there is no fence: with `F` absent, revisions cannot show what the window
+  missed.
+
+**What a confirmation covers, and what it does not.** It covers only the revisioned
+`market_batch` stream of that topic, for revisions (`F`, `R`]. It does **not** show that
+standalone events sent during the window were delivered: standalone `market_settled` and
+`book_dirty` carry no revision (1.6, item 3; Q10). It says nothing about revisions above
+`R`, about content of non-clean batches (each has its own blocker), or about the account
+topic. It is void if the epoch assumption is false.
+
+### 4.4 What raises the generation [Proposed]
+
+The generation is raised synchronously, in the same step as the event, and never by an
+await.
 
 | Event | Why it invalidates an attempt |
 | --- | --- |
-| Any new blocker instance, including one carried by a duplicate or late batch (4.4) | The attempt's target set is out of date |
-| SUBSCRIBED (re-join), socket or channel error or close | A new unobserved window has opened (1.6, item 1) |
-| Token refresh or expiry | Documented to require resynchronization ([RT]) |
-| A lifecycle read showing a status different from the last one seen | The market's state changed under the attempt |
-| A suspected revision anomaly (4.4) | The topic's continuity is in doubt |
-| `aclose()` | Nothing may commit after closing begins (as today, `realtime.py:617`, `realtime.py:658`) |
+| A new blocker instance from the realtime topic, including one carried by a duplicate or late batch (4.7) | The attempt's target set is out of date |
+| An unobserved window opening (4.3) | The market's continuity changed under the attempt |
+| A commit or restriction by the observe/commit step that adds or changes an instance (4.6) | Raised once, *after* that step has applied its own changes |
 
-Not raised by: a normal, contiguous batch with sequenced trades and complete books; a
-standalone `book_dirty`; a book expiry. These change books, and books are governed by the
-existing book-readiness rules, which are checked again before any ready is published.
+Not raised by: a normal, clean batch with sequenced trades and complete books; a standalone
+`book_dirty`; a book expiry. These change books, and books are governed by the existing
+book-readiness rules, which are checked again before any ready is published. A lifecycle
+read does not raise the generation by itself; only the instances it adds or changes do,
+through step 5 of 4.6, so it cannot invalidate its own transaction.
 
-### 4.3 Commit conditions [Proposed]
+### 4.5 Lifetime guards [Proposed]
 
-A recovery attempt may change a blocker instance only if, checked synchronously in one
-step with no `await` between the check and the change:
+**Readiness ends when closing begins.** [Code] `aclose()` sets the closing flag before it
+awaits `transport.close()` (`realtime.py:468`-`469`), and `_ready_now` checks that flag first
+(`realtime.py:578`), so `is_ready` is already false while `transport.close()` is pending.
+M2-A keeps that order: `readiness(market_id)` checks closing before anything else and
+reports `NOT_READY` with the reason "feed closing" from the moment `aclose()` begins.
 
-1. the feed is not closing and the attempt was not cancelled or past its deadline;
-2. the market's generation equals the attempt's starting generation;
+**Guard.** An attempt is *live* while the feed is not closing, the attempt has not been
+cancelled and the monotonic clock is before the attempt's deadline. Every effect of an
+attempt passes the guard first, synchronously, in the observe/commit step (4.6). If the
+guard fails, the response is dropped: no blocker instance, ledger entry, generation, fence,
+lifecycle observation or event is created or changed. A log line is the only trace.
+
+- **Closing** (`aclose()` begins): every attempt is cancelled, and nothing is applied,
+  including a response already received but not yet passed through the step.
+- **Cancellation** for any other reason: the same.
+- **Deadline expiry**: the same, including a response that arrived in time but reaches
+  the step after the deadline.
+- **Supersession is not cancellation.** An attempt whose generation is no longer current
+  is not cancelled. If it completes while live, its response goes through the step as a
+  *superseded* response, which may only restrict (4.6). A cancelled attempt may not even
+  restrict.
+
+**The existing teardown.** [Code] After closing, `run()`'s `finally` clears `subscribed` and
+calls `_set_stale(STOPPED)` for every market (`realtime.py:459`-`463`). That emits
+`MarketStale` only for markets whose `ready` flag was still set, and `STOPPED` is not a
+blocking reason. It withdraws readiness that the closing flag has already withdrawn. M2-A
+leaves it unchanged and adds nothing to it: no ledger write, blocker change or recovery
+effect happens after closing begins.
+
+### 4.6 The observe/commit step [Proposed]
+
+Every response of a recovery attempt is applied by one synchronous step, with no `await`
+anywhere inside it:
+
+1. **Guard.** If the attempt is not live (4.5), drop the response and stop.
+2. **Classify.** The response is *current* if the market's generation equals the attempt's
+   starting generation, and *superseded* otherwise.
+3. **Decide**, without changing anything yet:
+   - *Restriction*, current or superseded: if the tournament context shows `settled` or
+     `closed`, and the market has no quarantined `LIFECYCLE_NOT_OPEN` instance, decide to
+     add one in state `quarantined`. A response showing `open` restricts nothing.
+   - *Confirmation*, current only, under conditions 1 to 6 below: for each targeted open
+     `MARKET_SETTLED` instance whose `settledWith` equals the context's `settledWith`
+     (Q2), decide to move it to `quarantined`.
+   - Nothing else. In M2-A no decision clears an instance.
+4. **Apply** every decision together, attach the evidence (attempt id, generation, the
+   status and settlement exactly as sent, our read's start and finish on the monotonic
+   clock), and record the lifecycle observation.
+5. **Raise the generation once**, and only if step 4 added or changed an instance. Because
+   this comes after step 4, the attempt's own changes cannot invalidate it; the raise
+   invalidates every *other* decision made against the earlier generation.
+6. **Publish** at most a `MarketStale` withdrawal, if the market was ready. The step never
+   publishes `MarketReady`; readiness is re-evaluated afterwards by the normal rule, and
+   `MarketReady` comes only from the book-resync path, which checks every condition again
+   synchronously before publishing.
+
+Conditions for a confirmation in step 3 (all must hold):
+
+1. the attempt is live (step 1);
+2. the response is current (step 2);
 3. the instance is still `open`;
 4. every read in the attempt was **started** after the instance was raised and after the
    attempt began (ordering of our own requests on the monotonic clock; no claim about
@@ -459,25 +641,26 @@ step with no `await` between the check and the change:
 5. every read succeeded and passed the client's scope checks;
 6. the blocker-specific predicate (section 2) holds using only documented comparisons.
 
-Committing changes the blocker instance only. It never sets `ready` directly. Readiness is
-then re-evaluated from scratch by the existing rule: subscription, token, every book
-version and expiry rule, and no open blocker. [Code] The existing book resync already
-refuses ready when any blocker is outstanding (`realtime.py:651`).
+**A superseded response may still quarantine.** A completed, live, superseded response that
+shows `settled` or `closed` quarantines the market. This is local policy (4.1): a stale read
+cannot show the market is open, but showing it was settled or closed at some point is
+enough for this engine to stop trading it. It is not proof that SIG cannot reopen or correct
+it (Q9).
 
-**In M2's first slice the only change a commit can make is `open` → `terminal` for a
-`MARKET_SETTLED` instance confirmed by market state.** No predicate that clears a blocker
-is implemented until section 10's questions are answered or Arnav decides otherwise
-(section 11).
+**In M2-A the step can only restrict and confirm.** No predicate that clears a blocker is
+implemented until section 10's questions are answered or Arnav decides otherwise (section
+11).
 
-### 4.4 How concurrent events supersede recovery [Proposed]
+### 4.7 How concurrent events supersede recovery [Proposed]
 
 - **Concurrent pushes.** Books keep applying by version while an attempt runs, as today.
-  A push that raises a blocker raises the generation; the attempt cannot commit.
+  A push that raises a blocker raises the generation; the attempt's response is then
+  superseded.
 - **New blockers.** As above. The new instance is included in the next attempt.
-- **Reconnects.** Every SUBSCRIBED raises the generation and opens an unobserved window
-  (decision D-1 in section 11 settles whether that window blocks).
+- **Reconnects.** Every re-join opens an unobserved window with a fence (4.3) and raises
+  the generation. Whether the window blocks until confirmed is D-1.
 - **Revision resets.** [Unknown] whether they occur (Q7). None is detectable from
-  documented fields: the next batches simply look like duplicates. Two fail-closed
+  documented fields: the next batches simply look like duplicates. Three fail-closed
   detectors are proposed for duplicate batches, whose arrays are otherwise ignored:
   a `marketSettled` item or a null-sequence trade in a duplicate raises the corresponding
   blocker (redundant but harmless after a genuine retried send, which repeats content
@@ -487,20 +670,13 @@ is implemented until section 10's questions are answered or Arnav decides otherw
   (the market is then already blocked) or the id has left the 4,096-id memory (a false
   positive that blocks, never one that clears).
 - **Closing.** Two meanings:
-  - *Feed closing* (`aclose()`): the attempt is cancelled, nothing commits, and nothing
-    is published, as for book resyncs today (`realtime.py:617`).
+  - *Feed closing* (`aclose()`): readiness ends at once; attempts are cancelled and their
+    responses dropped (4.5).
   - *Market closing*: [Documented] no realtime signal exists for `open` → `closed` (1.6,
-    item 6). A lifecycle read showing `closed` or `settled` raises a new terminal reason,
-    `LIFECYCLE_NOT_OPEN`, and raises the generation.
+    item 6). A lifecycle read showing `closed` or `settled` quarantines the market through
+    the observe/commit step (4.6).
 
-### 4.5 Obsolete responses [Proposed]
-
-A response belonging to an attempt that can no longer commit is never used to publish
-ready or to change a blocker instance. Under E3 it may still restrict: if it shows the
-market `settled` or `closed`, it raises `LIFECYCLE_NOT_OPEN` (a new instance, which raises
-the generation again). It is logged with its attempt id and generation.
-
-### 4.6 No snapshot across endpoints
+### 4.8 No snapshot across endpoints
 
 Market detail, the orderbook and the tape are read separately (E4). [TMKT] returns status
 and books in one response, but nothing documents that its `status` was read at its books'
@@ -530,10 +706,11 @@ them.
   authoritative market orderbook is temporarily unavailable".
 - **Deadlines.** [Code] The client has a deadline per logical read but none per
   collection (`rest.py:36`-`38`). Each recovery attempt therefore gets its own overall
-  deadline (*configurable*) on the injected monotonic clock. An attempt past its deadline
-  is cancelled and commits nothing.
-- **Cancellation.** Cancelling an attempt (deadline, `aclose()`, superseding generation)
-  propagates `CancelledError`; nothing is committed and no event is published.
+  deadline (*configurable*) on the injected monotonic clock. Past it, the attempt is
+  cancelled, and a response that reaches the observe/commit step late is dropped (4.5).
+- **Cancellation.** Cancelling an attempt (deadline, `aclose()`) propagates
+  `CancelledError`; nothing is applied and no event is published. Supersession does not
+  cancel an attempt (4.5).
 - **Shared rate budget.** All reads share the account limiter (80 of 100 reads a minute).
   [Code] The feed already gates orderbook resyncs at 40 starts a minute
   (`realtime.py:291`). Recovery reads get their own gate (*configurable*, like the resync
@@ -543,46 +720,51 @@ them.
   many markets, it uses the market list [TMKTS] (three pages for 237 markets) rather than
   one market-detail read per market.
 - **Retry scheduling.** One attempt per market at a time; triggers during an attempt
-  coalesce into one follow-up (as for resyncs). Failed attempts back off exponentially with
-  jitter and a floor from any `Retry-After` (*configurable* base and cap). After a
-  *configurable* number of failed attempts the market is reported as `escalated` in its
-  readiness result: still not ready, still retried at the capped interval, and visible to
-  the operator. Escalation never clears anything.
-- **Partial or stale evidence never clears a blocker.** This follows from E2, E3 and 4.3.
+  coalesce into one follow-up, which starts after the current attempt ends (as for
+  resyncs). Failed attempts back off exponentially with jitter and a floor from any
+  `Retry-After` (*configurable* base and cap). After a *configurable* number of failed
+  attempts the market is reported as `escalated` in its readiness result: still not ready,
+  still retried at the capped interval, and visible to the operator. Escalation never
+  clears anything. A quarantined market is not retried.
+- **Partial or stale evidence never clears a blocker.** This follows from E2, E3 and 4.6.
 - **Expiry and clock skew are unchanged.** No recovery read is a book read. A recovery
-  attempt that completes after a held book's `nextExpiryAt` may still commit its blocker
-  change (its evidence does not concern that book), but readiness is not published until
-  a book read covers the expiry under the existing rules, which with the skew bound unknown
-  means a versioned read made at or after it (example F-6).
+  attempt that completes after a held book's `nextExpiryAt` may still pass through the
+  observe/commit step (expiry does not raise the generation), but readiness is not
+  published until a book read covers the expiry under the existing rules, which with the
+  skew bound unknown means a versioned read made at or after it (example F-6).
 
 ## 6. Engine readiness
 
 ### 6.1 Proposed per-market result [Proposed]
 
 An engine-internal, immutable `MarketReadiness` value, built on request from the feed's
-state. It lives in `engine/`; no `shared/` schema is proposed (the PRD reserves readiness
-schemas for Arnav's approval).
+state and the ledger. It lives in `engine/`; no `shared/` schema is proposed (the PRD
+reserves readiness schemas for Arnav's approval).
 
 | Field | Content |
 | --- | --- |
 | `market_id` | The market |
-| `status` | `READY`, `NOT_READY` or `TERMINAL` |
+| `status` | `READY`, `NOT_READY` or `QUARANTINED` |
 | `generation` | The market's generation when evaluated |
 | `evaluated_mono`, `evaluated_utc` | Local monotonic time (for ordering) and local UTC time (for display only) |
-| `reasons` | Human-readable reasons, one per failing condition, for example "blocker: revision gap (revisions 812–815) open; missing Q1, Q3, Q4" |
+| `reasons` | Human-readable reasons, one per failing condition, for example "blocker: revision gap (revisions 812–815) open; missing Q1, Q3, Q4" or "history unknown: no retained blocker history" |
+| `closing` | True from the moment `aclose()` begins |
+| `history` | Ledger origin (`unknown`, `bootstrap`, `loaded`) and whether `HISTORY_UNKNOWN` is open |
 | `transport` | Subscribed; token valid |
 | `books` | Per exchange: version or null, source, complete, expiry known, outstanding expiry |
-| `continuity` | Last accepted revision; open unobserved windows (cause and time) |
-| `lifecycle` | Last lifecycle read: status, `settledWith`, `settledOn` as sent, when our read started and finished (monotonic), its generation, and the fixed note "unversioned" |
-| `blockers` | Every instance: reason, raised at, generation, revision interval, state, evidence collected, missing guarantees (question ids) |
+| `continuity` | Last accepted revision; each unobserved window with its cause, fence and state (open, or confirmed through `R`), and the fixed note that confirmation covers the revisioned stream only (4.3) |
+| `lifecycle` | Last lifecycle read: status, `settledWith`, `settledOn` as sent, when our read started and finished (monotonic), its generation, whether it was current or superseded, and the fixed note "unversioned" |
+| `blockers` | Every open and quarantined instance: reason, raised at, generation, revision interval, state, evidence collected, missing guarantees (question ids) |
 | `escalated` | True after the configured number of failed attempts |
 | `does_not_cover` | The fixed statement that this result says nothing about account state, orders, risk, configuration or reference data |
 
-- `READY` exactly when today's `_ready_now` holds, no blocker instance is open or
-  terminal, a lifecycle read made in the current generation showed the market `open`
-  (decision D-3), and the unobserved-window policy (D-1) is met.
-- `TERMINAL` when any instance is terminal (settlement confirmed, or the market was
-  seen closed or settled). Recovery stops for that market.
+- `QUARANTINED` when any instance is quarantined. Recovery stops for that market. This is
+  local policy (4.1).
+- `READY` only when all of these hold: the feed is not closing; today's `_ready_now` holds;
+  no instance is open or quarantined (so `HISTORY_UNKNOWN` is absent); no unobserved window
+  is open; and the market's initial-state evidence meets the bootstrap declaration (D-3).
+  While D-1 is undecided, an unconfirmed window counts as open: M2-A relaxes nothing that a
+  decision would govern (9.2).
 - `NOT_READY` otherwise.
 
 ### 6.2 Its role in engine readiness
@@ -597,17 +779,18 @@ schemas for Arnav's approval).
   **Feed readiness alone never authorizes trading.**
 - [Proposed, for O2 and S1] The order path re-reads the market's readiness immediately
   before sending, and refuses if the generation differs from the one its decision used.
-- A `READY` result means "no loss detected, plus a recent lifecycle read showing the
-  market open". It does not mean nothing was lost: delivery is best-effort ([RT]), and a
-  missed standalone `market_settled` is undetectable (1.6, item 3).
+- A `READY` result means "no loss detected in the revisioned stream since history began,
+  plus the initial-state evidence the bootstrap declaration requires". It does not mean
+  nothing was lost: delivery is best-effort ([RT]), and a missed standalone
+  `market_settled` is undetectable (1.6, item 3).
 
 ### 6.3 Protective cancellation stays available
 
 Protective cancellation is not gated on `MarketReadiness`. A market that is `NOT_READY`,
-`TERMINAL` or escalated may still have resting orders, and cancelling them must remain
-possible, scoped to the configured tournament, within the rate budget and audited
-(`CLAUDE.md` hard rule 3). Nothing in this design blocks a cancel, and a cancel path never
-places or enlarges an order. No cancel path exists yet.
+`QUARANTINED`, escalated or of unknown history may still have resting orders, and
+cancelling them must remain possible, scoped to the configured tournament, within the rate
+budget and audited (`CLAUDE.md` hard rule 3). Nothing in this design blocks a cancel, and a
+cancel path never places or enlarges an order. No cancel path exists yet.
 
 ## 7. Failure examples
 
@@ -622,70 +805,87 @@ could have told the two apart, which is why no tape walk clears anything (3.2, 3
 
 **F-2. Settlement during a lifecycle read.** g=4, a `REVISION_GAP` instance is open.
 t=0 attempt A starts (g=4) and requests market detail. t=0.3 a batch carries
-`marketSettled`; `MARKET_SETTLED` opens, g=5. t=0.6 the response arrives showing `open`.
-A cannot commit (g changed). Under E3 an `open` read restricts nothing, so it is only
-logged. t=2 attempt B starts (g=5); t=2.4 market detail shows `settled` with the same
-`settledWith`; B commits `MARKET_SETTLED` → `terminal`. Result: `TERMINAL`. The
-`REVISION_GAP` instance stays open; it no longer matters for trading, but it is never
-recorded as cleared.
+`marketSettled`; `MARKET_SETTLED` opens, g=5. t=0.6 A's response arrives, live, showing
+`open`. It is superseded, and `open` restricts nothing, so the step changes nothing and
+the generation stays 5. t=2 attempt B starts (g=5). t=2.4 market detail shows `settled`
+with the same `settledWith`. In one step, B (current) moves `MARKET_SETTLED` to
+`quarantined` and adds a quarantined `LIFECYCLE_NOT_OPEN`; then g=6. B's own changes do not
+invalidate it, because the raise comes after them. Result: `QUARANTINED`; `blockers()`
+returns `REVISION_GAP`, `MARKET_SETTLED` and `LIFECYCLE_NOT_OPEN`. The `REVISION_GAP`
+instance stays open and visible; it is never recorded as cleared.
 
 **F-3. Truncated history.** A tape walk of a busy exchange reads three pages, each with
 `hasMore: true`, and reaches its page cap (as the recorded sample did under a three-page
 cap, 3.4). The client raises a pagination error and returns no partial tape. The attempt
 fails, the blocker stays open, and the next attempt waits for the backoff.
 
-**F-4. Restart.** t=0 `REVISION_GAP` opens on market 258. t=60 the process restarts.
-*Today:* the new feed has no blockers; at t=63 its first orderbook read publishes 258
-ready. Nothing was reconciled (1.5). *Proposed (D-4):* the open instance and the last
-accepted revision are persisted and reloaded, so 258 is still blocked after the restart;
-the downtime is recorded as an unobserved window, and the first batch after the restart
-either shows continuity (`previousRevision` at or below the persisted revision) or opens a
-new `REVISION_GAP`.
+**F-4. Restart.** t=0 `REVISION_GAP` opens on market 258.
+- *Today:* t=60 the process restarts; the new feed has no blockers, and at t=63 its first
+  orderbook read publishes 258 ready. Nothing was reconciled (1.5).
+- *M2-A, new process:* the new ledger's origin is `unknown`, so every market, 258 included,
+  carries `HISTORY_UNKNOWN`. At t=63 the lifecycle read shows `open` and the orderbook
+  resync succeeds; 258 is still `NOT_READY` ("history unknown"), and no `MarketReady` is
+  published (AT-02).
+- *M2-A, same process:* the engine replaces a feed object that stopped. The new feed is given
+  the same ledger, so `REVISION_GAP` is still open and visible, and the replacement opens an
+  unobserved window with fence = the ledger's last accepted revision (AT-03).
+- *M2-C (D-4):* the ledger is persisted and reloaded (origin `loaded`), so the same holds
+  across processes: the open instance survives, and the downtime is an unobserved window
+  with the persisted fence (AT-29).
 
-**F-5. Stale generation after a reconnect.** g=7, attempt A (g=7) requests market detail.
-t=1 the socket closes; every market's g rises (258 to g=8). t=3 the re-join; resyncs and
-a new attempt B (g=8) start. t=4 A's response arrives showing `settled`. A cannot commit,
-but under 4.5 it restricts: `LIFECYCLE_NOT_OPEN` opens (g=9), which also makes B's commit
-impossible. The next attempt confirms it. If A's response had shown `open`, it would have
-been logged and ignored.
+**F-5. Superseded response after a reconnect.** g=7, attempt A (g=7) requests market detail.
+t=1 the socket closes: a window opens with fence `F` = the last accepted revision, and g=8.
+A is not cancelled. t=3 the re-join. t=4 A's response arrives before A's deadline, with the
+feed still live, showing `settled`. It is superseded, so it cannot confirm anything, but it
+restricts: a quarantined `LIFECYCLE_NOT_OPEN` is added, then g=9. The market is
+`QUARANTINED` and is not retried. Had A's deadline passed before its response reached the
+step, the response would have been dropped even though it showed `settled`; the follow-up
+attempt would read again. Had it shown `open`, nothing would have changed.
 
 **F-6. Expiry crossed during a recovery read.** A pushed book for exchange 947 carries
 `nextExpiryAt` E. At t=0 (before E) an attempt requests market detail; at t=2 the local
 clock passes E and `BOOK_EXPIRY` triggers a book resync; at t=3 the market-detail response
-arrives. The attempt may commit its blocker change (expiry does not raise the generation),
-but readiness is not published: the expired book is still held. The resync's book read is
-unversioned and, with `expiry_skew_margin_s` unset, cannot cover E, so the market stays
-not ready and is read again. Only a versioned read whose `asOf.at` is at or after E clears
-it (`realtime_topic.py:509`).
+arrives. It may pass through the observe/commit step (expiry does not raise the
+generation), but readiness is not published: the expired book is still held. The resync's
+book read is unversioned and, with `expiry_skew_margin_s` unset, cannot cover E, so the
+market stays not ready and is read again. Only a versioned read whose `asOf.at` is at or
+after E clears it (`realtime_topic.py:509`).
 
-**F-7. Shutdown during an attempt.** An attempt is waiting for a tape page when
-`aclose()` is called. The attempt is cancelled; nothing is committed, persisted or
-published, and every market reports not ready from the moment `aclose()` returns, as today
-(`realtime.py:466`, `realtime.py:576`).
+**F-7. Shutdown during an attempt.** t=0 an attempt is waiting for its read when `aclose()`
+begins, and the transport's `close()` takes two seconds. From t=0, `is_ready` is false for
+every market and `readiness()` reports "feed closing", although `close()` has not returned.
+The attempt is cancelled. t=0.2 its response arrives showing `settled`: it is dropped,
+because a cancelled attempt may not even restrict. No instance, ledger entry, generation or
+event changes. The existing teardown then withdraws readiness that was already withdrawn
+(4.5).
 
 **F-8. Revision reset (hypothetical, Q7).** Last accepted revision 5,000. SIG redeploys and
 the topic restarts at revision 1. *Today:* every batch is a duplicate; its books apply, its
 trades and settlements are silently ignored, and the market stays ready. *Proposed:* a
 duplicate carrying `marketSettled`, a null-sequence trade, or a trade id never seen opens a
-blocker (4.4). A reset during a period with no trades and no settlement remains
-undetectable.
+blocker (4.7). A reset during a period with no trades and no settlement remains
+undetectable, and an open window can never be confirmed, because no batch advances past its
+fence (fail-closed).
 
-**F-9. Reconnect on a quiet topic.** Last accepted revision 40. t=0 the socket closes; a
-settlement batch (revision 41) is published and lost. t=5 the re-join; the orderbook read
-succeeds. *Today:* the market is ready at t=6 and stays ready while no batch arrives.
-*Proposed:* the lifecycle read in the new generation may show `settled` (restricts), or
-`open` if market detail lags (Q1); the window stays open under D-1 until a contiguous batch
-or the policy allows otherwise.
+**F-9. Reconnect on a quiet topic.** Last accepted revision 40. t=0 the socket closes; the
+window's fence is 40; a settlement batch (revision 41) is published and lost. t=5 the
+re-join; the orderbook read succeeds. *Today:* the market is ready at t=6 and stays ready
+while no batch arrives. *Proposed:* the window stays open until a clean batch advances past
+40 (4.3). The next batch, (41, 42], shows a gap and opens `REVISION_GAP`. A retried
+(39, 40] confirms nothing. A lifecycle read may quarantine the market if it shows `settled`,
+or show `open` if market detail lags (Q1). Whether an open window blocks trading is D-1;
+M2-A treats it as blocking.
 
 **F-10. `resyncRequired` hides a settlement.** A batch for revisions 90–95 arrives flagged
 `resyncRequired`, with books and some trades only. `RESYNC_REQUIRED` opens. A lifecycle
-read shows `settled`: `LIFECYCLE_NOT_OPEN` opens and the market is `TERMINAL`. A lifecycle
-read shows `open`: inconclusive (Q1, Q12); the market stays blocked.
+read shows `settled`: the market is quarantined (`LIFECYCLE_NOT_OPEN`, `QUARANTINED`). A
+lifecycle read shows `open`: inconclusive (Q1, Q12); the market stays blocked.
 
 **F-11. A missed standalone settlement (Q10).** An admin settles the market with a
 standalone `market_settled` event, which the socket drops. No revision moves, so nothing
-is detected. The next periodic lifecycle read (proposed for M2-B) is the only detector, and
-whether it reflects the settlement is Q1.
+is detected, and a window confirmed in the meantime still says nothing about it (4.3). The
+next periodic lifecycle read (proposed for M2-B) is the only detector, and whether it
+reflects the settlement is Q1.
 
 **F-12. Rate limiting during recovery.** An attempt's market-detail read receives 429 with
 `Retry-After: 60`. The client imposes the cooldown on the shared limiter and retries
@@ -696,39 +896,51 @@ next one waits at least 60 s. No blocker changes, and the market stays not ready
 
 Tests use the existing fake transport and harness (`tests/sig_client/realtime_kit.py`) and
 `httpx.MockTransport` REST responses, with the injected monotonic and wall clocks. No live
-calls. "A" marks tests for M2's first slice; "later" marks tests that need a later slice
-or an answer from SIG.
+calls. Unless a row says otherwise, the feed uses a `bootstrap` ledger created by the test
+(4.2). "A" marks tests for M2's first slice; "later" marks tests that need a later slice or
+an answer from SIG.
 
 | ID | Scenario | Expected | Slice |
 | --- | --- | --- | --- |
-| AT-01 | Each blocking reason, then any number of successful orderbook resyncs | Market never ready; blocker open; result `NOT_READY` with the reason | A |
-| AT-02 | Each blocking reason, then a feed restart with no durable ledger | The new feed's result lists an unobserved window with cause "feed start" and says no blocker history is held; nothing in it reads as recovery | A |
-| AT-03 | Same, with the durable ledger | Blocker still open after restart; market not ready | later (D-4) |
-| AT-04 | `MARKET_SETTLED`, market detail shows `settled` with equal `settledWith` | Instance `terminal`; result `TERMINAL`; never ready again, even after more resyncs | A |
+| AT-01 | Each blocking reason, then any number of successful orderbook resyncs | Market never ready; blocker open and listed by `blockers()`; result `NOT_READY` with the reason | A |
+| AT-02 | Each blocking reason; then a new feed with a new default (`unknown`) ledger, as after a process restart; its lifecycle read shows `open` and its orderbook resync succeeds | `blockers()` is `{HISTORY_UNKNOWN}`; `is_ready` false; result `NOT_READY` with "history unknown"; no `MarketReady` published, ever | A |
+| AT-03 | Each blocking reason; then the feed stops and a new feed object is created with the same ledger | The instance is still open and listed by `blockers()`; not ready; an unobserved window with fence = the ledger's last accepted revision is open | A |
+| AT-04 | `MARKET_SETTLED`, current attempt, market detail shows `settled` with equal `settledWith` | `MARKET_SETTLED` quarantined; `LIFECYCLE_NOT_OPEN` added; both listed by `blockers()`; result `QUARANTINED`; never ready, even after more resyncs | A |
 | AT-05 | `MARKET_SETTLED`, market detail shows `open` | Instance stays `open`; result `NOT_READY` with "inconclusive (Q1)" | A |
-| AT-06 | `MARKET_SETTLED`, market detail shows `settled` with a different label | Stays `open`; reason names the label mismatch (Q2) | A |
-| AT-07 | Second `marketSettled` while the first attempt's read is in flight | First attempt cannot commit; a new attempt covers both instances | A |
-| AT-08 | Any new blocker during an attempt | Generation rises; the in-flight response changes nothing (except 4.5 restrictions) | A |
+| AT-06 | `MARKET_SETTLED`, market detail shows `settled` with a different label | `MARKET_SETTLED` stays `open` with the label mismatch named (Q2); `LIFECYCLE_NOT_OPEN` quarantines the market | A |
+| AT-07 | Second `marketSettled` while the first attempt's read is in flight | The first response is superseded and confirms nothing; a follow-up attempt targets both instances | A |
+| AT-08 | Any new blocker during an attempt; the live response shows `open`, or `settled` | `open`: nothing changes; `settled`: quarantine only, no confirmation | A |
 | AT-09 | Reconnect (SUBSCRIBED) during an attempt | Same as AT-08 | A |
 | AT-10 | Token refresh and token expiry during an attempt | Same as AT-08 | A |
-| AT-11 | Obsolete response showing `settled` or `closed` | `LIFECYCLE_NOT_OPEN` opens; nothing cleared; no ready published | A |
-| AT-12 | `aclose()` during an attempt | Attempt cancelled; nothing committed or published; not ready | A |
+| AT-11 | Superseded response, completed before its deadline with the feed live, showing `settled` or `closed` | Quarantined `LIFECYCLE_NOT_OPEN`; generation raised once; no confirmation; nothing cleared; no ready published | A |
+| AT-12 | `aclose()` begins during an attempt while `transport.close()` is pending (slow-close transport); the response then arrives showing `settled` | `is_ready` false and status `NOT_READY` ("feed closing") while `close()` is pending; the attempt is cancelled; no instance, ledger entry, generation or event changes | A |
 | AT-13 | Market detail 503 or 429 until the attempt deadline | Attempt fails; blocker open; next attempt waits for backoff and any `Retry-After` | A |
-| AT-14 | Market detail with a context for another tournament | Scope error; attempt fails; nothing committed | A |
-| AT-15 | First subscription: lifecycle read shows `closed` or `settled` | `LIFECYCLE_NOT_OPEN`; never ready | A |
-| AT-16 | First subscription: lifecycle read fails until deadline | Not ready until a lifecycle read succeeds | A |
-| AT-17 | Book expiry crossed while a recovery read is in flight, skew bound unset | Blocker commit allowed if otherwise valid; no ready until a versioned read at or after the expiry | A |
+| AT-14 | Market detail with a context for another tournament | Scope error; attempt fails; nothing applied | A |
+| AT-15 | Bootstrap, first subscription: lifecycle read shows `closed` or `settled` | Quarantined `LIFECYCLE_NOT_OPEN`; never ready | A |
+| AT-16 | Bootstrap, first subscription: lifecycle read fails until its deadline | Not ready until a lifecycle read succeeds | A |
+| AT-17 | Book expiry crossed while a recovery read is in flight, skew bound unset | The response may pass the step if otherwise valid; no ready until a versioned read at or after the expiry | A |
 | AT-18 | Same, with an unversioned book read and a configured bound | Existing `_covers` rule decides; recovery code does not change the outcome | A |
-| AT-19 | Readiness result content for every state | Every failing condition has a human-readable reason and its question ids; `does_not_cover` present | A |
+| AT-19 | Readiness result content for every state | Every failing condition has a human-readable reason and its question ids; `closing`, `history`, `continuity` and `does_not_cover` present | A |
 | AT-20 | Duplicate batch carrying `marketSettled` | `MARKET_SETTLED` opens | later (M2-B) |
 | AT-21 | Duplicate batch carrying a null-sequence trade | `NULL_TRADE_SEQUENCE` opens | later (M2-B) |
 | AT-22 | Duplicate batch carrying an unseen trade id | `REVISION_ANOMALY` opens; an id evicted from memory also opens it (false positive accepted) | later (M2-B) |
 | AT-23 | Tape walk hits the page cap, repeats a cursor or an item, or reports `complete: false` | Attempt fails; blocker open | later (Q3, Q4) |
 | AT-24 | Tape walk complete over a past window, then a later read returns an extra row (late projection) | First walk never cleared anything | later (Q3, Q4) |
 | AT-25 | `NULL_TRADE_SEQUENCE` with any combination of tape and price reads | Never cleared while Q3 to Q6 and Q11 are open | A |
-| AT-26 | Periodic lifecycle sweep finds a market `closed` | `LIFECYCLE_NOT_OPEN`; result `TERMINAL` | later (M2-B) |
+| AT-26 | Periodic lifecycle sweep finds a market `closed` | Quarantined `LIFECYCLE_NOT_OPEN`; result `QUARANTINED` | later (M2-B) |
 | AT-27 | Recovery gate saturated | Attempts wait for the gate; resync gate and shared limiter behaviour unchanged | A |
 | AT-28 | Escalation after the configured number of failures | `escalated` true; still not ready; retries continue at the capped interval | A |
+| AT-29 | Blocker open; process restart with a persisted ledger | Origin `loaded`; instance still open; downtime window with the persisted fence | later (M2-C, D-4) |
+| AT-30 | Last accepted 40; socket close captures fence 40; after the re-join a batch with `previousRevision` 39 and `revision` 40 arrives | Treated as a duplicate; the window stays open; the market stays not ready | A |
+| AT-31 | As AT-30, then a clean batch (40, 41] | Window confirmed through 41; the result states that the confirmation covers the revisioned stream only | A |
+| AT-32 | Fence 40, then a batch (42, 43] | `REVISION_GAP` opens; the window stays open | A |
+| AT-33 | Fence 40, then (40, 41] flagged `resyncRequired`, or malformed with a parsed `delivery`, or missing a named book | Revision advances but the window stays open; the batch's own blocker opens | A |
+| AT-34 | Reconnect before any batch was ever accepted for the topic | No fence; the window cannot be confirmed by any batch | A |
+| AT-35 | A window is confirmed; a standalone `market_settled` sent during it was dropped by the transport | Nothing claims the standalone event was delivered: the confirmation's coverage note is present, and no instance or readiness field states otherwise | A |
+| AT-36 | The attempt's deadline passes after its response arrived but before the observe/commit step runs | Response dropped; nothing changes | A |
+| AT-37 | A superseded response that completed while live reaches the step after `aclose()` has begun | Dropped; closing takes precedence over restriction | A |
+| AT-38 | A current attempt's read shows `settled` with an equal label | Confirmation and quarantine applied together; generation raised exactly once, after them; the commit is not rejected by its own change | A |
+| AT-39 | Search of `engine/` for the bootstrap declaration | No module in `engine/` creates a `BootstrapDeclaration` | A |
 
 G-8 also requires the concrete socket adapter to pass the transport contract tests (M3);
 that is outside M1 and M2.
@@ -738,46 +950,54 @@ that is outside M1 and M2.
 ### 9.1 Smallest slice: M2-A
 
 Within `engine/sig_client/` only; no `shared/` change, no new REST endpoint, no order
-code, no live call.
+code, no persistence, no live call.
 
-1. Blocker instances replacing the internal `set[StaleReason]`, keeping
-   `blockers(market_id)` unchanged for callers.
-2. The per-market generation and the commit rule of 4.3, generalizing the existing
-   `wanted` fence.
-3. A recovery attempt runner: one per market, its own read gate, an overall deadline,
-   backoff, escalation and cancellation (section 5).
-4. Lifecycle reads with the existing `get_market` (`rest.py:566`): before the first ready
-   in each generation (D-3), and in every attempt. They may only restrict: `settled` or
-   `closed` opens `LIFECYCLE_NOT_OPEN`; `settled` with an equal label confirms an open
-   `MARKET_SETTLED` instance as `terminal`.
-5. `MarketReadiness` (6.1) and a `readiness(market_id)` accessor; `is_ready` becomes
+1. The in-memory `RecoveryLedger` (4.1, 4.2): blocker instances replacing the internal
+   `set[StaleReason]`, ledger origin and `HISTORY_UNKNOWN`, last accepted revision per
+   topic, unobserved windows and fences, generations. A feed constructed without a ledger
+   gets a new `unknown` one. `BootstrapDeclaration` exists for tests only (AT-39).
+2. The `blockers()` compatibility change of 4.1, reviewed: open and quarantined reasons,
+   new blocking reasons `HISTORY_UNKNOWN` and `LIFECYCLE_NOT_OPEN`.
+3. The continuity predicate of 4.3, recorded in the readiness result.
+4. A recovery attempt runner: one per market, its own read gate, an overall deadline,
+   backoff, escalation and cancellation (section 5), with the lifetime guards of 4.5.
+5. The observe/commit step of 4.6, with lifecycle reads through the existing `get_market`
+   (`rest.py:566`). They only restrict (quarantine) or confirm a settlement.
+6. `MarketReadiness` (6.1) and a `readiness(market_id)` accessor; `is_ready` becomes
    `readiness(market_id).status is READY`.
-6. Tests AT-01, AT-02, AT-04 to AT-19, AT-25, AT-27 and AT-28.
+7. Tests AT-01 to AT-19, AT-25, AT-27, AT-28 and AT-30 to AT-39.
 
-M2-A clears no blocker. It makes the existing "blocked for the life of the feed"
-behaviour explicit and explained, detects settled and closed markets that the feed misses
-today (1.6, items 2 and 6), and builds the fencing that any future clearing rule needs.
-It reads no trade tape: no predicate can use a tape walk yet (3.2), so the reads would
-spend budget for nothing.
+M2-A clears no blocker and, in production, never reports `READY`: every process starts
+with unknown history. It makes "blocked" explicit and explained, stops a restart or a new
+feed object from laundering a blocker, detects settled and closed markets that the feed
+misses today (1.6, items 2 and 6), and builds the fencing that any future clearing rule
+needs. It reads no trade tape: no predicate can use a tape walk yet (3.2), so the reads
+would spend budget for nothing.
 
 ### 9.2 Prerequisites for M2-A
 
-- This note reviewed and approved by Arnav, with the independent review.
-- Decisions D-3 (initial lifecycle read required) and D-5 (no manual clearing in M2), or
-  Arnav's alternatives.
+- This note reviewed and approved by Arnav, with the independent review, including the
+  `blockers()` compatibility change (4.1).
 - Values for the configurable bounds (recovery read gate, attempt deadline, backoff,
   escalation count), set by Arnav.
-- Confirmation that `MarketReadiness` stays engine-internal for now.
+- Confirmation that `MarketReadiness` and the ledger stay engine-internal for now.
+- **No decision D-1 to D-6 is needed.** M2-A implements none of the relaxations they
+  govern: unobserved windows stay open until confirmed, no bootstrap is declared in
+  production, nothing is persisted, nothing is cleared manually, and lost-window and
+  trade blockers keep blocking. That is the absence of a relaxation, not the adoption of
+  any option; each decision stays open, and any later relaxation needs its own review.
 - Nothing from SIG is needed for M2-A, and M3 is not needed (fake transport).
 
 ### 9.3 Later slices (not proposed for implementation yet)
 
-- **M2-B:** duplicate-batch detectors (4.4) and a periodic lifecycle sweep with the market
+- **M2-B:** duplicate-batch detectors (4.7) and a periodic lifecycle sweep with the market
   list [TMKTS] (*configurable* interval).
-- **M2-C:** a durable blocker ledger and last accepted revision per topic (D-4). Needs a
-  storage decision; SQLite storage is not started.
-- **M2-D:** clearing predicates, only for guarantees SIG documents (section 10) or
-  policies Arnav adopts (section 11), each with its own tests (AT-23, AT-24 and new ones).
+- **M2-C:** a durable ledger (origin `loaded`) with blocker instances, windows, fences and
+  the last accepted revision per topic (D-4). Needs a storage decision; SQLite storage is
+  not started.
+- **M2-D:** clearing predicates and a production bootstrap, only for guarantees SIG
+  documents (section 10) or policies Arnav adopts (section 11), each with its own tests
+  (AT-23, AT-24 and new ones).
 
 ## 10. Missing guarantees: questions for SIG
 
@@ -802,12 +1022,12 @@ evidence, the affected blocker stays open.
 - **Q6 (timestamps).** Is a tape row's `createdAt` the realtime trade's `executedAt`? What is
   the longest delay between execution and a trade appearing on the tape?
 - **Q7 (revisions).** Is a topic's `delivery.revision` strictly increasing for the life of
-  the topic, including across SIG deploys and restarts? If it can reset, how is a client
-  told?
+  the topic, including across SIG deploys and restarts and across a client's reconnects?
+  If it can reset, how is a client told? (The epoch assumption of 4.3.)
 - **Q8 (lost windows).** How should a client find the time or sequence span of a missed
   revision range, so that it knows which tape window to read?
-- **Q9 (settlement after-effects).** Can a tournament settlement be corrected or reversed so
-  that the market reopens? Is a client told?
+- **Q9 (settlement after-effects).** Can a tournament settlement be corrected or reversed,
+  or a closed market reopened? Is a client told?
 - **Q10 (standalone events).** Is every standalone `market_settled` also carried in a
   revisioned `market_batch` on the tournament market topic? If not, how can a client detect
   a missed one?
@@ -823,34 +1043,40 @@ evidence, the affected blocker stays open.
 
 ## 11. Decisions for Arnav
 
-Each is a policy choice, not a platform fact. This note proposes no answer as adopted;
-where a recommendation is given, it is labelled.
+Each is a policy choice, not a platform fact. This note adopts none of them and recommends
+none. Until each is decided, M2-A keeps the behaviour that relaxes nothing (9.2).
 
-- **D-1 (unobserved windows).** After a reconnect, socket or channel error, token refresh
-  or expiry, or the first subscription, must a market stay not ready until a contiguous
-  batch (one whose `previousRevision` is at or below the last accepted revision) confirms
-  continuity? *Strict* closes item 1 of 1.6 for active markets but leaves quiet markets not
-  ready after every reconnect and every token refresh (about every three hours). *As today*
-  accepts that a loss in the window is detected only when a later batch arrives.
+- **D-1 (unobserved windows).** After a reconnect, a socket or channel error, a token
+  refresh or expiry, or a replacement feed sharing the ledger, must a market stay not ready
+  until its window is confirmed by the predicate of 4.3 (a clean batch advancing past the
+  captured fence, under the epoch assumption)? *Strict* closes item 1 of 1.6 for active
+  markets but leaves quiet markets, and any topic with no fence, not ready after every
+  reconnect and every token refresh (about every three hours). *As today* accepts that a
+  loss in the window is detected only when a later batch arrives. Either way, confirmation
+  never covers standalone events (4.3). D-1 does not apply to initial bootstrap (D-3) or to
+  a restart without retained history (`HISTORY_UNKNOWN`, 4.2).
 - **D-2 (trade-stream continuity).** Does any trading consumer depend on SIG's trade
   stream being complete (for example last-trade marks or lag measurement used in
   decisions)? If none does, `NULL_TRADE_SEQUENCE` and the trade part of lost windows could
   stop blocking new trading, which needs a PRD change. Until decided, they block.
-- **D-3 (initial lifecycle trust).** Accept a lifecycle read showing `open`, made after the
-  subscription, as the initial-state evidence for readiness, knowing its freshness is
-  unproven (Q1)? Without it no market can ever be ready, because initial state always rests
-  on that read. *Recommendation:* accept it for initial state only, as M2-A does.
-- **D-4 (durable ledger).** Persist open blocker instances and the last accepted revision
-  across restarts? Then a blocked market stays blocked for the rest of the competition
-  unless a clearing rule exists. Without persistence, a restart clears blockers with no
-  evidence.
-- **D-5 (manual clearing).** Should an operator ever be able to clear a blocker? If so, it
-  would be a controlled, audited command (track C1), never automatic. M2 proposes none.
-- **D-6 (settlement standard for lost windows).** If D-3 is accepted, should the same
-  standard (a lifecycle read showing `open`, made after the window) also settle the
-  *settlement* part of a lost window? The trade part would still need D-2 or Q3 to Q8.
-  This would make lost-window blockers clearable with residual risk; it is not proposed as
-  adopted.
+- **D-3 (bootstrap policy).** When may history be declared to begin (a
+  `BootstrapDeclaration`), by whom, and what initial-state evidence does it accept? The
+  candidate is a lifecycle read showing `open`, made after the subscription, whose
+  freshness is unproven (Q1). D-3 governs only the start of history. It never applies to
+  restart or reconnect recovery, where history already exists (D-1, D-4), and it cannot
+  turn a restart without retained history into a bootstrap. Undecided; until it is decided,
+  no production path declares bootstrap, so no market is ever ready in production.
+- **D-4 (durable ledger).** Persist the ledger across processes (origin `loaded`)? Then a
+  blocked or quarantined market stays so for the rest of the competition unless a clearing
+  rule exists. Without persistence, M2-A stays safe because every new process has unknown
+  history (4.2), but no market can ever be ready after a restart.
+- **D-5 (manual clearing).** Should an operator ever be able to clear a blocker, lift a
+  quarantine or declare bootstrap? If so, it would be a controlled, audited command (track
+  C1), never automatic. M2 proposes none.
+- **D-6 (settlement standard for lost windows).** If D-3 accepts a lifecycle read for
+  bootstrap, should the same standard (a lifecycle read showing `open`, made after the
+  window) also settle the *settlement* part of a lost window? The trade part would still
+  need D-2 or Q3 to Q8. This would make lost-window blockers clearable with residual risk.
 
 ## 12. References
 
