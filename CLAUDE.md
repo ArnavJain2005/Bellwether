@@ -82,9 +82,20 @@ evidence yet. See the PRD roadmap for the full state of `main`.
 2. **Never read, print, log or commit `.env` or any key.** Secrets are read only from
    environment variables through `engine/config.py`. A local `.env` is optional and
    git-ignored.
-3. **Every submitted trading intent passes `risk.check(intent)`.** No code path may reach
-   an order endpoint without it. When the order path is built (O2), a bypass test must
-   enforce this (G-6); none exists yet because no order path exists.
+3. **Every new order passes `risk.check(intent)` and the applicable readiness checks,
+   with no bypass.** This covers single, batch and multi-leg placements, sells included
+   (a sell can turn into a buy), and any order change that can create or increase
+   exposure. The documented API has no amend endpoint; cancel-and-replace is a new order.
+   No code path may reach a placement endpoint without these checks. When the order path
+   is built (O2), a bypass test must enforce this (G-6); none exists yet because no order
+   path exists.
+
+   **Protective cancellation must stay available** during fault, loss and manual pauses,
+   and when the readiness check for new trading fails. It is not gated on `risk.check`
+   or readiness, but it still goes through engine authorization, is scoped to the
+   configured tournament (`tournamentId`), stays within the rate budget and is written to
+   the audit log. A cancel path must never place, re-place or enlarge an order. This is
+   required design behaviour, not an implemented feature: no cancel path exists yet.
 4. **Limit orders only.** Every order carries an explicit limit price on the 0.005 tick,
    0.005–0.995. Never send a market order (`price: 1` buy, `price: 0` sell, or no price).
 5. **A sell never exceeds the quantity held,** as established from SIG state for the
