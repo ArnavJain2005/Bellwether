@@ -172,6 +172,9 @@ def test_no_public_write_or_arbitrary_request_methods() -> None:
         "list_exchange_trades_page",  # S1-T3-B
         "list_orders_page",
         "list_tournament_markets_page",
+        "read_open_orders",  # A2-A
+        "read_tournament_balance",  # A2-A
+        "read_tournament_positions",  # A2-A
         "tournament",  # read-only accessor for the configured TournamentRef
         "verify_tournament",
     }

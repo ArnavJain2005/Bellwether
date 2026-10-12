@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,7 @@ import httpx
 
 from engine.config import ApiKey, SigConfig, TournamentRef
 from engine.sig_client.rate_limiter import RateLimiter
-from engine.sig_client.rest import ReadRetryPolicy, SigRestClient
+from engine.sig_client.rest import ReadRetryPolicy, SigRestClient, utc_now
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "sig"
 
@@ -91,6 +92,9 @@ class Router:
             f"{API}/orders": json_response(200, fixture("orders_page")),
             f"{API}/markets/26": json_response(200, fixture("market")),
             f"{API}/exchanges/36/trades": json_response(200, fixture("exchange_trades")),
+            f"{API}/tournaments/alpha-tournament/portfolio/positions": json_response(
+                200, fixture("tournament_positions")
+            ),
         }
         self.routes.update(overrides or {})
 
@@ -126,6 +130,7 @@ def make_client(
     jitter: Callable[[float], float] = lambda delay: delay,
     tournament: TournamentRef = TOURNAMENT,
     api_key: str = SENTINEL_KEY,
+    wall_clock: Callable[[], datetime] | None = None,
 ) -> tuple[SigRestClient, Router, FakeClock]:
     router = router or Router()
     clock = clock or FakeClock()
@@ -140,6 +145,7 @@ def make_client(
         jitter=jitter,
         limiter=limiter or RateLimiter(clock=clock, sleep=clock.sleep),
         retry=retry,
+        wall_clock=wall_clock or utc_now,
     )
     return client, router, clock
 

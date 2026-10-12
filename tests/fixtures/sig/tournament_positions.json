@@ -1,0 +1,65 @@
+{
+  "provenance": "synthetic, spec-derived: shape from the TournamentPortfolioPosition schema; exchangeId 36 and marketId 26 are the spec examples; every other value is a placeholder chosen for documented type and nullability, not a recorded or realistic holding",
+  "openapi": [
+    "#/paths/~1tournaments~1{slug}~1portfolio~1positions/get/responses/200/content/application~1json/schema",
+    "#/components/schemas/TournamentPortfolioPosition"
+  ],
+  "body": {
+    "positions": [
+      {
+        "exchangeId": "36",
+        "marketId": "26",
+        "marketTitle": "Placeholder market A",
+        "option": "Placeholder option A",
+        "settled": false,
+        "quantity": 10,
+        "avgCost": 0.42,
+        "currentPrice": 0.535,
+        "marketValue": 5.35,
+        "costBasis": 4.2,
+        "unrealizedPnl": 1.15,
+        "unrealizedPnlPct": 27.380952380952380952,
+        "moneyEarned": 0,
+        "lots": [
+          {"lotId": "placeholder-lot-1", "side": "yes", "quantity": 6, "entryPrice": 0.4, "openedAt": "2026-10-02T12:00:00.000Z"},
+          {"lotId": "placeholder-lot-2", "side": "yes", "quantity": 4, "entryPrice": 0.45, "openedAt": "2026-10-03T12:00:00.000Z"}
+        ]
+      },
+      {
+        "exchangeId": "37",
+        "marketId": "27",
+        "marketTitle": "Placeholder market B",
+        "option": null,
+        "settled": false,
+        "quantity": -2.5,
+        "avgCost": 0.61,
+        "currentPrice": 0.585,
+        "marketValue": -1.4625,
+        "costBasis": -1.525,
+        "unrealizedPnl": 0.0625,
+        "unrealizedPnlPct": -4.0983606557377049,
+        "moneyEarned": 0.1,
+        "lots": [
+          {"lotId": "placeholder-lot-3", "side": "NO", "quantity": 2.5, "entryPrice": 0.39, "openedAt": "2026-10-04T12:00:00.000Z"}
+        ]
+      },
+      {
+        "exchangeId": "38",
+        "marketId": "28",
+        "marketTitle": "Placeholder market C",
+        "option": null,
+        "settled": true,
+        "quantity": 0,
+        "avgCost": 0,
+        "currentPrice": null,
+        "marketValue": 0,
+        "costBasis": 0,
+        "unrealizedPnl": 0,
+        "unrealizedPnlPct": 0,
+        "moneyEarned": 3.25,
+        "lots": []
+      }
+    ],
+    "summary": {"totalMarketValue": 3.8875, "totalCostBasis": 2.675, "totalUnrealizedPnl": 1.2125}
+  }
+}
