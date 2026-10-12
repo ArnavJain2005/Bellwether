@@ -115,11 +115,17 @@ class StaleReason(StrEnum):
     MARKET_SETTLED = "market settled"
     BOOK_EXPIRY = "resting order expiry"
     STOPPED = "feed stopped"
+    # Recovery-ledger reasons (M2-A, engine/sig_client/recovery.py). Neither comes from a
+    # message: HISTORY_UNKNOWN marks a market whose earlier history this process cannot
+    # show, and LIFECYCLE_NOT_OPEN a market that a lifecycle read showed settled or closed.
+    HISTORY_UNKNOWN = "history unknown"
+    LIFECYCLE_NOT_OPEN = "market not open"
 
 
 # Recovery that an orderbook read cannot provide: settlement needs the market state, a
 # null-sequence trade needs the trade tape (steps 7 and 8), and a message whose arrays were
-# discarded or never seen may have hidden either.
+# discarded or never seen may have hidden either. The last two are raised by the recovery
+# ledger, not by a message.
 BLOCKING_REASONS = frozenset(
     {
         StaleReason.NULL_TRADE_SEQUENCE,
@@ -128,6 +134,8 @@ BLOCKING_REASONS = frozenset(
         StaleReason.RESYNC_REQUIRED,
         StaleReason.MALFORMED,
         StaleReason.MISSING_BOOK,
+        StaleReason.HISTORY_UNKNOWN,
+        StaleReason.LIFECYCLE_NOT_OPEN,
     }
 )
 
@@ -169,6 +177,11 @@ class TopicOutcome:
 
     `resync` is set when the market must be refetched. `blockers` holds the reasons that
     need more than an orderbook read (BLOCKING_REASONS); they are also in `resync`.
+
+    `window` is the batch's (`previousRevision`, `revision`) whenever its `delivery`
+    parsed. `clean` is True only for a batch that was well-formed, not flagged
+    `resyncRequired`, not a duplicate, accepted without a gap and named no exchange
+    without its book: the "clean advancing batch" of the recovery design (section 4.3).
     """
 
     books: list[HeldBook] = field(default_factory=list)
@@ -177,6 +190,8 @@ class TopicOutcome:
     resync: StaleReason | None = None
     blockers: set[StaleReason] = field(default_factory=set)
     duplicate: bool = False
+    window: tuple[int, int] | None = None
+    clean: bool = False
 
 
 class _Malformed(Exception):
@@ -209,7 +224,11 @@ def decode_payload(payload: object) -> object:
 
 
 class MarketTopic:
-    """One `tournament:{tournament_id}:market:{market_id}` topic."""
+    """One `tournament:{tournament_id}:market:{market_id}` topic.
+
+    `last_revision` seeds the last accepted revision, so that a replacement feed keeps
+    checking revisions against the one a recovery ledger retained (None: none accepted).
+    """
 
     def __init__(
         self,
@@ -217,11 +236,16 @@ class MarketTopic:
         market_id: str,
         *,
         trade_id_memory: int = DEFAULT_TRADE_ID_MEMORY,
+        last_revision: int | None = None,
     ) -> None:
+        if last_revision is not None and (
+            isinstance(last_revision, bool) or not isinstance(last_revision, int) or last_revision < 0
+        ):
+            raise ValueError("last_revision must be None or an integer of at least 0")
         self.tournament_id = tournament_id
         self.market_id = market_id
         self.topic = f"tournament:{tournament_id}:market:{market_id}"
-        self._last_revision: int | None = None
+        self._last_revision: int | None = last_revision
         self._books: dict[str, HeldBook] = {}
         self._stamp = 0
         self._expiry_handled: set[int] = set()
@@ -283,6 +307,7 @@ class MarketTopic:
             delivery = Delivery.model_validate(data.get("delivery"))
         except ValidationError:
             return TopicOutcome(resync=StaleReason.MALFORMED)  # no revision to accept
+        window = (delivery.previousRevision, delivery.revision)
         try:
             batch = MarketBatch.model_validate(data)
             pushed = [(book, *self._book_clocks(book)) for book in batch.books or ()]
@@ -292,9 +317,9 @@ class MarketTopic:
             [*(batch.trades or ()), *(batch.bookDirty or ()), *(batch.marketSettled or ())]
         ):
             self._accept_if_newer(delivery.revision)
-            return TopicOutcome(resync=StaleReason.MALFORMED)
+            return TopicOutcome(resync=StaleReason.MALFORMED, window=window)
 
-        outcome = TopicOutcome()
+        outcome = TopicOutcome(window=window)
         for book, key, expiry in pushed:
             held = self._apply_push(book, key, expiry)
             if held is not None:
@@ -330,6 +355,9 @@ class MarketTopic:
         if not named <= {str(book.exchangeId) for book in batch.books or ()}:
             outcome.resync = StaleReason.MISSING_BOOK
             return outcome  # no trades from a batch that broke the protocol
+        # Every revision in the window arrived in this well-formed, complete batch (its
+        # settlements and null-sequence trades still raise their own blockers).
+        outcome.clean = True
         if StaleReason.NULL_TRADE_SEQUENCE not in outcome.blockers:
             outcome.trades = self._new_trades(trades)
         return outcome
