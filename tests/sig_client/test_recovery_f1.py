@@ -535,4 +535,3 @@ def test_f1_control_deadline_still_fails_the_attempt() -> None:
         await h.stop()
 
     run(scenario, policy=QUIET)
-
