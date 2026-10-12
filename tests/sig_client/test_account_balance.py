@@ -317,26 +317,33 @@ def test_t5_requests_are_built_from_the_configured_tournament_only() -> None:
 
 
 def test_concurrent_reads_keep_their_own_attempts_times_and_values() -> None:
-    a_failed = asyncio.Event()
-    b_served = asyncio.Event()
+    # Two balance reads that both retry, with their attempts strictly interleaved:
+    # a1 < b1 < a2 < b2 < a3. Each result must report only its own attempts, value and
+    # times; a counter or "last response" shared across calls would mix them.
+    steps = {name: asyncio.Event() for name in ("a1", "b1", "a2", "b2")}
 
-    async def a_unavailable() -> httpx.Response:
-        a_failed.set()
-        return unavailable()
+    def attempt(after: str | None, done: str | None, response: httpx.Response) -> Any:
+        async def serve() -> httpx.Response:
+            if after is not None:
+                await steps[after].wait()
+            if done is not None:
+                steps[done].set()
+            return response
 
-    async def a_after_b() -> httpx.Response:
-        await b_served.wait()
-        return json_response(200, tournament_body(myBalance=111))
+        return serve
 
-    async def b_ok() -> httpx.Response:
-        await a_failed.wait()  # b's only attempt lands between a's attempts
-        b_served.set()
-        return json_response(200, tournament_body(myBalance=222))
-
-    router = Router(
-        {TOURNAMENT_PATH: per_caller({"a": [a_unavailable, a_unavailable, a_after_b], "b": [b_ok]})}
-    )
-    client, _, clock = make_client(router)
+    scripts = {
+        "a": [
+            attempt(None, "a1", unavailable()),
+            attempt("b1", "a2", unavailable()),
+            attempt("b2", None, json_response(200, tournament_body(myBalance=111))),
+        ],
+        "b": [
+            attempt("a1", "b1", unavailable()),
+            attempt("a2", "b2", json_response(200, tournament_body(myBalance=222))),
+        ],
+    }
+    client, _, clock = make_client(Router({TOURNAMENT_PATH: per_caller(scripts)}))
 
     async def scenario() -> list[TournamentBalanceRead]:
         return await asyncio.gather(
@@ -346,11 +353,11 @@ def test_concurrent_reads_keep_their_own_attempts_times_and_values() -> None:
 
     a, b = run(scenario())
     assert (a.tournament.myBalance, a.provenance.attempts) == (111, 3)
-    assert (b.tournament.myBalance, b.provenance.attempts) == (222, 1)
+    assert (b.tournament.myBalance, b.provenance.attempts) == (222, 2)
     assert a.provenance.started_mono <= b.provenance.started_mono
     assert b.provenance.finished_mono <= a.provenance.finished_mono
-    assert clock.sleeps == [0.25, 0.5]  # a's two backoffs; b never waited
-    assert client.limiter.used(RequestKind.READ) == 4
+    assert sorted(clock.sleeps) == [0.25, 0.25, 0.5]  # a: 0.25, 0.5; b: 0.25
+    assert client.limiter.used(RequestKind.READ) == 5
 
 
 def test_retries_are_counted_for_the_read_that_made_them() -> None:
