@@ -402,7 +402,7 @@ financial source of truth" ([RT]), and polling `/portfolio/*` in a loop is disco
 same denomination is not stated (2.4).
 
 **[Proposed]** No account-channel work in A2 or A3. Without it, the only way A3 can see
-a change between reads is to read again (5.4).
+a change between reads is to read again (5.7).
 
 ## 3. Cash and collateral
 
@@ -446,13 +446,14 @@ may be hours old.
 1. A cash observation in A3 comes **only** from a `GET /tournaments/{slug}` read made
    for that snapshot (A2's `read_tournament_balance`, section 4.2). It is never taken
    from the verification cache, even when the cache holds a `Tournament` object.
-2. Each observation keeps its own provenance (4.1): local start and finish times, the
-   attempt count and the identity check result. The snapshot records whether the balance
-   read was taken **before** or **after** the other reads, and re-reads it at the end
-   (5.4).
+2. A3 makes two balance reads, the first and the last of an assembly. Both are kept in
+   full, whatever their outcome: values, enrolment flag, currency, identity result and
+   provenance (4.1). Section 5.7 states which observation supplies `cash.value`, and
+   when none does.
 3. Verification remains a one-time identity check with a permanent mismatch latch
    (`rest.py:507`-`515`). A fresh balance read also re-checks identity
-   (`rest.py:480`). A mismatch there latches as well and fails the snapshot.
+   (`rest.py:480`). A mismatch there latches as well and makes the snapshot
+   `SCOPE_MISMATCH` (5.5).
 
 ### 3.4 Collateral is not spendable cash
 
@@ -479,15 +480,21 @@ confirm the empty set.
 
 ### 3.5 What is missing before any cash figure can be trusted
 
-| Missing evidence | Question | Who closes it |
-| --- | --- | --- |
-| That `myBalance` is the balance orders are admitted against, for this key and tournament | OQ-W11 | SIG answer (Q-S1) or a logged check by Arnav (P3) |
-| Whether resting buys are already deducted from `myBalance` | OQ-C3 | P3 (tiny resting order far from the market) |
-| Our current enrolment state, and the seed-to-current transition | OQ-W11 | P1 (read-only), P3 |
-| Whether a fill or settlement is reflected in `myBalance` before, with or after positions | none yet; candidate A1-N3 | SIG answer (Q-S3) |
-| Fees | PRD section B (fees) | First fill, P4 |
+| Missing evidence | Question | Documented answer would come from | Bounded observation that could inform it |
+| --- | --- | --- | --- |
+| That `myBalance` is the balance orders are admitted against, for this key and tournament | OQ-W11 | SIG (Q-S1) | P3 |
+| Whether resting buys are already deducted from `myBalance` | OQ-C3 | SIG (Q-S2) | P3 (one tiny resting order far from the market) |
+| How the enrolment flag, portfolio access and the balance relate, and when a seed becomes current | OQ-W11; A1-N4 | SIG (Q-S5) | P1 (read-only), P3 |
+| Whether a fill or settlement is reflected in `myBalance` before, with or after positions | none yet; candidate A1-N3 | SIG (Q-S3) | none |
+| Fees | PRD section B (fees) | SIG | P4 (one fill) |
 
-Until these close, A3 reports `myBalance` as an **unestablished candidate** (5.2), and
+**A logged check is one bounded observation.** It shows what one account saw, for one
+order, at one time. It does not establish a general rule: not that balances always or
+never reserve resting orders, not that reads are fresh, not that fees never apply, and
+not that fills always land on the tick grid. Whether bounded evidence is enough for a
+gate is Arnav's decision, recorded in the PRD.
+
+Until then, A3 reports `myBalance` as an **unestablished candidate** (5.7), and
 nothing downstream may treat it as uncommitted cash (G-1).
 
 ## 4. Proposed A2: raw tournament-scoped reads
@@ -514,7 +521,7 @@ nothing downstream may treat it as uncommitted cash (G-1).
   `shared/` change.
 - **R5. Unresolved units travel with the data.** A static table in the engine (not in
   `shared/`) maps each numeric wire field to either its documenting pointer or the open
-  PRD question. A3 copies the entries for fields present in a snapshot (5.3).
+  PRD question. A3 copies the entries for fields present in a snapshot (5.9).
 - **R6. Provenance per read and per page.** Every result carries a `ReadProvenance`:
   - route template and request path (both built from configuration);
   - the allowlisted parameters sent (`tournamentId`, `status`, `limit`, `period`,
@@ -579,16 +586,32 @@ ids (`rest.py:301`).
   `SigConflictError` as today.
 
 The pairs are result data and are never put in an error or log line (R8). This keeps
-the documented signal "holdings exist without valuation prices" visible to A3 (5.5)
+the documented signal "holdings exist without valuation prices" visible to A3 (5.10)
 instead of collapsing it into a generic conflict.
 
 ### 4.4 Rate cost
 
-Under the existing 80-read budget (`rate_limiter.py:35`):
+Under the existing 80-read budget (`rate_limiter.py:35`), with page limit 200 and
+`pages(n) = max(1, ⌈n / 200⌉)`. An empty collection still costs one page.
 
-- **A2-A** is 1 + 1 + ⌈open orders / 200⌉ reads, normally 3.
-- **A2-B** adds 1 for P&L, ⌈fills / 200⌉ and ⌈settlements / 200⌉, plus one per order
-  whose fills are read.
+| Read | Requests on success |
+| --- | --- |
+| Balance ([TOUR]) | 1 |
+| Positions ([TPOS]) | 1 |
+| Open orders ([ORDERS]) | `pages(open orders)` |
+| P&L ([TPNL]) | 1 |
+| Fills ([TFILLS]) | `pages(fills)` |
+| Settlements ([TSETTLE]) | `pages(settlements)` |
+| One order's fills ([OFILLS]) | `pages(that order's fills)`, per order |
+
+- **An A3 assembly with the required components only** costs
+  `2 + 1 + pages(open orders)`, so **at least 4** (two balance reads, positions, and
+  one open-orders page even when there are none).
+- **Each optional component adds** its row above. Order fills add one `pages(...)` term
+  per requested order.
+- **Every retried attempt is one more request.** A read that needs three attempts (two
+  retries of a 429 or 503) costs three requests (`rest.py:1065`). The figures above are
+  minimums.
 
 Fills and settlements have no time filter, so their walks grow with history. Each walk
 keeps a page cap and fails closed above it. A later incremental "read until a known id"
@@ -623,82 +646,262 @@ It **never claims**:
 mirrors M2-A, where no production market is ever ready while D-3 and D-4 are undecided
 (`recovery.py:16`-`21`).
 
-### 5.2 Fields
+### 5.2 Components and the requirement policy [Proposed]
+
+An assembly requests a fixed list of components. Every requested component ends with
+exactly one outcome (5.3), and every outcome is kept in the snapshot.
+
+| Component | Read | Requirement |
+| --- | --- | --- |
+| `balance_opening` | [TOUR], fresh (3.3) | **Required.** Always the first read |
+| `positions` | [TPOS] | **Required** |
+| `open_orders` | [ORDERS] `status=open`, full walk | **Required** |
+| `fills` | [TFILLS], full walk | Optional (A2-B) |
+| `valuation` | [TPNL] `period=all` | Optional (A2-B) |
+| `settlements` | [TSETTLE], full walk | Optional (A2-B) |
+| `order_fills[order_id]` | [OFILLS], full walk, one component per requested order id | Optional (A2-B) |
+| `balance_closing` | [TOUR], fresh | **Required.** Always the last read |
+
+The policy:
+
+- **Required components** are requested by every assembly. An A3 that cannot request
+  one builds no snapshot at all.
+- **Optional components** are chosen by the caller for each assembly and recorded in
+  `requested`. Once requested, an optional component is judged exactly as a required
+  one: the same outcomes, mapped to the same status classes (5.5). A failed optional
+  read is never ignored because it was optional.
+- **An optional component that was not requested** has the outcome `NOT_REQUESTED`. It
+  takes no part in the status, is never reported as observed, and is listed in
+  `cannot_vouch_for`. The status therefore describes the requested components only.
+- **The assembly does not stop at the first failure.** Every requested component is
+  attempted and gets an outcome, so later reasoning sees every failure. The one
+  exception is a tournament identity mismatch. The client latches it
+  (`rest.py:507`-`515`), so every later read fails at once with a `SCOPE_MISMATCH`
+  outcome and spends no rate budget.
+- **Which components the engine readiness check needs is S1 policy.** It is not chosen
+  here.
+
+### 5.3 Component outcomes [Proposed]
+
+| Outcome | When | Data kept |
+| --- | --- | --- |
+| `OBSERVED` | 200, A2 validation passed, and a walk reached `hasMore: false` | Rows and fields exactly as sent, **including an empty list** |
+| `OBSERVED_INCOMPLETE` | A settlements walk in which a page reported `coverage.complete: false` (1.5) | Rows read, plus the page index |
+| `UNVALUED` | The documented 409 on positions or valuation (4.3) | The `(exchange_id, market_id)` pairs |
+| `HTTP_ERROR` | Any other non-2xx after A2's retries, **403 included** | HTTP status, and the documented `code` or "unrecognized"; never the message |
+| `FAILED` | Transport, deadline, retries exhausted, rate budget, response validation, pagination or client closed | Error class and phase only |
+| `SCOPE_MISMATCH` | A balance read reports another slug or UUID, the client's mismatch latch raises, or an order-fills read echoes another `tournamentId` or null | Which read |
+| `NOT_REQUESTED` | An optional component that was not requested | Nothing |
+
+- **An empty `OBSERVED` response is retained as observed.** That covers no positions,
+  no open orders and no fills. It shows what that response contained. It does not show
+  that SIG holds no positions or orders for the account: projection freshness is
+  unknown (A1-N1), and so is what a pending member is served (A1-N4).
+- **A 403 is an `HTTP_ERROR` like any other, with its code kept.** A3 never translates
+  403 `FORBIDDEN` into "not a member". The error table documents `FORBIDDEN` as generic:
+  "e.g. not a member of the requested tournament, accessing another user's order, or the
+  key owner's email address is unconfirmed" ([INFO]).
+
+### 5.4 Fields
 
 ```text
 AccountSnapshot
   tournament            configured slug + UUID
-  status                UNAVAILABLE | INCOMPLETE | CONTRADICTED | OBSERVED_UNRESOLVED
-  reasons               tuple[str]       one line per failing condition, with OQ / A1-N ids
-  assembled_from_mono   first read's started_mono
-  assembled_to_mono     last read's finished_mono
-  evaluated_utc         local wall clock, display only
-  reads                 tuple[ReadProvenance]   every read used, in order (4.1 R6)
+  status                SCOPE_MISMATCH | CONTRADICTED | UNAVAILABLE | INCOMPLETE
+                        | OBSERVED_UNRESOLVED                          (5.5)
+  requested             tuple[component]  required ones plus the optional ones asked for
+  component_outcomes    component -> outcome (5.3); every requested component, plus
+                        NOT_REQUESTED for the optional ones not asked for
+  reasons               tuple[str]  one line per non-OBSERVED outcome, per identity state
+                        other than MATCH, per finding and per balance difference, with
+                        OQ / A1-N ids; all kept, whatever the status
+  findings              tuple[Finding{ check_id, kind: CONTRADICTION | UNEXPLAINED,
+                                       components, question_ids }]       (5.10)
 
-  identity              VERIFIED_THIS_ASSEMBLY | MISMATCH
-                        from the fresh balance read(s), never from the verification cache
+  times                 per component: started_mono and finished_mono of its earliest
+                        and latest request (pages for a walk); assembled_from_mono,
+                        assembled_to_mono, evaluated_mono, evaluated_utc       (5.8)
+  reads                 tuple[ReadProvenance]  every request made, in order (4.1 R6)
 
-  enrolment
-    reported            pending | enrolled | not read      (isPendingEnrolment as sent)
-    portfolio_access    member | not member (403 FORBIDDEN) | other error | not read
-    state               PENDING | ENROLLED_REPORTED | CONTRADICTED | UNKNOWN
+  identity              opening: MATCH | MISMATCH | NOT_OBSERVED
+                        closing: MATCH | MISMATCH | NOT_OBSERVED
+                        overall: MISMATCH if either is; else NOT_OBSERVED if either is;
+                                 else MATCH. Never taken from the verification cache
+
+  balance_opening       BalanceObservation (5.7)
+  balance_closing       BalanceObservation (5.7)
+  balance_differences   tuple[field name]  fields on which the two observations differ
+
+  portfolio_access      per requested portfolio read (positions, fills, valuation,
+                        settlements): outcome, HTTP status, documented code     (5.6)
+  conclusions
+    membership          NOT_DETERMINED                                         (5.6)
+    seed_or_current     NOT_DETERMINED                                         (5.6)
 
   cash
-    value               Decimal as sent (myBalance) | None
-    currency            currencyName as sent
-    basis               SEED_WHILE_PENDING | REPORTED | UNAVAILABLE
-    first_read, last_read   provenance of the opening and closing balance reads
-    changed_during_assembly bool | None
-    source_established  False   (OQ-W11; fixed until Arnav records evidence)
+    value               Decimal | None   balance_closing.myBalance, only under the
+                                         rule in 5.7; otherwise None
+    source              CLOSING | NONE
+    currency            balance_closing.currencyName under the same rule, else None
+    reported_pending_at_source  balance_closing.isPendingEnrolment, or None
+    source_established  False    (OQ-W11; fixed until Arnav records evidence)
     excludes_resting_orders UNKNOWN (OQ-C3; fixed until answered)
 
-  positions
-    state               OBSERVED | UNVALUED | NOT_MEMBER | UNAVAILABLE | NOT_READ
-    rows                raw wire rows as sent (empty unless OBSERVED)
-    unvalued            tuple[(exchange_id, market_id)]   from the 409 (4.3)
-    unresolved_fields   field -> OQ id (5.3)
-
-  open_orders
-    state               COMPLETE_WALK | UNAVAILABLE | NOT_READ
-    orders              raw rows; pages: per-page coverage as sent
-    scope_evidence      UUID_PARAM_SENT (no echo)
-    unresolved_fields   priceLimit -> OQ-W6
-    note                "Order rows carry no idempotency key or tournament id" (OQ-E1)
-
-  fills                 (A2-B) COMPLETE_WALK | UNAVAILABLE | NOT_READ; raw rows; pages
-  valuation             (A2-B) REPORTED_AS_SENT | MISSING_VALUATIONS | UNAVAILABLE | NOT_READ
+  positions             outcome; rows as sent (possibly empty); unvalued pairs
+  open_orders           outcome; rows as sent (possibly empty); per-page coverage
+  fills                 outcome; rows as sent; per-page coverage             (optional)
+  valuation             outcome; fields as sent; unvalued pairs              (optional)
     candidate_equity    totalAccountValue as sent, labelled "candidate, OQ-D1"; unused
-  settlements           (A2-B) COMPLETE | INCOMPLETE_BY_SIG_BUDGET | UNAVAILABLE | NOT_READ
+  settlements           outcome; entries as sent; per-page `complete`         (optional)
+  order_fills           order_id -> outcome; echoed tournamentId; rows; totals (optional)
+  unresolved_fields     field -> documenting pointer or OQ id (5.9)
 
-  findings              tuple[Finding{ check_id, kind: CONTRADICTION | UNEXPLAINED,
-                                       components, question_ids }]
-  vouches_for           tuple[str]   e.g. "every open-order page was read"
-  cannot_vouch_for      tuple[str]   always includes the fixed list in 5.6
-  does_not_cover        fixed text (5.6)
+  vouches_for           tuple[str]
+  cannot_vouch_for      tuple[str]   always includes the fixed list in 5.11
+  does_not_cover        fixed text (5.11)
 ```
 
-The status is the first that applies:
+### 5.5 Status: an exhaustive rule [Proposed]
 
-1. `UNAVAILABLE` if the identity check failed, or the balance, positions or open-orders
-   read ended in an error. A positions 403 `FORBIDDEN` (recorded as `NOT_MEMBER`) and a
-   documented 409 (recorded as `UNVALUED`) are outcomes, not errors;
-2. `CONTRADICTED` if any finding is a contradiction;
-3. `INCOMPLETE` if any read component is `NOT_READ`, `NOT_MEMBER`, `UNVALUED`,
-   `INCOMPLETE_BY_SIG_BUDGET` or `MISSING_VALUATIONS`, or the cash changed during
-   assembly;
-4. otherwise `OBSERVED_UNRESOLVED`.
+Each input below maps to exactly one class. `NOT_REQUESTED` outcomes and `UNEXPLAINED`
+findings map to none. The status is the most severe class present, and
+`OBSERVED_UNRESOLVED` when none is.
 
-A pending enrolment therefore never looks like "no positions": positions are
-`NOT_MEMBER` or `NOT_READ`, not an empty `OBSERVED` list (5.5).
+| Class (most severe first) | Status | Inputs that map to it |
+| --- | --- | --- |
+| 1 | `SCOPE_MISMATCH` | Identity `MISMATCH` on either balance read; any `SCOPE_MISMATCH` outcome (including an order-fills echo, K12); K1 |
+| 2 | `CONTRADICTED` | Any `CONTRADICTION` finding: K6, K8 or K9, each within a single response |
+| 3 | `UNAVAILABLE` | Identity `NOT_OBSERVED` on either balance read; any requested component, required or optional, with `HTTP_ERROR` or `FAILED` |
+| 4 | `INCOMPLETE` | Any requested component with `UNVALUED` or `OBSERVED_INCOMPLETE`; any balance difference (K13) |
+| – | `OBSERVED_UNRESOLVED` | None of the above |
 
-### 5.3 Unresolved-value flags
+So `OBSERVED_UNRESOLVED` requires all of the following:
+
+- identity `MATCH` on both balance reads;
+- every requested component `OBSERVED`;
+- no contradiction;
+- no difference between the two balance observations.
+
+**Counterexample.** The core reads succeed, `fills` was requested and ends `FAILED`
+(deadline on page 3), and everything else is `OBSERVED`. Class 3 applies, so the status
+is `UNAVAILABLE`, with the reason "fills: FAILED (deadline, page 3)". It cannot fall
+through to `OBSERVED_UNRESOLVED`.
+
+**Precedence chooses only the label.** `component_outcomes`, `findings` and `reasons`
+keep every failure. A `SCOPE_MISMATCH` snapshot whose fills read also failed and whose
+positions also held a K6 row lists all three.
+
+**Identity.** Each balance read is classified separately:
+
+- `MATCH`: the read completed and echoed the configured slug and UUID.
+- `MISMATCH`: it reported another slug or UUID, or the latch raised.
+- `NOT_OBSERVED`: it ended in `HTTP_ERROR` or `FAILED` before any identity check.
+
+"Not observed" is never folded into "mismatch", and the reverse. A `Tournament` held in
+`verify_tournament`'s cache never supplies identity for a snapshot (3.3).
+
+### 5.6 Enrolment, access and cash: observations kept apart from conclusions [Proposed]
+
+A3 keeps three layers separate.
+
+1. **Reported.** Each balance observation keeps `isPendingEnrolment`, `myBalance`,
+   `initialBalance` and `currencyName` as that response sent them (5.7).
+2. **Observed access.** Each requested portfolio read keeps its outcome, HTTP status and
+   documented code (5.3).
+3. **Conclusions.** A3 draws none about membership, or about whether `myBalance` is a
+   seed or a current balance. `conclusions.membership` and
+   `conclusions.seed_or_current` are always `NOT_DETERMINED`:
+   - **A 200 from a portfolio read does not confirm membership.** No documented
+     guarantee says only members are served 200, and the read is not tied to the
+     enrolment flag in time.
+   - **A 403 `FORBIDDEN` does not show non-membership.** The code is generic (5.3).
+   - **`isPendingEnrolment = true` does not by itself make `myBalance` a seed.** The
+     endpoint documents the balance only as "current or seed". The rule that a pending
+     member receives "its initial virtual balance" is documented for `/account` alone
+     (2.1, 3.2).
+
+**Differences between separate reads are observations, not contradictions.** Examples
+are a pending flag in a balance read next to a 200 from a positions read, or a flag that
+changes between the opening and closing reads. No documented guarantee places separate
+reads at one instant or on one state (A1-N1). Such differences become `UNEXPLAINED`
+findings (K3, K4, K5, K13). Only a contradiction inside **one** response, against a
+documented rule for that response, is a `CONTRADICTION` (K6, K8, K9).
+
+### 5.7 Balance observations and `cash.value` [Proposed]
+
+Each of the two balance reads is kept in full, whatever its outcome:
+
+```text
+BalanceObservation
+  role                  OPENING | CLOSING
+  outcome               OBSERVED | HTTP_ERROR | FAILED | SCOPE_MISMATCH       (5.3)
+  identity              MATCH | MISMATCH | NOT_OBSERVED
+  myBalance             Decimal as sent, or None if not observed
+  isPendingEnrolment    bool as sent, or None
+  initialBalance        Decimal as sent, or None
+  currencyName          str as sent, or None
+  provenance            ReadProvenance (attempts, status, started/finished times)
+```
+
+**Which observation supplies `cash.value`.** It is `balance_closing.myBalance`, with
+`cash.source = CLOSING`, if and only if all of these hold:
+
+- both observations are `OBSERVED`;
+- both have identity `MATCH`;
+- they agree exactly on `myBalance`, `isPendingEnrolment`, `initialBalance` and
+  `currencyName`.
+
+Otherwise `cash.value` is None and `cash.source` is `NONE`. The reason names what was
+missing or which fields differed, and **both observations stay in the snapshot** with
+their actual values, flags, currency and provenance.
+
+The closing read is named because it is the later one. When the two agree they carry
+the same value, and naming one keeps provenance exact. Agreement shows only that the two
+responses matched. It does not exclude a change and reversal between them, and it says
+nothing about positions, orders or any other component read in between.
+
+### 5.8 Times and ages [Proposed]
+
+**Recorded:**
+
+- for every request (every page of a walk): `started_mono`, `finished_mono` and
+  `finished_utc`;
+- for every component: the start and finish of its earliest and latest request;
+- for the snapshot: `assembled_from_mono` (the first request's start),
+  `assembled_to_mono` (the last request's finish), `evaluated_mono` and `evaluated_utc`.
+
+**Derived by whoever uses the snapshot, at local monotonic time `t`:**
+
+| Quantity | Definition | What it means |
+| --- | --- | --- |
+| Assembly span | `assembled_to_mono − assembled_from_mono` | How long the assembly took |
+| Completion age | `t − assembled_to_mono` | Time since the last request finished. **Not the age of any data** |
+| Component age | `t − started_mono` of the component's earliest request | Time since we first asked for that component. For a walk, the first page sets it |
+| Oldest component age | The largest component age, with its component named | The figure to quote for the snapshot |
+
+**Counterexample.** The positions request starts at 1 and finishes at 2. The closing
+balance finishes at 900, and the snapshot is evaluated at 900. Then:
+
+- completion age is 0;
+- positions component age is 899 (898 since its response finished);
+- oldest component age is 899, named `positions`.
+
+A recent closing balance read refreshes neither positions nor orders, and the snapshot
+never reports their age as the closing read's.
+
+Every age here is **local**. It measures our own requests, never SIG's state. A response
+may reflect projected state older than the request that fetched it (A1-N1), so no local
+age shows that a server value is fresh. A3 sets **no maximum age**: what counts as too
+old is S1 policy and is not chosen here.
+
+### 5.9 Unresolved-value flags
 
 Every numeric field that A3 exposes carries its status from the R5 table. The status is
 never dropped when the value is passed on.
 
 | Field | Documented | Unresolved |
 | --- | --- | --- |
-| `myBalance` | Tournament virtual cash; "current or seed" | Reservation (OQ-C3), source (OQ-W11), seed value while pending |
+| `myBalance` | Tournament virtual cash; "current or seed" | Reservation (OQ-C3), source (OQ-W11), seed or current (5.6) |
 | Position `quantity` | Sign: positive YES, negative NO | Granularity; lots relation (OQ-W5, OQ-W8) |
 | Position `avgCost`, `currentPrice`, `lots[].entryPrice` | `currentPrice` is the tournament valuation price | Denomination (OQ-W5); mark source (OQ-D1) |
 | Position `marketValue`, `costBasis`, `unrealizedPnl`, `moneyEarned` | None on the tournament row | Units and signs for NO (OQ-W5) |
@@ -710,94 +913,113 @@ never dropped when the value is passed on.
 | Settlement `shares` | None on the tournament row | Sign and unit (OQ-W5) |
 | Settlement `payout` | Cash credited to the tournament balance | Timing relative to `myBalance` (A1-N3) |
 
-### 5.4 Observation times and the closing re-read
+**Coverage values.** Open-order and fill pages keep `complete` and
+`projectedThroughSequence` as sent. Settlement pages carry economic-command coverage,
+which has **only** `complete` ([TCOV]); there is no settlement checkpoint to keep.
 
-- **[Proposed]** A3 reads the balance **first and last**. Equal values set
-  `changed_during_assembly = False`. That shows only that no change was observed in that
-  one value at those two instants; it is **not** atomicity, and it says nothing about
-  positions or orders between the reads. Different values set it to `True`, and the
-  status becomes `INCOMPLETE` with the reason "balance changed during assembly; read
-  again". A3 does not retry by itself; the caller decides when to assemble again.
-- **[Proposed]** Open-order pages, fill pages and settlement pages each keep their
-  `projectedThroughSequence` as sent. A3 does not compare them with one another, with
-  the market topics' sequences, or with anything else. Engine sequence bounds "are
-  provenance, not the topic gap counter" ([INFO]), and the meaning across endpoints is
-  undocumented (A1-N1).
-- **[Proposed]** A snapshot's age is reported as `now_mono − assembled_to_mono` by
-  whoever consumes it. A3 sets no maximum age: that is policy for S1.
+A3 compares no `projectedThroughSequence` with another page's, another endpoint's, a
+market topic's sequence, or anything else. Engine sequence bounds "are provenance, not
+the topic gap counter" ([INFO]), and their meaning across endpoints is undocumented
+(A1-N1).
 
-### 5.5 Consistency checks
+### 5.10 Consistency checks
 
-Each check produces a finding with its question ids. Contradictions make the snapshot
-`CONTRADICTED`; unexplained findings are reported but do not change the status.
+`CONTRADICTION` findings set class 2 (5.5). `UNEXPLAINED` findings never change the
+status but always appear in `findings` and `reasons`.
 
 | Id | Check | Kind | Basis |
 | --- | --- | --- | --- |
-| K1 | Every read in `reads` is tournament-bound (no default-context kind) | Contradiction (programming error) | 1.2; R2 |
-| K2 | Fresh balance reads echo the configured slug and UUID | `UNAVAILABLE` on mismatch, latched | `rest.py:493` |
-| K3 | `isPendingEnrolment = true`, but a portfolio read returned 200 with rows | Contradiction | [TOUR] description vs [TPOS] 403 "Not a member"; A1-N4 |
-| K4 | `isPendingEnrolment = false`, but a portfolio read returned 403 `FORBIDDEN` | Contradiction | Same |
-| K5 | `isPendingEnrolment = true` and `myBalance ≠ initialBalance` | Unexplained | "seed" is not documented to equal `initialBalance` on [TOUR] (3.2) |
-| K6 | A position row has `currentPrice = null` and `quantity ≠ 0` | Contradiction | `#/components/schemas/TournamentPortfolioPosition/properties/currentPrice/description` |
-| K7 | A position row's lot sides or lot quantities disagree with the sign or size of `quantity` | Unexplained | Lot semantics undocumented (OQ-W5, OQ-W8) |
-| K8 | A fill's `quantity` sign disagrees with its `side` | Contradiction | `#/components/schemas/Fill/properties/quantity/description` |
-| K9 | An order in a `status=open` walk has `open = false` | Contradiction | `#/paths/~1orders/get/parameters/0/schema/description` |
-| K10 | An order in a `status=open` walk has `expirationDate` at or before the local clock | Unexplained | [ORDER] `open` description; local-clock skew unknown |
-| K11 | Positions returned 409 while P&L returned 200, or the reverse | Unexplained | Different reads at different times; reported, not reconciled |
-| K12 | An order-fills read echoes a `tournamentId` other than the configured UUID, or null | `SigContextMismatchError` in A2 | `#/paths/~1orders~1{id}~1fills/get/responses/200/content/application~1json/schema/properties/tournamentId` |
-| K13 | The balance changed between the first and last read | `INCOMPLETE` (not a finding) | 5.4 |
+| K1 | A read in `reads` is not tournament-bound (a default-context kind) | `SCOPE_MISMATCH` (programming error) | 1.2; R2 |
+| K2 | Each balance read's echoed slug and UUID | Identity per read: `MATCH`, `MISMATCH` or `NOT_OBSERVED` (5.5) | `rest.py:493` |
+| K3 | A balance observation reports `isPendingEnrolment = true`, and a portfolio read returned 200 (with or without rows) | `UNEXPLAINED` | Separate reads; no documented guarantee ties them (5.6; A1-N4) |
+| K4 | A balance observation reports `isPendingEnrolment = false`, and a portfolio read returned 403 `FORBIDDEN` | `UNEXPLAINED` | `FORBIDDEN` is generic (5.3); separate reads (A1-N4) |
+| K5 | A balance observation reports `isPendingEnrolment = true` and `myBalance ≠ initialBalance` | `UNEXPLAINED` | "Seed" is not documented to equal `initialBalance` on [TOUR] (3.2) |
+| K6 | A position row in one response has `currentPrice = null` and `quantity ≠ 0` | `CONTRADICTION` | Same response; `#/components/schemas/TournamentPortfolioPosition/properties/currentPrice/description` |
+| K7 | A position row's lot sides or lot quantities disagree with the sign or size of `quantity` | `UNEXPLAINED` | Lot semantics undocumented (OQ-W5, OQ-W8) |
+| K8 | A fill row has a `quantity` sign that disagrees with its `side` | `CONTRADICTION` | Same row; `#/components/schemas/Fill/properties/quantity/description` |
+| K9 | A row in a `status=open` response has `open = false` | `CONTRADICTION` | Same response; `#/paths/~1orders/get/parameters/0/schema/description` |
+| K10 | A row in a `status=open` response has `expirationDate` at or before the local clock | `UNEXPLAINED` | [ORDER] `open` description; local-clock skew unknown (A1-N5) |
+| K11 | Positions returned 409 while valuation returned 200, or the reverse | `UNEXPLAINED` | Separate reads at different times; reported, not reconciled |
+| K12 | An order-fills read echoes a `tournamentId` other than the configured UUID, or null | `SCOPE_MISMATCH` outcome for that order | `#/paths/~1orders~1{id}~1fills/get/responses/200/content/application~1json/schema/properties/tournamentId` |
+| K13 | The opening and closing balance observations differ in `myBalance`, `isPendingEnrolment`, `initialBalance` or `currencyName` | `UNEXPLAINED` finding, plus class 4 (`INCOMPLETE`) | 5.7 |
 
 **Not checked in A3**, because the units are unresolved: positions against fills,
 fills against orders, cash against settlements or fills, and summary totals against row
 sums. A3 lists each one under `cannot_vouch_for`, with OQ-W4, OQ-W5 and OQ-W8.
 
-### 5.6 What it can and cannot vouch for
+### 5.11 What it can and cannot vouch for
 
 `vouches_for` holds only statements A3 checked, each of the form "this read completed
 under these rules". For example:
 
-- "the tournament identity was verified by a read made during this assembly";
+- "both balance reads echoed the configured tournament identity";
 - "every page of the open-orders walk was read, with no repeated cursor or duplicate
   id";
-- "positions were reported without a valuation conflict".
+- "the positions response held no valuation conflict".
 
 `cannot_vouch_for` always includes:
 
 - that `myBalance` is cash available for new orders (OQ-W11, OQ-C3);
+- whether `myBalance` is a seed or a current balance, and whether the account is
+  enrolled (5.6);
+- that an empty response means SIG holds nothing of that kind for the account (5.3);
 - that the reads describe one instant (no atomicity);
 - that any read reflects every engine event up to its time (projection freshness,
   A1-N1);
+- that any local age bounds the age of SIG's state (5.8);
 - the units or denomination of any price, cost or value field (OQ-W4 to OQ-W7);
 - that positions, fills, orders and cash agree with one another;
 - that no order or fill exists that the engine did not place (OQ-E1, OQ-E2; needs O2);
 - anything that happened before this process started (restart recovery, G-3);
-- market readiness of any market.
+- market readiness of any market;
+- each optional component that was not requested, by name.
 
 `does_not_cover` (fixed text) reads: "Account observations only. This snapshot is not a
 readiness result. It says nothing about market readiness, unresolved idempotency keys,
 risk, configuration, reference data or rate budget, and never authorizes trading on its
 own."
 
-### 5.7 Examples
+### 5.12 Examples
 
-1. **Pending enrolment.** `isPendingEnrolment = true`, `myBalance = 100000`, and
-   positions returns 403 `FORBIDDEN`. The result: cash `SEED_WHILE_PENDING`,
-   enrolment `PENDING`, positions `NOT_MEMBER`, status `INCOMPLETE`, and the reason
-   "not enrolled: positions not readable; first order enrols (OQ-W11)". It is not an
+1. **Pending flag, positions 403.** Both balance reads report `isPendingEnrolment =
+   true` and `myBalance = 100000`, with identity `MATCH`. Positions returns 403
+   `FORBIDDEN`. Open orders are `OBSERVED` with zero rows. The result:
+   - positions `HTTP_ERROR(403, FORBIDDEN)` and status `UNAVAILABLE`;
+   - `cash.value = 100000` from the closing read, with
+     `reported_pending_at_source = true`;
+   - `membership` and `seed_or_current` both `NOT_DETERMINED`.
+
+   No finding fires (K4 needs `isPendingEnrolment = false`). Nothing reports "not a
+   member", an empty portfolio or a seed balance.
+2. **Pending flag, empty positions.** As in 1, but positions returns 200 with
+   `positions: []`. Positions is `OBSERVED` with zero rows, retained. K3 is recorded as
+   `UNEXPLAINED`. If every other requested component is `OBSERVED`, the status is
+   `OBSERVED_UNRESOLVED`, and `cannot_vouch_for` says the empty list does not show an
    empty portfolio.
-2. **Missing valuation.** Positions returns 409 with two `(exchange, market)` pairs.
-   The result: positions `UNVALUED` with both pairs, valuation `MISSING_VALUATIONS` if
-   P&L also returns 409, status `INCOMPLETE`, and the reasons cite OQ-D3. Nothing values
-   the holdings at a default.
-3. **Incomplete orders.** The open-orders walk hits its page cap, or SIG repeats a
-   cursor. A2 raises (no partial list), and A3 sets open orders `UNAVAILABLE` and status
-   `UNAVAILABLE`. A walk is never marked complete on the strength of `coverage.complete`
-   alone: completeness is the walk reaching `hasMore: false`.
-4. **Contradiction.** `isPendingEnrolment = false`, but fills returns 403 `FORBIDDEN`
-   (K4): status `CONTRADICTED`, reasons cite A1-N4.
-5. **Change during assembly.** The opening balance read gives `X` and the closing read
-   gives `Y ≠ X`. The result is `INCOMPLETE` with `changed_during_assembly = True`. All
-   other components are kept as observed, for logging only.
+3. **Missing valuation.** Positions returns 409 with two `(exchange, market)` pairs, so
+   positions is `UNVALUED` with both pairs and the status is `INCOMPLETE`. If
+   `valuation` was requested and returned 200, K11 is recorded as `UNEXPLAINED`. Nothing
+   values the holdings at a default.
+4. **Optional component failure.** The core reads are `OBSERVED` with identity `MATCH`,
+   but the requested `fills` walk ends `FAILED` (deadline). The status is `UNAVAILABLE`
+   (5.5). If `fills` had not been requested, it would be `NOT_REQUESTED`, excluded from
+   the status and named in `cannot_vouch_for`.
+5. **Contradiction inside one response.** Positions returns 200 with a row of
+   `quantity = 5` and `currentPrice = null`. K6 fires and the status is `CONTRADICTED`.
+   The row is retained as sent.
+6. **Identity not observed.** The opening balance read ends `FAILED` after its retries.
+   Its identity is `NOT_OBSERVED`. The other components are still read and recorded. The
+   status is `UNAVAILABLE`, `cash.value` is None, and the opening observation is kept
+   with its outcome and provenance.
+7. **Identity mismatch, plus other failures.** The closing balance read reports another
+   UUID, and the fills walk had already failed. The status is `SCOPE_MISMATCH`, and the
+   reasons list both the mismatch and the fills failure.
+8. **Balance changed during assembly.** The opening read gives `myBalance = X`, and the
+   closing read gives `Y ≠ X` (or the same value with a different pending flag). K13
+   fires. The status is `INCOMPLETE` and `cash.value` is None. Both observations are kept
+   with their values, flags, currency and provenance.
+9. **Ages.** This is the counterexample in 5.8: the snapshot reports positions as its
+   oldest component, at age 899, not the completion age of 0.
 
 ## 6. Mapping unresolved contracts to PRD questions
 
@@ -856,23 +1078,37 @@ and the shared limiter. None calls SIG.
 | T13 | A2 | Orders page with `coverage: null` | `SigResponseError` (optional, not nullable) |
 | T14 | A2 | Orders page with `coverage` omitted | Recorded as `omitted`; walk continues |
 | T15 | A2 | Repeated cursor, duplicate order id, cursor on the last page, page cap reached | `SigPaginationError`; no partial list |
-| T16 | A2 | Settlements page with `coverage.complete: false` | Walk result `complete = False` with the page index; never presented as complete |
+| T16 | A2 | Settlements page with `coverage: {complete: false}` | Walk result `complete = False` with the page index; never presented as complete. The coverage model has `complete` only; a `projectedThroughSequence` sent there is ignored as an unknown field, never kept as a checkpoint |
 | T17 | A2 | Order fills echo another `tournamentId`, or null | `SigContextMismatchError` |
 | T18 | A2 | Any error carrying balance, ids or titles in `message` or `details` | None of that text in the exception or the logs (redaction test, as `test_sig_redaction.py`) |
 | T19 | A2 | P&L read | `period=all` sent explicitly |
-| T20 | A3 | Pending, seed balance, positions 403 | Example 5.7.1: `INCOMPLETE`, positions `NOT_MEMBER`, not an empty `OBSERVED` list |
-| T21 | A3 | Positions 409 | Example 5.7.2: `UNVALUED` with ids; status `INCOMPLETE`; no value invented |
-| T22 | A3 | Orders walk failed | `UNAVAILABLE`; no orders component claims completeness |
-| T23 | A3 | K3, K4, K6, K8, K9 each injected | `CONTRADICTED` with the check id and question ids in `reasons` |
-| T24 | A3 | K5, K7, K10, K11 each injected | Finding of kind `UNEXPLAINED`; status unchanged by it |
-| T25 | A3 | First balance read `X`, last read `Y ≠ X` | `INCOMPLETE`, `changed_during_assembly = True` |
-| T26 | A3 | First and last balance equal, all reads clean | `OBSERVED_UNRESOLVED`, never `READY`; the enum has no ready member |
-| T27 | A3 | Any snapshot | `cash.source_established is False` and `excludes_resting_orders == UNKNOWN`; the 5.6 list is in `cannot_vouch_for`; `does_not_cover` present |
-| T28 | A3 | Any snapshot | Coverage checkpoints present and never compared (no code path reads two endpoints' checkpoints together) |
-| T29 | A3 | A `Tournament` taken from `verify_tournament`'s cache is offered as the cash source | Rejected: cash provenance must be a read inside this assembly |
-| T30 | A3 | A snapshot built with a market `MarketReadiness` present | No field of either is derived from the other; account status has no effect on market status, and the reverse |
-| T31 | Both | Static check | No A2/A3 module imports `shared.schemas` `Fill` or `Position`, or converts to ticks or milli |
-
+| T20 | A2 | Order fills over two pages, then a third order with no fills | Both pages read, each page's coverage kept; lifetime totals kept as sent; the empty order still costs one request and returns an empty walk |
+| T21 | A3 | Both balance reads report pending; positions 403 `FORBIDDEN` | Example 5.12.1: positions `HTTP_ERROR(403, FORBIDDEN)`; status `UNAVAILABLE`; `membership` and `seed_or_current` are `NOT_DETERMINED`; no "not a member" or "seed" value exists in the model |
+| T22 | A3 | Pending reported; positions 200 with `positions: []` | Example 5.12.2: positions `OBSERVED` with zero rows retained; K3 `UNEXPLAINED`; status not changed by K3; `cannot_vouch_for` names the empty-response limit |
+| T23 | A3 | Not pending reported; fills 403 `FORBIDDEN` | K4 `UNEXPLAINED`; status `UNAVAILABLE` (from the `HTTP_ERROR`), never `CONTRADICTED` |
+| T24 | A3 | Positions 409 | Example 5.12.3: `UNVALUED` with ids; status `INCOMPLETE`; no value invented |
+| T25 | A3 | Core reads `OBSERVED`, identity `MATCH`; requested `fills` ends `FAILED` (deadline) | Example 5.12.4: status `UNAVAILABLE`, not `OBSERVED_UNRESOLVED`; the reason names fills and the phase |
+| T26 | A3 | Each optional component (fills, valuation, settlements, one `order_fills` id) in turn ends `HTTP_ERROR`, then `FAILED`; everything else `OBSERVED` | `UNAVAILABLE` every time |
+| T27 | A3 | Settlements `OBSERVED_INCOMPLETE`; valuation `UNVALUED`; an order-fills echo naming another tournament or null | `INCOMPLETE`, `INCOMPLETE` and `SCOPE_MISMATCH` respectively |
+| T28 | A3 | Optional components not requested | `NOT_REQUESTED`; excluded from the status; never shown as observed; each named in `cannot_vouch_for`; `requested` lists only what was asked for |
+| T29 | A3 | Status function over every combination of identity state (per balance read), outcome per requested component, finding kinds and balance difference | The status equals the most severe class in 5.5; `OBSERVED_UNRESOLVED` exactly when both identities are `MATCH`, every requested component is `OBSERVED`, there is no contradiction and there is no balance difference; no input lacks a class |
+| T30 | A3 | Opening balance read `FAILED` after retries | Example 5.12.6: opening identity `NOT_OBSERVED`; status `UNAVAILABLE`; the other components still have outcomes; the opening observation is kept with outcome and provenance; `cash.value` None |
+| T31 | A3 | Closing balance read `HTTP_ERROR` (503 after retries) | Closing identity `NOT_OBSERVED`; `UNAVAILABLE`; `cash.value` None; the opening observation is kept with its values |
+| T32 | A3 | Closing balance read reports another UUID; fills had failed; positions held a K6 row | Example 5.12.7: `SCOPE_MISMATCH`; `reasons` and `component_outcomes` still list the fills failure and the K6 finding |
+| T33 | A3 | A `NOT_OBSERVED` identity and a `MISMATCH` identity | Represented as different values; a mismatch is never reported as not observed, nor the reverse |
+| T34 | A3 | K6, K8 and K9 each injected in a single response | `CONTRADICTED`; the offending rows retained as sent; the check id and question ids in `reasons` |
+| T35 | A3 | K3, K4, K5, K7, K10 and K11 each injected | Finding of kind `UNEXPLAINED`; status unchanged by it |
+| T36 | A3 | Opening `myBalance = X`, closing `Y ≠ X` | Example 5.12.8: K13; `INCOMPLETE`; `cash.value` None; both observations kept with values, flags, currency and provenance; `balance_differences` names `myBalance` |
+| T37 | A3 | Equal balances, but the pending flag (or currency, or `initialBalance`) differs | K13; `INCOMPLETE`; `cash.value` None; the differing field named |
+| T38 | A3 | Both balance observations agree exactly and have identity `MATCH` | `cash.value` equals the closing `myBalance`; `cash.source = CLOSING`; currency and pending flag from the closing read |
+| T39 | A3 | Positions request 1 to 2, closing balance finishes at 900, evaluated at 900 | Example 5.12.9: completion age 0; positions component age 899; oldest component age 899, named `positions` |
+| T40 | A3 | Any snapshot | No field or reason calls server state fresh because of a local age; no maximum-age constant exists in A3 |
+| T41 | A3 | All requested components `OBSERVED`, identities `MATCH`, no difference | `OBSERVED_UNRESOLVED`, never `READY`; the status enum has no ready member |
+| T42 | A3 | Any snapshot | `cash.source_established is False` and `excludes_resting_orders == UNKNOWN`; the 5.11 list is in `cannot_vouch_for`; `does_not_cover` present |
+| T43 | A3 | Any snapshot with orders and fills pages | Their `projectedThroughSequence` values are kept and never compared; settlement pages hold `complete` only |
+| T44 | A3 | A `Tournament` taken from `verify_tournament`'s cache is offered as a balance observation | Rejected: both balance observations must be reads made inside this assembly |
+| T45 | A3 | A snapshot built with a market `MarketReadiness` present | No field of either is derived from the other; account status has no effect on market status, and the reverse |
+| T46 | Both | Static check | No A2/A3 module imports `shared.schemas` `Fill` or `Position`, or converts to ticks or milli |
 ## 8. Next bounded implementation slice: A2-A
 
 **Scope** (engine and tests only):
@@ -899,9 +1135,9 @@ and the shared limiter. None calls SIG.
   `SigRestClient`. Both are inside `engine/`, which Claude Code owns, but the read
   client's documented scope ("eight documented GET endpoints", `rest.py:3`) grows.
 
-**Then:** A2-B, then A3. A3 depends on A2-B only for the fills, valuation and
-settlements components. An A3 built on A2-A alone would report those as `NOT_READ` and
-stay `INCOMPLETE`.
+**Then:** A2-B, then A3. A3 needs only A2-A for its required components (5.2). A2-B
+is needed before any optional component can be requested; until then those components
+are `NOT_REQUESTED` and are named in `cannot_vouch_for`.
 
 ## 9. Remaining questions and checks
 
@@ -946,16 +1182,21 @@ None is run by an agent. Each is listed with its rate cost.
 - **Enrolment:** if P1 shows pending enrolment, the first order in P3 or P4 also enrols
   the account ([OIN-T]).
 
+Each check records **one bounded observation**: one account, one set of orders, one
+time (3.5). None establishes a general guarantee about reservation, freshness, fees or
+the tick grid. A check can only inform the questions listed, and whether that is enough
+for a gate is Arnav's decision.
+
 Captured bodies are reviewed and redacted before anything is committed (R8).
 
-| Id | Check | Kind | Closes or informs |
+| Id | Check | Kind | Bounded observation it informs |
 | --- | --- | --- | --- |
-| P1 | One read each of [TOUR], [TPOS], [TFILLS] (one page), [TPNL] `period=all`, [TSETTLE] (one page) and [ORDERS] `status=open`, recording status codes, shapes, the presence of `coverage`, and the unredacted `isPendingEnrolment` (kept local) | Read-only, about 6 reads | Enrolment state; 403-vs-200 while pending (A1-N4); first observed positions and P&L shapes; fixtures for A2 |
+| P1 | One read each of [TOUR], [TPOS], [TFILLS] (one page), [TPNL] `period=all`, [TSETTLE] (one page) and [ORDERS] `status=open`, recording status codes, shapes, the presence of `coverage`, and the unredacted `isPendingEnrolment` (kept local) | Read-only, at least 6 requests (one page each, more if a walk is followed) | The reported pending flag next to the portfolio status codes at one time (A1-N4); first observed positions and P&L shapes; fixtures for A2 |
 | P2 | Record from the SIG website's API-key settings whether the key is organization-bound, if shown; no API call | No API call | Key binding (1.1); why `/account` is not used |
-| P3 | `myBalance` before placing, while resting, and after cancelling one tiny resting buy far from the market (with P1's reads around it) | Writes (2), reads | OQ-C3; OQ-W11 (balance moves with tournament orders); seed-to-current transition if pending |
-| P4 | One minimal NO buy that fills (marketable, so a real trade), then [TFILLS], [OFILLS], [TPOS], [ORDERS] `status=all` and [TOUR] | Writes (1), reads | OQ-W4, OQ-W5, OQ-W6, OQ-W7 for one example; fees (PRD section B); K8 and K6 in practice |
-| P5 | Within P3: one [OFILLS] or [ORDER1] read for the placed order | Reads | Echoed `tournamentId` (K12); order-row fields for a real order |
-| P6 | One `GET /portfolio/collateral?tournamentId=<configured>` read | Read-only, 1 read | That no ALL collateral exists for our account (3.4) |
+| P3 | `myBalance` before placing, while resting, and after cancelling one tiny resting buy far from the market (with P1's reads around it) | Writes (2), reads | Whether this balance moved with this one resting order (informs OQ-C3, OQ-W11); the reported flag and balance before and after a first order, if pending |
+| P4 | One minimal NO buy that fills (marketable, so a real trade), then [TFILLS], [OFILLS], [TPOS], [ORDERS] `status=all` and [TOUR] | Writes (1), reads | The field values of one real fill, position and order (informs OQ-W4 to OQ-W7); whether this one fill showed a fee (PRD section B); K6 and K8 on real rows |
+| P5 | Within P3: one [OFILLS] read for the placed order, the only order read that echoes `tournamentId`. Optionally one [ORDER1] read for the order-row fields, which carry no tournament id (2.8) | Reads (one per page) | The echoed `tournamentId` for one order (K12); order-row fields of one real order |
+| P6 | One `GET /portfolio/collateral?tournamentId=<configured>` read | Read-only, 1 read | Whether any ALL collateral was reported for our account at that time (3.4) |
 
 ## 10. References
 
