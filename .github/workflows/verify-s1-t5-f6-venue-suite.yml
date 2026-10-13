@@ -1,0 +1,32 @@
+name: Verify S1-T5-F6 venue suite
+
+# Verification only, on a separate branch: runs the venue suite, which the default CI job does
+# not collect (pyproject testpaths = ["tests"]), against the exact implementation commit of
+# PR #31. Not for merge.
+
+on:
+  push:
+    branches: [ci-verify/s1-t5-f6-venue-suite]
+
+permissions:
+  contents: read
+
+jobs:
+  venue-suite:
+    runs-on: ubuntu-latest
+    env:
+      IMPLEMENTATION_SHA: 7308651409e52813e7cfb9defcefd8fe05aba4c1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 7308651409e52813e7cfb9defcefd8fe05aba4c1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: git rev-parse HEAD
+      - run: test "$(git rev-parse HEAD)" = "$IMPLEMENTATION_SHA"
+      - run: python --version
+      - run: pip install -e .
+      - run: ruff check .
+      - run: python -m pytest data/venue_markets/tests -q
+      - run: python -m pytest tests data/venue_markets/tests -q
