@@ -41,6 +41,7 @@ from sig_testkit import (
 from engine.sig_client.errors import SigContextMismatchError
 from engine.sig_client.rate_limiter import RateLimiter, RequestKind
 from engine.sig_client.rest import SigRestClient
+from engine.sig_client.wire import Tournament
 
 OTHER_UUID = "11111111-2222-4333-8444-555555555555"
 MATCHING = json_response(200, tournament_body())
@@ -99,6 +100,7 @@ def test_no_endpoint_request_after_a_mismatch_latched_during_verification(
     run(scenario())
     assert count(router, endpoint) == 0  # nothing was sent after the latch
     assert count(router, TOURNAMENT_PATH) == 2
+    assert client.limiter.used(RequestKind.READ) == 2  # and no rate budget was spent
 
 
 def test_a_waiter_on_the_verification_lock_sends_nothing_after_a_latch() -> None:
@@ -126,6 +128,7 @@ def test_a_waiter_on_the_verification_lock_sends_nothing_after_a_latch() -> None
     run(scenario())
     assert count(router, POSITIONS) == 0
     assert count(router, TOURNAMENT_PATH) == 2
+    assert client.limiter.used(RequestKind.READ) == 2
 
 
 # --- retries and rate admission ---------------------------------------------------------
@@ -169,7 +172,8 @@ def test_no_retry_after_a_mismatch_latched_during_the_retry_wait() -> None:
             await positions
 
     run(scenario())
-    assert count(router, POSITIONS) == 1  # the retry was never sent
+    assert count(router, POSITIONS) == 1  # the retry was never sent ...
+    assert client.limiter.used(RequestKind.READ) == 3  # ... nor admitted (verify, try, balance)
 
 
 class GatedLimiter(RateLimiter):
@@ -273,6 +277,20 @@ def test_no_public_read_sends_anything_after_the_latch() -> None:
 
     run(scenario())
     assert router.paths() == ["/tournaments/alpha-tournament"]
+
+
+def test_check_tournament_never_replaces_an_existing_latch() -> None:
+    # Unit check of the latch itself: whatever reaches _check_tournament later, the error
+    # already latched is the one raised and kept.
+    client, _, _ = make_client()
+    first = SigContextMismatchError(method="GET", path="/tournaments/x", reason="first")
+    client._mismatch = first
+    other = Tournament.model_validate(
+        tournament_body(slug="another-slug", id=OTHER_UUID) | {"myBalance": 1}
+    )
+    with pytest.raises(SigContextMismatchError) as info:
+        client._check_tournament("/tournaments/alpha-tournament", other)
+    assert info.value is first and client._mismatch is first
 
 
 # --- controls: normal concurrent use is unchanged ---------------------------------------------
