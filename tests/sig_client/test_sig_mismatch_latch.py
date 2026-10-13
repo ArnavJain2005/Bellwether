@@ -310,3 +310,42 @@ def test_control_retries_still_happen_without_a_mismatch() -> None:
     result = run(client.read_tournament_positions())
     assert result.provenance.attempts == 2 and clock.sleeps == [0.25]
     assert count(router, POSITIONS) == 2
+
+
+@pytest.mark.parametrize(
+    "waiter",
+    [lambda c: c.verify_tournament(), lambda c: c.read_tournament_positions()],
+)
+def test_a_lock_waiter_does_not_reuse_a_verification_once_latched(
+    waiter: Callable[[SigRestClient], Awaitable[Any]],
+) -> None:
+    # The holder's verification matches and is cached, but a mismatch is latched before
+    # the waiter gets the lock: the waiter must raise, not return the cached Tournament.
+    holder_gate = asyncio.Event()
+    balance_gate = asyncio.Event()
+    scripts = {
+        "holder": [held(holder_gate, MATCHING)],
+        "balance": [held(balance_gate, MISMATCHED)],
+    }
+    router = Router({TOURNAMENT_PATH: per_caller(scripts)})
+    client, _, _ = make_client(router)
+
+    async def scenario() -> None:
+        holder = asyncio.create_task(as_caller("holder", client.verify_tournament()))
+        await until(lambda: count(router, TOURNAMENT_PATH) == 1)
+        waiting = asyncio.create_task(as_caller("waiter", waiter(client)))
+        balance = asyncio.create_task(as_caller("balance", client.read_tournament_balance()))
+        await until(lambda: count(router, TOURNAMENT_PATH) == 2)
+        # Release both responses together: the holder caches a match and frees the lock,
+        # and the balance read latches its mismatch before the waiter resumes.
+        holder_gate.set()
+        balance_gate.set()
+        await holder  # the holder's own read matched before the latch
+        with pytest.raises(SigContextMismatchError):
+            await balance
+        with pytest.raises(SigContextMismatchError):
+            await waiting
+
+    run(scenario())
+    assert count(router, POSITIONS) == 0
+    assert count(router, TOURNAMENT_PATH) == 2
