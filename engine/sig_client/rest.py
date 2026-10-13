@@ -21,7 +21,11 @@ readiness. No account value is converted into domain units.
 
 Tournament scoping: before any scoped read, the client calls GET /tournaments/{slug}
 once and checks that SIG reports the configured slug and UUID. A mismatch is permanent
-for the client's lifetime. UUID-scoped reads always send `tournamentId`, and the echoed
+for the client's lifetime, and the first mismatch observed is the one kept. Once it is
+latched, no request or retry starts: every read re-checks the latch before rate
+admission, after it, and when a response arrives, so a read that was already waiting
+(on verification, admission or a retry wait) sends nothing more and returns nothing.
+UUID-scoped reads always send `tournamentId`, and the echoed
 context of the market orderbook and the market detail is checked as well. The trade
 tape echoes no tournament, so its scope rests on the `tournamentId` sent.
 
@@ -41,6 +45,11 @@ Transport and credentials:
   log line, exception or repr. An injected client with its own auth or credential
   headers is refused. Errors and logs carry no text taken from a response body (see
   errors.py).
+- httpx itself logs each request URL at INFO on the "httpx" logger. A cursor walk's URL
+  carries the previous page's `nextCursor`, which is response data, so for requests
+  sent by this client that one query value is logged as REDACTED. The rest of the line
+  (method, URL, configuration-derived parameters, status) is kept. Requests of any other
+  httpx client are logged unchanged, and no logger is disabled or reconfigured.
 
 Deadlines and retries (ReadRetryPolicy):
 - One logical read (one public page or object request) has one overall deadline,
@@ -77,6 +86,7 @@ property, or [client policy] when it is an extra consistency check of ours.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import itertools
 import json
@@ -317,6 +327,53 @@ def _recorded_params(
     return tuple(sorted(recorded)), cursor_sent
 
 
+# Query parameters whose values come from a response (design 4.1 R8: never logged).
+_RESPONSE_DERIVED_QUERY_PARAMS = frozenset({"cursor"})
+_REDACTED = "REDACTED"
+# True only inside SigRestClient._send, in the task sending the request.
+_SIG_REQUEST_IN_FLIGHT: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "sig_rest_request_in_flight", default=False
+)
+
+
+def _redacted_url(url: httpx.URL) -> httpx.URL:
+    """`url` with every response-derived query value replaced; otherwise unchanged."""
+    params = url.params
+    if not any(name in params for name in _RESPONSE_DERIVED_QUERY_PARAMS):
+        return url
+    return url.copy_with(
+        params=[
+            (name, _REDACTED if name in _RESPONSE_DERIVED_QUERY_PARAMS else value)
+            for name, value in params.multi_items()
+        ]
+    )
+
+
+class _RequestLogRedaction(logging.Filter):
+    """Redacts response-derived query values in httpx's request log lines.
+
+    Attached once to the "httpx" logger. It acts only on records emitted while
+    `_SIG_REQUEST_IN_FLIGHT` is set, which `_send` does for its own request in its own
+    task, so any other httpx client's lines (concurrent ones included) are untouched. It
+    never drops a record. If redaction itself fails, the URL is withheld from that line.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if _SIG_REQUEST_IN_FLIGHT.get() and isinstance(record.args, tuple):
+            try:
+                record.args = tuple(
+                    _redacted_url(arg) if isinstance(arg, httpx.URL) else arg for arg in record.args
+                )
+            except Exception:  # noqa: BLE001 - logging must never break the request
+                record.args = tuple(
+                    "<url withheld>" if isinstance(arg, httpx.URL) else arg for arg in record.args
+                )
+        return True
+
+
+_REQUEST_LOG_REDACTION = _RequestLogRedaction()
+
+
 def _missing_valuations(content: bytes) -> tuple[MissingValuation, ...] | None:
     """The (exchange, market) pairs of a documented 409 MissingTournamentValuation, or None.
 
@@ -530,6 +587,8 @@ class SigRestClient:
         self._verified: Tournament | None = None
         self._mismatch: SigContextMismatchError | None = None
         self._verify_lock = asyncio.Lock()
+        # Idempotent: Logger.addFilter ignores a filter that is already attached.
+        logging.getLogger("httpx").addFilter(_REQUEST_LOG_REDACTION)
 
     @classmethod
     def create(
@@ -598,9 +657,7 @@ class SigRestClient:
         fails this call. `myBalance` is kept exactly as sent; it is a candidate, not
         established tournament cash (see account_reads.NUMERIC_FIELD_STATUS).
         """
-        read = await self._read_tournament()
-        self._raise_if_latched()
-        return read
+        return await self._read_tournament()
 
     async def _read_tournament(self) -> TournamentBalanceRead:
         if self._mismatch is not None:
@@ -620,6 +677,7 @@ class SigRestClient:
         if self._mismatch is not None:
             raise self._mismatch
         async with self._verify_lock:
+            self._raise_if_latched()  # latched while this call waited for the lock
             if self._verified is None:
                 return await self.get_tournament()
             return self._verified
@@ -633,14 +691,15 @@ class SigRestClient:
         if self._mismatch is not None:
             raise self._mismatch
         async with self._verify_lock:
+            self._raise_if_latched()  # latched while this call waited for the lock
             if self._verified is None:
                 read = await self._read_tournament()
                 return VerificationUse.PERFORMED, read.provenance
             return VerificationUse.CACHED, None
 
     def _raise_if_latched(self) -> None:
-        # [client policy] a mismatch latched (by any read) while this read was in flight
-        # means the client no longer vouches for its tournament: nothing is returned.
+        # [client policy] once a mismatch is latched (by any read) the client no longer
+        # vouches for its tournament: no request or retry starts, nothing is returned.
         if self._mismatch is not None:
             raise self._mismatch
 
@@ -658,14 +717,15 @@ class SigRestClient:
         if not same_id:
             problems.append("id")
         if problems:
-            self._mismatch = SigContextMismatchError(
-                method="GET",
-                path=path,
-                reason=(
-                    f"SIG reports a different tournament {' and '.join(problems)} than "
-                    f"configured ({expected.slug} / {expected.id})"
-                ),
-            )
+            if self._mismatch is None:  # the first mismatch observed stays latched
+                self._mismatch = SigContextMismatchError(
+                    method="GET",
+                    path=path,
+                    reason=(
+                        f"SIG reports a different tournament {' and '.join(problems)} than "
+                        f"configured ({expected.slug} / {expected.id})"
+                    ),
+                )
             raise self._mismatch
 
     # --- positions (A2-A) ---------------------------------------------------------------
@@ -695,10 +755,8 @@ class SigRestClient:
             verification_read=verification_read,
         )
         if exchange.conflict is not None:
-            self._raise_if_latched()
             return UnvaluedHoldingsRead(missing=exchange.conflict, provenance=provenance)
         positions = self._validate(path, exchange.body, TournamentPositions)
-        self._raise_if_latched()
         return PositionsRead(
             rows=tuple(positions.positions), summary=positions.summary, provenance=provenance
         )
@@ -1030,7 +1088,6 @@ class SigRestClient:
         orders = await self._collect(
             ORDERS_ROUTE, fetch, max_pages=max_pages, key=lambda order: order.id
         )
-        self._raise_if_latched()
         return OrdersWalk(orders=tuple(orders), pages=tuple(records))
 
     async def list_all_orders(
@@ -1357,6 +1414,8 @@ class SigRestClient:
         while True:
             if self._closed:
                 raise SigClientClosedError("the SIG client is closed")
+            # A mismatch latched before this attempt (or during a retry wait) stops it.
+            self._raise_if_latched()
             try:
                 # A cancelled admission consumes no token: the limiter admits only in a
                 # synchronous step after its wait, and keeps no queue of waiters.
@@ -1366,6 +1425,7 @@ class SigRestClient:
                 )
             except SigRateBudgetError:
                 raise expired("rate admission") from None
+            self._raise_if_latched()  # latched while this attempt waited for admission
             attempts += 1
             error: SigApiError | SigTransportError
             wait_floor = 0.0
@@ -1382,6 +1442,7 @@ class SigRestClient:
                 finished = self._clock()
                 if finished >= deadline:
                     raise expired("request")  # a late response is not returned
+                self._raise_if_latched()  # latched while the request was in flight
                 missing = None
                 if response.status_code == 409 and conflict is not None:
                     missing = conflict(response.content)  # None: handled as any 409 below
@@ -1459,7 +1520,11 @@ class SigRestClient:
             },
             timeout=self._config.timeout,
         )
-        return await self._http.send(request, follow_redirects=False)
+        marker = _SIG_REQUEST_IN_FLIGHT.set(True)  # scopes _RequestLogRedaction
+        try:
+            return await self._http.send(request, follow_redirects=False)
+        finally:
+            _SIG_REQUEST_IN_FLIGHT.reset(marker)
 
     @staticmethod
     def _api_error(

@@ -2,12 +2,8 @@
 
 Every response here carries sentinel strings in the places a careless client might copy
 from: `message`, `details`, titles, ids and values. None may appear in an exception (its
-text, repr, attributes or chained errors) or in any log line the client writes.
-
-Known pre-existing gap, not changed here: httpx's own "httpx" logger writes each request
-URL at INFO, including a `cursor` query value taken from the previous page. That applies
-to every cursor walk on main, not only to A2-A, and is reported in the A2-A pull request.
-The checks below therefore cover every logger except "httpx".
+text, repr, attributes or chained errors) or in any captured log line, from any logger
+(httpx's own request lines included; see test_sig_log_redaction.py).
 """
 
 from __future__ import annotations
@@ -51,11 +47,6 @@ SENTINELS = (KEY, TITLE, "SENTINEL_MESSAGE_TEXT", "987654.321", DETAIL, BALANCE,
 Call = Callable[[SigRestClient], Awaitable[Any]]
 
 
-def client_log(caplog: Any) -> str:
-    """Every captured log message except httpx's own request lines (see the docstring)."""
-    return "\n".join(r.getMessage() for r in caplog.records if r.name != "httpx")
-
-
 def assert_clean(router: Router, call: Call, error_type: type[SigClientError], caplog: Any) -> None:
     client, _, _ = make_client(router, api_key=KEY)
     caplog.set_level(logging.DEBUG)
@@ -63,8 +54,7 @@ def assert_clean(router: Router, call: Call, error_type: type[SigClientError], c
         run(call(client))
     for sentinel in SENTINELS:
         assert secret_leaks(info.value, sentinel) == [], sentinel
-        assert sentinel not in client_log(caplog), sentinel
-    assert KEY not in caplog.text  # the key never appears, not even in httpx's lines
+        assert sentinel not in caplog.text, sentinel  # every logger, httpx included
 
 
 def missing_valuation(**item_changes: Any) -> dict[str, Any]:
@@ -129,7 +119,7 @@ def test_retried_errors_stay_out_of_logs(path: str, caplog: Any) -> None:
     assert_clean(
         Router({path: [json_response(503, body)]}), calls[path], SigRetryExhaustedError, caplog
     )
-    assert "SIG read retry" in client_log(caplog)  # retries were logged, without the text
+    assert "SIG read retry" in caplog.text  # retries were logged, without the text
 
 
 @pytest.mark.parametrize(
