@@ -29,7 +29,6 @@ from sig_testkit import (
     TOURNAMENT,
     FakeClock,
     Router,
-    run,
 )
 
 from engine.config import ApiKey, SigConfig
@@ -43,6 +42,18 @@ OTHER_URL = f"https://other.invalid/feed?cursor={OTHER_CURSOR}"
 OTHER_LINE = f'HTTP Request: GET {OTHER_URL} "HTTP/1.1 200 OK"'
 
 Hook = Callable[[Any], Awaitable[None]]
+
+
+def run(coro: Awaitable[Any]) -> Any:
+    """Run a scenario with a wall-clock guard, so a regression fails instead of hanging.
+
+    The guard only bounds the whole test; no step of any scenario is timed by it.
+    """
+
+    async def main() -> Any:
+        return await asyncio.wait_for(coro, timeout=10)
+
+    return asyncio.run(main())
 
 
 def httpx_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -308,9 +319,12 @@ def test_control_the_ownership_registry_is_emptied(ending: str) -> None:
     seen: list[int] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(len(rest._SIG_REQUESTS_IN_FLIGHT))  # owned while being sent
-        if ending != "success" and request.url.params.get("cursor") == SIG_CURSOR:
+        is_cursor = request.url.params.get("cursor") == SIG_CURSOR
+        if is_cursor:
             started.set()
+        registry = getattr(rest, "_SIG_REQUESTS_IN_FLIGHT", None)
+        seen.append(-1 if registry is None else len(registry))  # owned while being sent
+        if ending != "success" and is_cursor:
             if ending == "cancelled":
                 await asyncio.Event().wait()
             raise httpx.UnsupportedProtocol("synthetic, not retried")
@@ -332,7 +346,7 @@ def test_control_the_ownership_registry_is_emptied(ending: str) -> None:
 
     run(scenario())
     assert seen and all(count == 1 for count in seen)
-    assert rest._SIG_REQUESTS_IN_FLIGHT == {}
+    assert getattr(rest, "_SIG_REQUESTS_IN_FLIGHT", None) == {}
 
 
 def test_control_concurrent_sig_clients_and_an_unrelated_sibling(
