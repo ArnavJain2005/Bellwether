@@ -46,10 +46,12 @@ Transport and credentials:
   headers is refused. Errors and logs carry no text taken from a response body (see
   errors.py).
 - httpx itself logs each request URL at INFO on the "httpx" logger. A cursor walk's URL
-  carries the previous page's `nextCursor`, which is response data, so for requests
-  sent by this client that one query value is logged as REDACTED. The rest of the line
-  (method, URL, configuration-derived parameters, status) is kept. Requests of any other
-  httpx client are logged unchanged, and no logger is disabled or reconfigured.
+  carries the previous page's `nextCursor`, which is response data, so in the line for
+  a request this client sends, that one query value is logged as REDACTED. Ownership is
+  per request object: requests of any other httpx client (including ones made inside an
+  event hook of this client's httpx client, or by tasks created there) are logged
+  unchanged. The rest of the line (method, URL, configuration-derived parameters,
+  status) is kept, and no logger is disabled or reconfigured.
 
 Deadlines and retries (ReadRetryPolicy):
 - One logical read (one public page or object request) has one overall deadline,
@@ -86,7 +88,6 @@ property, or [client policy] when it is an extra consistency check of ours.
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import functools
 import itertools
 import json
@@ -330,10 +331,23 @@ def _recorded_params(
 # Query parameters whose values come from a response (design 4.1 R8: never logged).
 _RESPONSE_DERIVED_QUERY_PARAMS = frozenset({"cursor"})
 _REDACTED = "REDACTED"
-# True only inside SigRestClient._send, in the task sending the request.
-_SIG_REQUEST_IN_FLIGHT: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "sig_rest_request_in_flight", default=False
-)
+# Every SIG request currently inside httpx's `send`, keyed by id() and holding the request
+# object itself, so an id can never match once its request is gone. `_send` adds its own
+# request before sending and removes it in `finally` (success, failure or cancellation).
+# Ownership is per request object, not per task, context or time window: requests made by
+# other clients (in event hooks, in tasks spawned there, or concurrently) are never in it.
+_SIG_REQUESTS_IN_FLIGHT: dict[int, httpx.Request] = {}
+
+
+def _is_sig_request_url(arg: object) -> bool:
+    """True if `arg` is the current URL object of a SIG request being sent.
+
+    Identity, not equality: another request to the same URL text is not a SIG request.
+    The request's *current* `url` is compared, so a hook that replaces it is still covered.
+    """
+    if not isinstance(arg, httpx.URL):
+        return False
+    return any(request.url is arg for request in list(_SIG_REQUESTS_IN_FLIGHT.values()))
 
 
 def _redacted_url(url: httpx.URL) -> httpx.URL:
@@ -352,22 +366,28 @@ def _redacted_url(url: httpx.URL) -> httpx.URL:
 class _RequestLogRedaction(logging.Filter):
     """Redacts response-derived query values in httpx's request log lines.
 
-    Attached once to the "httpx" logger. It acts only on records emitted while
-    `_SIG_REQUEST_IN_FLIGHT` is set, which `_send` does for its own request in its own
-    task, so any other httpx client's lines (concurrent ones included) are untouched. It
-    never drops a record. If redaction itself fails, the URL is withheld from that line.
+    Attached once to the "httpx" logger. It rewrites only a record whose URL argument is
+    the URL of a SIG request being sent (`_is_sig_request_url`); every other record,
+    including those of other clients' requests made while a SIG request is in flight, is
+    passed on unchanged. It never drops a record. If redacting a SIG URL fails, every URL
+    in that record is withheld instead (fail closed).
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if _SIG_REQUEST_IN_FLIGHT.get() and isinstance(record.args, tuple):
-            try:
-                record.args = tuple(
-                    _redacted_url(arg) if isinstance(arg, httpx.URL) else arg for arg in record.args
-                )
-            except Exception:  # noqa: BLE001 - logging must never break the request
-                record.args = tuple(
-                    "<url withheld>" if isinstance(arg, httpx.URL) else arg for arg in record.args
-                )
+        args = record.args
+        if not isinstance(args, tuple):
+            return True
+        owned = [_is_sig_request_url(arg) for arg in args]
+        if not any(owned):
+            return True
+        try:
+            record.args = tuple(
+                _redacted_url(arg) if mine else arg for arg, mine in zip(args, owned, strict=True)
+            )
+        except Exception:  # noqa: BLE001 - logging must never break the request
+            record.args = tuple(
+                "<url withheld>" if isinstance(arg, httpx.URL) else arg for arg in args
+            )
         return True
 
 
@@ -1520,11 +1540,12 @@ class SigRestClient:
             },
             timeout=self._config.timeout,
         )
-        marker = _SIG_REQUEST_IN_FLIGHT.set(True)  # scopes _RequestLogRedaction
+        key = id(request)
+        _SIG_REQUESTS_IN_FLIGHT[key] = request  # owned by _RequestLogRedaction until sent
         try:
             return await self._http.send(request, follow_redirects=False)
         finally:
-            _SIG_REQUEST_IN_FLIGHT.reset(marker)
+            _SIG_REQUESTS_IN_FLIGHT.pop(key, None)
 
     @staticmethod
     def _api_error(
