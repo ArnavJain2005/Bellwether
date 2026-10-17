@@ -20,6 +20,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Self
@@ -241,7 +242,12 @@ def classify_race(venue: str, market: dict[str, Any], event_title: str | None = 
         return "governor"
     if series.startswith("SENATE") or "senate" in text:
         return "senate"
-    if series.startswith("HOUSE") or "house" in text or re.search(r"\b[a-z]{2}-\d{2}\b", title) or re.search(r"\b[a-z]{2}-\d{2}\b", subtitle):
+    if (
+        series.startswith(("HOUSE", "KXHOUSERACE"))
+        or "house" in text
+        or re.search(r"\b[a-z]{2}-\d{2}\b", title)
+        or re.search(r"\b[a-z]{2}-\d{2}\b", subtitle)
+    ):
         return "house"
 
     saved_type = market.get("race_type")
@@ -331,6 +337,7 @@ _KALSHI_STATE_CONTEST_RES = (
     ("governor", re.compile(r"^(?:KX)?(?P<st>[A-Z]{2})GOV(?:PARTY)?(?:[-_](?P<yr>20[23]\d|[23]\d))?(?:[-_].*)?$")),
     ("house", re.compile(r"^(?:KX)?HOUSE(?:PARTY)?[-_]?(?P<st>[A-Z]{2})[-_]?(?:\d+|AL)(?:[-_](?P<yr>20[23]\d|[23]\d))?(?:[-_].*)?$")),
     ("house", re.compile(r"^(?:KX)?(?P<st>[A-Z]{2})HOUSE(?:PARTY)?[-_]?(?:\d+|AL)?(?:[-_](?P<yr>20[23]\d|[23]\d))?(?:[-_].*)?$")),
+    ("house", re.compile(r"^(?:KX)?HOUSERACE[-_]?(?P<st>[A-Z]{2})(?:\d{2}|AL)(?:[-_](?P<yr>20[23]\d|[23]\d))?(?:[-_].*)?$")),
 )
 _KALSHI_SUFFIX_STATE_SERIES_RE = re.compile(
     r"^(?:KX)?(?:SENATEWITHIN\d*|CLOSEST(?:SENATE|GOVERNOR))$"
@@ -456,6 +463,533 @@ def _evaluate_election_contest(
     return False, "lacks_us_jurisdiction"
 
 
+# =====================================================================
+# Bounded House Party-Winner Admission (S1-T5-F6)
+# =====================================================================
+#
+# Two narrow paths admit 2026 House party-winner contracts:
+#   * Polymarket records whose identity omits the year, through the complete supported
+#     opening resolution clause (`_evaluate_polymarket_house_resolution_clause`);
+#   * Kalshi generic KXHOUSERACE-<ST><DD>-26-<D|R> records, through the complete supported
+#     decisive rules sentence (`_corroborate_kxhouserace_contract`).
+# Each decisive proposition must be consumed completely by one of the shapes below. Unknown,
+# ambiguous or partially consumed shapes are excluded; nothing falls back to keyword presence.
+# The supported grammar is listed in the README ("House admission grammar").
+
+
+@dataclass(frozen=True)
+class HouseResolutionEvidence:
+    """Fields extracted from one completely parsed decisive House resolution proposition."""
+
+    venue: str
+    shape: str  # grammar shape that consumed the proposition
+    subject: str  # who decides the market
+    office: str  # always "us_house" on these paths
+    state: str  # two-letter postal code
+    district: str  # normalised number ("2") or "AL"
+    party: str | None  # "D"/"R" when named; None for party-of-the-winner clauses
+    polarity: str  # always "affirmative" once parsed
+    payout: str  # "yes" (Kalshi) or "party_of_winner" (Polymarket)
+    election_year: int | None
+    term_year: int | None
+
+
+_PARTY_CODES = {"democratic": "D", "republican": "R"}
+_STATE_BY_NAME = {name: abbr for abbr, name in STATE_ABBRS.items()}
+# Longest names first, so "west virginia" is consumed before "virginia" can match.
+_STATE_NAME_ALT = "|".join(re.escape(n) for n in sorted(_STATE_BY_NAME, key=len, reverse=True))
+
+# Supported complete district references (see `_parse_house_district`).
+_DISTRICT_CODE_RE = re.compile(r"(?P<st>[A-Z]{2})-(?P<d>\d{1,2}|AL)")
+_DISTRICT_ORDINAL_RE = re.compile(
+    rf"(?P<name>{_STATE_NAME_ALT})'s (?P<n>\d{{1,2}})(?P<suffix>st|nd|rd|th) congressional district",
+    re.IGNORECASE,
+)
+_DISTRICT_AT_LARGE_RE = re.compile(rf"(?P<name>{_STATE_NAME_ALT})'s at-large congressional district", re.IGNORECASE)
+# Scanner over the same forms, used only for corroboration and rejection reasons.
+_DISTRICT_REFERENCE_RE = re.compile(
+    r"\b(?:(?P<st>[A-Z]{2})-(?P<d>\d{1,2}|AL)\b"
+    rf"|(?i:(?P<name>{_STATE_NAME_ALT}))'s (?:(?P<n>\d{{1,2}})(?:st|nd|rd|th)|(?P<al>at-large))"
+    r" congressional district\b)"
+)
+# Slugs are scanned for numeric districts only: "-al" also follows ordinary two-letter words.
+_SLUG_DISTRICT_RE = re.compile(r"\b(?P<st>[a-z]{2})-(?P<d>\d{1,2})\b")
+
+_ZERO_WIDTH_RE = re.compile("[\u200b\u200c\u200d\u2060\ufeff]")
+_SENTENCE_SPLIT_RE = re.compile(r"(?<!\bU\.S\.)(?<!\bU\.S\.A\.)(?<=[.!?])\s+")
+
+_SUB_DISTRICT_RE = re.compile(
+    r"\b(?:county|counties|precincts?|parish(?:es)?|city|cities|towns?|municipal\w*|wards?)\b", re.IGNORECASE
+)
+_PRIMARY_CONTEST_RE = re.compile(r"\b(?:primary|primaries|nominee)\b", re.IGNORECASE)
+
+# Background acceptance is explicit. Every sentence after a decisive proposition must be one of
+# the supported shapes below, compared after `_normalise_clause_text`; any other sentence is
+# rejected as `unsupported_background_sentence`. There is no keyword screen: a sentence that
+# could change the resolution is excluded because it is unknown, not because of its words.
+
+# Recorded boilerplate (October 11-12 cache): every cached contract on each path carries exactly
+# these sentences.
+_POLYMARKET_HOUSE_BACKGROUND = frozenset({
+    "The midterm elections will take place on November 3, 2026.",
+    (
+        "A candidate's party will be determined by their ballot-listed or otherwise identifiable affiliation"
+        " with that party at the time all of the 2026 House elections are conclusively called by this"
+        " market's resolution sources."
+    ),
+    (
+        "A candidate without a ballot-listed affiliation to either the Democrat or Republican parties will"
+        " be considered a member of one of these parties based on the party with which they most recently"
+        " expressed their intent to caucus at the time all of the House elections are conclusively called"
+        " by this market's resolution sources."
+    ),
+    (
+        "This market will resolve based on the result of the election as indicated by a consensus of"
+        " credible reporting."
+    ),
+    (
+        "If there is ambiguity, this market will resolve based solely on the official results as reported"
+        " by the United States government, specifically the Federal Election Commission"
+        " (https://www.fec.gov/)."
+    ),
+})
+_KALSHI_HOUSE_BACKGROUND = frozenset({
+    (
+        "This market is eligible for accelerated determination after a consensus of media organizations"
+        " project the winner."
+    ),
+    "See full rules for details.",
+})
+# Additional reviewed shapes, each matched against a complete sentence and documented in the
+# README. Kalshi party mention (SYNTHETIC control, not observed upstream): reviewed as neutral
+# because it names no outcome, payout, condition, district or year, and the resolving party is
+# fixed by the parsed decisive sentence, which is checked first.
+_KALSHI_REVIEWED_BACKGROUND_SHAPES = (
+    re.compile(r"The (?:Democratic|Republican) Party also nominated a candidate in this race\."),
+)
+_POLYMARKET_REVIEWED_BACKGROUND_SHAPES: tuple[re.Pattern[str], ...] = ()
+
+_HouseParse = tuple[HouseResolutionEvidence | None, str | None, list[str]]
+
+
+def _ordinal_word(n: int) -> str:
+    """Return the numeric ordinal of n (e.g. 1 -> '1st', 12 -> '12th')."""
+    if 11 <= (n % 100) <= 13:
+        return f"{n}th"
+    return f"{n}" + {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+
+
+def _normalise_district(state: str, district: str) -> tuple[str, str] | None:
+    """Return (state code, district) with leading zeros dropped, or None if invalid."""
+    st = state.upper()
+    if st not in STATE_ABBRS:
+        return None
+    if district.upper() == "AL":
+        return st, "AL"
+    number = int(district)
+    return (st, str(number)) if number >= 1 else None
+
+
+def _parse_house_district(text: str) -> tuple[str, str] | None:
+    """Parse one complete district reference, or return None.
+
+    Supported: "AL-02" / "AL-2" / "DE-AL" (upper-case code), "<State>'s <Nth> congressional
+    district" with a correct numeric ordinal suffix, and "<State>'s at-large congressional
+    district". Word ordinals, "district 2" and "the second district of <State>" are not
+    supported.
+    """
+    t = _normalise_clause_text(text)
+    if m := _DISTRICT_CODE_RE.fullmatch(t):
+        return _normalise_district(m["st"], m["d"])
+    if m := _DISTRICT_ORDINAL_RE.fullmatch(t):
+        number = int(m["n"])
+        if number < 1 or _ordinal_word(number) != f"{number}{m['suffix'].lower()}":
+            return None
+        return _STATE_BY_NAME[m["name"].lower()], str(number)
+    if m := _DISTRICT_AT_LARGE_RE.fullmatch(t):
+        return _STATE_BY_NAME[m["name"].lower()], "AL"
+    return None
+
+
+def _scan_district_references(text: str) -> list[tuple[str, str]]:
+    """Every supported district reference in ``text``, longest state names first."""
+    found: list[tuple[str, str]] = []
+    for m in _DISTRICT_REFERENCE_RE.finditer(_normalise_clause_text(text)):
+        if m["st"]:
+            ref = _normalise_district(m["st"], m["d"])
+        else:
+            st = _STATE_BY_NAME[m["name"].lower()]
+            ref = (st, "AL") if m["al"] else _normalise_district(st, m["n"])
+        if ref:
+            found.append(ref)
+    return found
+
+
+def _scan_slug_districts(slug: str) -> list[tuple[str, str]]:
+    found: list[tuple[str, str]] = []
+    for m in _SLUG_DISTRICT_RE.finditer(slug or ""):
+        ref = _normalise_district(m["st"], m["d"])
+        if ref:
+            found.append(ref)
+    return found
+
+
+def _normalise_clause_text(text: str | None) -> str:
+    """Drop zero-width characters, use straight apostrophes and collapse whitespace."""
+    t = _ZERO_WIDTH_RE.sub("", text or "").replace("\u2019", "'")
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _split_sentences(text: str) -> list[str]:
+    return [s for s in _SENTENCE_SPLIT_RE.split(_normalise_clause_text(text)) if s]
+
+
+def _district_slot_failure(text: str) -> str:
+    """Reason for a district slot that is not one complete supported reference."""
+    return "mismatched_district" if len(set(_scan_district_references(text))) >= 2 else "unsupported_district_reference"
+
+
+def _unconsumed_reason(rest: str) -> str:
+    """Reason for text left over after a supported proposition was matched."""
+    if re.match(r"\s*,?\s*(?:or|and)\b", rest, re.IGNORECASE):
+        return "contradictory_party_winner_rules"
+    if {int(y) for y in _YEAR_RE.findall(rest)} - {CONTEST_YEAR}:
+        return "non_2026_primary_contest"
+    return "unconsumed_resolution_condition"
+
+
+def _check_background(
+    sentences: list[str], recorded: frozenset[str], reviewed: tuple[re.Pattern[str], ...]
+) -> str | None:
+    """Reject any sentence outside the decisive proposition that is not a supported shape."""
+    for sentence in sentences:
+        if sentence not in recorded and not any(shape.fullmatch(sentence) for shape in reviewed):
+            return "unsupported_background_sentence"
+    return None
+
+
+# ---------------------------------------------------------------------
+# Kalshi KXHOUSERACE
+# ---------------------------------------------------------------------
+
+# Decisive sentence frame: "If <condition>, then the market resolves to <Yes|No>."
+_KALSHI_DECISIVE_RE = re.compile(r"If (?P<cond>.+), then the market resolves to (?P<payout>yes|no)\.", re.IGNORECASE)
+# K1 (recorded): "the House member sworn in for <district> for the term beginning in <year>
+# is a member of the <party> Party"
+_KALSHI_SWORN_MEMBER_RE = re.compile(
+    r"the House member sworn in for (?P<district>.+?) for the term beginning in (?P<term>\d{4})"
+    r"(?P<term_rest>.*?) is (?P<predicate>.+)",
+    re.IGNORECASE,
+)
+_KALSHI_PARTY_MEMBER_RE = re.compile(r"a member of the (?P<party>[A-Za-z]+) party(?P<rest>.*)", re.IGNORECASE)
+_KALSHI_NEGATED_PREDICATE_RE = re.compile(r"(?:not|never|no longer)\b", re.IGNORECASE)
+# K2 (synthetic control): "the <party> Party wins the <district> House <race|seat> in the
+# <year> election"
+_KALSHI_PARTY_WINS_RE = re.compile(
+    r"the (?P<party>[A-Za-z]+) party wins the (?P<district>.+?) House (?:race|seat) in the (?P<year>\d{4})"
+    r" election(?P<rest>.*)",
+    re.IGNORECASE,
+)
+_KALSHI_KNOWN_SUBJECT_RE = re.compile(r"the (?:House member sworn in for|[A-Za-z]+ party wins)\b", re.IGNORECASE)
+
+_KXHOUSERACE_EVENT_RE = re.compile(
+    r"^KXHOUSERACE-(?P<st>[A-Z]{2})(?P<dist>\d{2}|AL)(?:-(?P<yr>20[23]\d|[23]\d))?$"
+)
+_KXHOUSERACE_VALID_PARTIES = frozenset({"D", "R", "DEM", "REP"})
+# Recorded market title: "Will <Democratic|Republican> win the House race for <ST>-<DD>?"
+_KXHOUSERACE_TITLE_RE = re.compile(
+    r"Will (?:the )?(?P<party>Democratic|Republican)(?: Party)? win the House race for (?P<district>[A-Z]{2}-\S+)\?"
+)
+_KXHOUSERACE_TITLE_SCREEN_RE = re.compile(
+    r"\b(?:turnout|popular\s+vote|vote\s+share|margin|percentage|candidate)\b", re.IGNORECASE
+)
+
+
+def _parse_kalshi_house_rules(rules_primary: str) -> _HouseParse:
+    """Parse a KXHOUSERACE ``rules_primary``: (evidence, rejection reason, background sentences)."""
+    sentences = _split_sentences(rules_primary)
+    frame = _KALSHI_DECISIVE_RE.fullmatch(sentences[0]) if sentences else None
+    if frame is None:
+        return None, "insufficient_resolution_evidence", []
+    if frame["payout"].lower() != "yes":
+        return None, "contradictory_party_winner_rules", []
+    cond = frame["cond"].strip()
+
+    if m := _KALSHI_SWORN_MEMBER_RE.fullmatch(cond):
+        district = _parse_house_district(m["district"])
+        if district is None:
+            return None, _district_slot_failure(m["district"]), []
+        term_year = int(m["term"])
+        if term_year != CONTEST_YEAR + 1:
+            return None, "non_2026_primary_contest", []
+        if m["term_rest"]:
+            return None, _unconsumed_reason(m["term_rest"]), []
+        predicate = m["predicate"].strip()
+        if _KALSHI_NEGATED_PREDICATE_RE.match(predicate):
+            return None, "contradictory_party_winner_rules", []
+        member = _KALSHI_PARTY_MEMBER_RE.fullmatch(predicate)
+        if member is None:
+            return None, "not_party_winner_proposition", []  # e.g. a named person
+        party = _PARTY_CODES.get(member["party"].lower())
+        if party is None:
+            return None, "contradictory_party_winner_rules", []
+        if member["rest"]:
+            return None, _unconsumed_reason(member["rest"]), []
+        evidence = HouseResolutionEvidence(
+            venue="kalshi", shape="kalshi_sworn_member_party", subject="house_member_sworn_in",
+            office="us_house", state=district[0], district=district[1], party=party,
+            polarity="affirmative", payout="yes", election_year=None, term_year=term_year,
+        )
+    elif m := _KALSHI_PARTY_WINS_RE.fullmatch(cond):
+        party = _PARTY_CODES.get(m["party"].lower())
+        if party is None:
+            return None, "contradictory_party_winner_rules", []
+        district = _parse_house_district(m["district"])
+        if district is None:
+            return None, _district_slot_failure(m["district"]), []
+        election_year = int(m["year"])
+        if election_year != CONTEST_YEAR:
+            return None, "non_2026_primary_contest", []
+        if m["rest"]:
+            return None, _unconsumed_reason(m["rest"]), []
+        evidence = HouseResolutionEvidence(
+            venue="kalshi", shape="kalshi_party_wins_race", subject="district_house_race_winner",
+            office="us_house", state=district[0], district=district[1], party=party,
+            polarity="affirmative", payout="yes", election_year=election_year, term_year=None,
+        )
+    elif re.match(r"the House member sworn in for the term\b", cond, re.IGNORECASE):
+        return None, "missing_resolution_district", []
+    elif _KALSHI_KNOWN_SUBJECT_RE.match(cond):
+        return None, "unsupported_resolution_clause", []
+    else:
+        return None, "unsupported_resolution_subject", []  # e.g. a mayor or a named person
+    return evidence, None, sentences[1:]
+
+
+def _corroborate_kxhouserace_contract(
+    m: dict[str, Any], ev: dict[str, Any]
+) -> tuple[bool, str | None, set[int]]:
+    """Corroborate a Kalshi KXHOUSERACE market against its parent event and decisive rules."""
+    m_ticker = (m.get("ticker") or "").upper()
+    event_ticker = (ev.get("event_ticker") or ev.get("ticker") or "").upper()
+    m_event_ticker = (m.get("event_ticker") or "").upper()
+    m_series_ticker = (m.get("series_ticker") or "").upper()
+    ev_series_ticker = (ev.get("series_ticker") or "").upper()
+
+    # Explicit relationships: the parent must supply series KXHOUSERACE, an explicit market
+    # series must agree, and market.event_ticker must name the parent. Ticker resemblance
+    # alone never establishes a relationship.
+    if ev_series_ticker != "KXHOUSERACE":
+        return False, "mismatched_market_event_relationship", set()
+    if m_series_ticker and m_series_ticker != "KXHOUSERACE":
+        return False, "mismatched_market_event_relationship", set()
+    if not m_event_ticker or m_event_ticker != event_ticker:
+        return False, "mismatched_market_event_relationship", set()
+
+    ev_match = _KXHOUSERACE_EVENT_RE.match(event_ticker)
+    if not ev_match:
+        return False, "lacks_election_evidence", set()
+    ticker_district = _normalise_district(ev_match["st"], ev_match["dist"])
+    if ticker_district is None:
+        return False, "lacks_us_jurisdiction", set()
+    yr_str = ev_match["yr"]
+    if not yr_str:
+        return False, "lacks_2026_contest_year", set()
+    if (int(yr_str) if len(yr_str) == 4 else 2000 + int(yr_str)) != CONTEST_YEAR:
+        return False, "non_2026_primary_contest", set()
+
+    expected_prefix = f"{event_ticker}-"
+    if not m_ticker.startswith(expected_prefix):
+        return False, "mismatched_market_event_relationship", set()
+    m_suffix = m_ticker[len(expected_prefix):]
+    if m_suffix not in _KXHOUSERACE_VALID_PARTIES:
+        return False, "arbitrary_ticker_suffix", set()
+    party_code = "D" if m_suffix in ("D", "DEM") else "R"
+
+    m_title = (m.get("title") or "").strip()
+    ev_title = (ev.get("title") or "").strip()
+    ev_subtitle = (ev.get("sub_title") or "").strip()
+    rules_primary = m.get("rules_primary") or ""
+    rules_secondary = m.get("rules_secondary") or ""
+
+    if _PRIMARY_CONTEST_RE.search(f"{m_title} {rules_primary} {ev_title} {ev_subtitle}"):
+        return False, "non_2026_primary_contest", set()
+
+    # Market title: a recorded-shape party-winner question that agrees with the ticker.
+    if _KXHOUSERACE_TITLE_SCREEN_RE.search(m_title):
+        return False, "not_party_winner_proposition", set()
+    title = _KXHOUSERACE_TITLE_RE.fullmatch(m_title)
+    if title is None:
+        return False, "not_party_winner_proposition", set()
+    if _PARTY_CODES[title["party"].lower()] != party_code:
+        return False, "contradictory_party_winner_rules", set()
+    if _parse_house_district(title["district"]) != ticker_district:
+        return False, "mismatched_district", set()
+
+    # Decisive rules: complete supported sentence naming the same party and district.
+    evidence, reason, background = _parse_kalshi_house_rules(rules_primary)
+    if evidence is None:
+        return False, reason, set()
+    if evidence.party != party_code:
+        return False, "contradictory_party_winner_rules", set()
+    if (evidence.state, evidence.district) != ticker_district:
+        return False, "mismatched_district", set()
+
+    background_reason = _check_background(
+        background + _split_sentences(rules_secondary),
+        _KALSHI_HOUSE_BACKGROUND,
+        _KALSHI_REVIEWED_BACKGROUND_SHAPES,
+    )
+    if background_reason:
+        return False, background_reason, set()
+
+    # Parent context corroborates; it never supplies the district.
+    if any(ref != ticker_district for ref in _scan_district_references(f"{ev_title} {ev_subtitle}")):
+        return False, "mismatched_district", set()
+
+    return True, None, {CONTEST_YEAR}
+
+
+# ---------------------------------------------------------------------
+# Polymarket
+# ---------------------------------------------------------------------
+
+# Recorded question: "Will the <Democratic|Republican> Party win the <ST>-<DD> House seat?"
+_POLYMARKET_HOUSE_QUESTION_RE = re.compile(
+    r"Will the (?P<party>Democratic|Republican) Party win the (?P<district>[A-Z]{2}-\S+) House seat\?"
+)
+_POLYMARKET_HOUSE_SLUG_RE = re.compile(
+    r"will-the-(?P<party>democratic|republican)-party-win-the-(?P<st>[a-z]{2})-(?P<d>\d{1,2}|al)-house-seat"
+    r"(?:-\d+)?"
+)
+# Opening clause frame: "This market will [not] resolve [to Yes|No] according to <basis>."
+_POLYMARKET_RESOLUTION_FRAME_RE = re.compile(
+    r"This market will (?P<negation>not )?resolve (?:to (?P<payout>yes|no) )?according to (?P<basis>.+)\.",
+    re.IGNORECASE,
+)
+_POLYMARKET_CANDIDATE_FRAME_RE = re.compile(r"This market will resolve to (?:yes|no) if\b", re.IGNORECASE)
+# Recorded basis: "the party of the candidate who wins <seat> in the U.S. House of
+# Representatives in the 2026 midterm elections[, <supported aggregation>]"
+_POLYMARKET_PARTY_OF_WINNER_RE = re.compile(
+    r"the party of the candidate who wins (?P<seat>.+?) in the (?P<office>.+?) in the (?P<year>\d{4})"
+    r" (?P<kind>[a-z]+) elections?(?P<tail>.*)",
+    re.IGNORECASE,
+)
+_POLYMARKET_SEAT_CODE_RE = re.compile(r"the (?P<district>\S+) congressional district seat")
+_POLYMARKET_SEAT_NAMED_RE = re.compile(r"(?P<district>.+ congressional district) seat")
+_POLYMARKET_DISTRICT_AGGREGATION = ", using certified totals from every county in the district"
+
+
+def _parse_polymarket_house_clause(description: str) -> _HouseParse:
+    """Parse a House party-winner description: (evidence, rejection reason, background sentences)."""
+    sentences = _split_sentences(description)
+    if not sentences or not re.search(r"\bresolv", sentences[0], re.IGNORECASE):
+        return None, "lacks_2026_contest_year", []
+    opening = sentences[0]
+
+    frame = _POLYMARKET_RESOLUTION_FRAME_RE.fullmatch(opening)
+    if frame is None:
+        if _POLYMARKET_CANDIDATE_FRAME_RE.match(opening):
+            return None, "not_party_winner_proposition", []  # a named subject overrides the party
+        return None, "unsupported_resolution_clause", []
+    if frame["negation"] or frame["payout"]:
+        return None, "contradictory_party_winner_rules", []
+
+    basis = _POLYMARKET_PARTY_OF_WINNER_RE.fullmatch(frame["basis"])
+    if basis is None:
+        return None, "unsupported_resolution_clause", []
+    office = basis["office"]
+    if office.lower() != "u.s. house of representatives":
+        if _FOREIGN_RE.search(_normalize_contest_text(office)):
+            return None, "lacks_us_jurisdiction", []
+        return None, "unsupported_resolution_clause", []
+    kind = basis["kind"].lower()
+    election_year = int(basis["year"])
+    if kind == "primary" or election_year != CONTEST_YEAR:
+        return None, "non_2026_primary_contest", []
+    if kind != "midterm":
+        return None, "unsupported_resolution_clause", []
+
+    seat = basis["seat"]
+    seat_match = _POLYMARKET_SEAT_CODE_RE.fullmatch(seat) or _POLYMARKET_SEAT_NAMED_RE.fullmatch(seat)
+    district = _parse_house_district(seat_match["district"]) if seat_match else None
+    if district is None:
+        if len(set(_scan_district_references(seat))) >= 2:
+            return None, "mismatched_district", []
+        return None, "unsupported_resolution_clause", []
+
+    tail = basis["tail"]
+    if tail and tail != _POLYMARKET_DISTRICT_AGGREGATION:
+        if _SUB_DISTRICT_RE.search(tail):
+            return None, "sub_district_resolution_scope", []
+        return None, _unconsumed_reason(tail), []
+
+    evidence = HouseResolutionEvidence(
+        venue="polymarket", shape="polymarket_party_of_winner", subject="candidate_who_wins_district_seat",
+        office="us_house", state=district[0], district=district[1], party=None,
+        polarity="affirmative", payout="party_of_winner", election_year=election_year, term_year=None,
+    )
+    return evidence, None, sentences[1:]
+
+
+def _evaluate_polymarket_house_resolution_clause(
+    question: str,
+    slug: str,
+    description: str,
+    parent_event: dict[str, Any] | None = None,
+) -> tuple[bool, str] | None:
+    """Admit a 2026 House party-winner market through its own opening resolution clause.
+
+    Used only when primary identity lacks the year 2026 and has no conflicting year. Returns
+    None when the question is not a House question, so the baseline reason stands.
+    """
+    ev = parent_event or {}
+    ev_title = ev.get("title") or ""
+    ev_slug = ev.get("slug") or ""
+    if _PRIMARY_CONTEST_RE.search(f"{ev_title} {ev_slug.replace('-', ' ')}"):
+        return False, "non_2026_primary_contest"
+
+    q = _normalise_clause_text(question)
+    prop = _POLYMARKET_HOUSE_QUESTION_RE.fullmatch(q)
+    if prop is None:
+        if not re.search(r"\bHouse\b", q):
+            return None
+        if len(set(_scan_district_references(q))) >= 2:
+            return False, "mismatched_district"
+        return False, "not_party_winner_proposition"
+    district = _parse_house_district(prop["district"])
+    if district is None:
+        return False, "unsupported_market_identity"
+    party = _PARTY_CODES[prop["party"].lower()]
+
+    if slug:
+        slug_match = _POLYMARKET_HOUSE_SLUG_RE.fullmatch(slug)
+        if slug_match is None:
+            if any(ref != district for ref in _scan_slug_districts(slug)):
+                return False, "mismatched_district"
+            return False, "unsupported_market_identity"
+        if _PARTY_CODES[slug_match["party"]] != party:
+            return False, "contradictory_party_winner_rules"
+        if _normalise_district(slug_match["st"], slug_match["d"]) != district:
+            return False, "mismatched_district"
+
+    parent_refs = _scan_district_references(ev_title) + _scan_slug_districts(ev_slug)
+    if any(ref != district for ref in parent_refs):
+        return False, "mismatched_district"
+
+    evidence, reason, background = _parse_polymarket_house_clause(description)
+    if evidence is None:
+        return False, reason
+    if (evidence.state, evidence.district) != district:
+        return False, "mismatched_district"
+    background_reason = _check_background(
+        background, _POLYMARKET_HOUSE_BACKGROUND, _POLYMARKET_REVIEWED_BACKGROUND_SHAPES
+    )
+    if background_reason:
+        return False, background_reason
+    return True, "verified_2026"
+
+
 def is_2026_polymarket_market(
     item: dict[str, Any],
     parent_event: dict[str, Any] | None = None,
@@ -476,7 +1010,21 @@ def is_2026_polymarket_market(
     q = item.get("question") or ""
     slug = item.get("slug") or item.get("market_slug") or ""
     identity = f"{q} {slug} {ev_title} {ev_slug}".strip()
-    return _evaluate_election_contest(identity, is_tag_102289=is_tag_102289)
+    eligible, reason = _evaluate_election_contest(identity, is_tag_102289=is_tag_102289)
+    if eligible:
+        return True, reason
+
+    # Bounded repair (S1-T5-F6): when identity omits the election year and has no conflicting
+    # year, a House party-winner market may supply the cycle through its own complete opening
+    # resolution clause. A parent event description is never borrowed.
+    if reason == "lacks_2026_contest_year":
+        desc = item.get("description") or item.get("resolution_description") or ""
+        if desc:
+            house = _evaluate_polymarket_house_resolution_clause(q, slug, desc, parent_event=ev)
+            if house is not None:
+                return house
+
+    return False, reason
 
 
 def is_2026_kalshi_market(
@@ -509,8 +1057,16 @@ def is_2026_kalshi_market(
     ):
         return False, "lieutenant_governor_contest"
 
-    structured = _kalshi_structured_contest(m_series, m_ticker)
-    symbol_years = _kalshi_symbol_years(m_ticker, m_series, event_ticker)
+    # Bounded repair (S1-T5-F6): support KXHOUSERACE generic House contract family
+    if m_series == "KXHOUSERACE" or m_ticker.startswith("KXHOUSERACE-") or event_ticker.startswith("KXHOUSERACE-"):
+        corroborated, reason, years = _corroborate_kxhouserace_contract(m, ev)
+        if not corroborated:
+            return False, reason
+        structured = "house"
+        symbol_years = years
+    else:
+        structured = _kalshi_structured_contest(m_series, m_ticker)
+        symbol_years = _kalshi_symbol_years(m_ticker, m_series, event_ticker)
 
     # Candidate/outcome labels never establish jurisdiction or the cycle year.
     # Event subtitles describe the contest and remain part of its identity.
