@@ -17,6 +17,14 @@ They stay alongside the recorded fixtures below. For order items and error envel
 they are still the only evidence, so there the client is checked against the spec's
 shapes, not against SIG's actual behaviour.
 
+The tournament positions read (A2-A) has never been captured, so it is covered by
+synthetic fixtures only: `tournament_positions.json` (a 200 with a YES row, a fractional
+NO row and a zero-quantity row with a null `currentPrice`) and
+`positions_missing_valuation.json` (the documented 409 `MissingTournamentValuation`).
+Their numbers are placeholders chosen for type and nullability. They say nothing about
+the units, denomination or sign conventions SIG uses (OQ-W5), and nothing about the
+account.
+
 ## Fixtures derived from recorded responses: `recorded/<run id>/`
 
 Each directory comes from one genuine, read-only capture made with

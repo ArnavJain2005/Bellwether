@@ -1,12 +1,31 @@
-"""Read-only SIG REST client (S1-T2-B; market detail and trade tape added in S1-T3-B).
+"""Read-only SIG REST client (S1-T2-B; market detail and trade tape added in S1-T3-B;
+raw tournament account reads added in A2-A).
 
-Scope: eight documented GET endpoints, always pinned to the configured tournament. There
+Scope: nine documented GET endpoints, always pinned to the configured tournament. There
 are no write methods (orders, cancels, realtime tokens) and no public way to issue an
 arbitrary request.
 
+Account reads (A2-A; docs/design/account-state-contracts.md, section 8):
+- `read_tournament_balance` always makes a fresh GET /tournaments/{slug} and checks the
+  echoed slug and UUID. It never returns the verification cache as an observation.
+- `read_tournament_positions` reads GET /tournaments/{slug}/portfolio/positions. Its
+  documented 409 for holdings without a valuation price is returned as
+  `UnvaluedHoldingsRead` when the body is a valid `MissingTournamentValuation`; any
+  other 409 raises SigConflictError as before.
+- `read_open_orders` walks GET /orders?status=open and keeps every page's coverage and
+  provenance.
+Each returns a `ReadProvenance` built from that call's own local variables: there is no
+shared "last response" state, so concurrent calls and retries cannot mix observations.
+Provenance is our own local record, never evidence of server freshness, atomicity or
+readiness. No account value is converted into domain units.
+
 Tournament scoping: before any scoped read, the client calls GET /tournaments/{slug}
 once and checks that SIG reports the configured slug and UUID. A mismatch is permanent
-for the client's lifetime. UUID-scoped reads always send `tournamentId`, and the echoed
+for the client's lifetime, and the first mismatch observed is the one kept. Once it is
+latched, no request or retry starts: every read re-checks the latch before rate
+admission, after it, and when a response arrives, so a read that was already waiting
+(on verification, admission or a retry wait) sends nothing more and returns nothing.
+UUID-scoped reads always send `tournamentId`, and the echoed
 context of the market orderbook and the market detail is checked as well. The trade
 tape echoes no tournament, so its scope rests on the `tournamentId` sent.
 
@@ -26,6 +45,13 @@ Transport and credentials:
   log line, exception or repr. An injected client with its own auth or credential
   headers is refused. Errors and logs carry no text taken from a response body (see
   errors.py).
+- httpx itself logs each request URL at INFO on the "httpx" logger. A cursor walk's URL
+  carries the previous page's `nextCursor`, which is response data, so in the line for
+  a request this client sends, that one query value is logged as REDACTED. Ownership is
+  per request object: requests of any other httpx client (including ones made inside an
+  event hook of this client's httpx client, or by tasks created there) are logged
+  unchanged. The rest of the line (method, URL, configuration-derived parameters,
+  status) is kept, and no logger is disabled or reconfigured.
 
 Deadlines and retries (ReadRetryPolicy):
 - One logical read (one public page or object request) has one overall deadline,
@@ -81,6 +107,18 @@ import httpx
 from pydantic import BaseModel, ValidationError
 
 from engine.config import SigConfig, TournamentRef
+from engine.sig_client.account_reads import (
+    CoverageState,
+    MissingValuation,
+    OrdersWalk,
+    PageRecord,
+    PositionsRead,
+    ReadProvenance,
+    ScopeEvidence,
+    TournamentBalanceRead,
+    UnvaluedHoldingsRead,
+    VerificationUse,
+)
 from engine.sig_client.errors import (
     SigApiError,
     SigArgumentError,
@@ -122,12 +160,15 @@ from engine.sig_client.wire import (
     MarketOrderbook,
     MarketOrderbookContext,
     MarketPricingContext,
+    MissingTournamentValuation,
     Order,
     OrderbookLevel,
+    OrderCoverage,
     OrdersPage,
     Tournament,
     TournamentMarket,
     TournamentMarketsPage,
+    TournamentPositions,
     TradeCoverage,
 )
 
@@ -223,6 +264,153 @@ class ExchangeTradeHistory:
     window_to: str
     trades: tuple[ExchangeTrade, ...]
     page_coverage: tuple[TradeCoverage | None, ...]
+
+
+WallClock = Callable[[], datetime]
+
+
+def utc_now() -> datetime:
+    """The local wall clock in UTC (display only; never used for ordering or deadlines)."""
+    return datetime.now(UTC)
+
+
+# Route templates recorded in ReadProvenance.
+TOURNAMENT_ROUTE = "/tournaments/{slug}"
+POSITIONS_ROUTE = "/tournaments/{slug}/portfolio/positions"
+ORDERS_ROUTE = "/orders"
+
+# Query parameters a ReadProvenance may record (design 4.1 R6). A cursor is response
+# data: only the fact that one was sent is recorded, never its value.
+_RECORDED_PARAMS = frozenset({"tournamentId", "status", "limit", "period", "type"})
+
+
+@dataclass(frozen=True)
+class _Exchange:
+    """One completed logical GET, as this call observed it. Private; never logged.
+
+    Built only from the local variables of one `_get_observed` call, so concurrent reads,
+    and the attempts of one read, can never share or overwrite it.
+    """
+
+    path: str
+    params: tuple[tuple[str, str | int], ...]
+    status: int
+    attempts: int
+    started_mono: float
+    finished_mono: float
+    finished_utc: datetime
+    body: object  # the decoded 2xx body; None for an accepted 409
+    conflict: tuple[MissingValuation, ...] | None  # set only for an accepted 409
+
+
+@dataclass(frozen=True)
+class _ObservedOrdersPage:
+    page: OrdersPage
+    exchange: _Exchange
+    verification: VerificationUse
+    verification_read: ReadProvenance | None
+
+
+def _recorded_params(
+    params: tuple[tuple[str, str | int], ...],
+) -> tuple[tuple[tuple[str, str], ...], bool]:
+    """The allowlisted parameters as sent (sorted), and whether a cursor was sent."""
+    recorded: list[tuple[str, str]] = []
+    cursor_sent = False
+    for name, value in params:
+        if name == "cursor":
+            cursor_sent = True
+        elif name in _RECORDED_PARAMS:
+            recorded.append((name, str(value)))
+        else:
+            # A programming error: every parameter of an account read is accounted for.
+            raise ValueError(f"query parameter {name} is not on the provenance allowlist")
+    return tuple(sorted(recorded)), cursor_sent
+
+
+# Query parameters whose values come from a response (design 4.1 R8: never logged).
+_RESPONSE_DERIVED_QUERY_PARAMS = frozenset({"cursor"})
+_REDACTED = "REDACTED"
+# Every SIG request currently inside httpx's `send`, keyed by id() and holding the request
+# object itself, so an id can never match once its request is gone. `_send` adds its own
+# request before sending and removes it in `finally` (success, failure or cancellation).
+# Ownership is per request object, not per task, context or time window: requests made by
+# other clients (in event hooks, in tasks spawned there, or concurrently) are never in it.
+_SIG_REQUESTS_IN_FLIGHT: dict[int, httpx.Request] = {}
+
+
+def _is_sig_request_url(arg: object) -> bool:
+    """True if `arg` is the current URL object of a SIG request being sent.
+
+    Identity, not equality: another request to the same URL text is not a SIG request.
+    The request's *current* `url` is compared, so a hook that replaces it is still covered.
+    """
+    if not isinstance(arg, httpx.URL):
+        return False
+    return any(request.url is arg for request in list(_SIG_REQUESTS_IN_FLIGHT.values()))
+
+
+def _redacted_url(url: httpx.URL) -> httpx.URL:
+    """`url` with every response-derived query value replaced; otherwise unchanged."""
+    params = url.params
+    if not any(name in params for name in _RESPONSE_DERIVED_QUERY_PARAMS):
+        return url
+    return url.copy_with(
+        params=[
+            (name, _REDACTED if name in _RESPONSE_DERIVED_QUERY_PARAMS else value)
+            for name, value in params.multi_items()
+        ]
+    )
+
+
+class _RequestLogRedaction(logging.Filter):
+    """Redacts response-derived query values in httpx's request log lines.
+
+    Attached once to the "httpx" logger. It rewrites only a record whose URL argument is
+    the URL of a SIG request being sent (`_is_sig_request_url`); every other record,
+    including those of other clients' requests made while a SIG request is in flight, is
+    passed on unchanged. It never drops a record. If redacting a SIG URL fails, every URL
+    in that record is withheld instead (fail closed).
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if not isinstance(args, tuple):
+            return True
+        owned = [_is_sig_request_url(arg) for arg in args]
+        if not any(owned):
+            return True
+        try:
+            record.args = tuple(
+                _redacted_url(arg) if mine else arg for arg, mine in zip(args, owned, strict=True)
+            )
+        except Exception:  # noqa: BLE001 - logging must never break the request
+            record.args = tuple(
+                "<url withheld>" if isinstance(arg, httpx.URL) else arg for arg in args
+            )
+        return True
+
+
+_REQUEST_LOG_REDACTION = _RequestLogRedaction()
+
+
+def _missing_valuations(content: bytes) -> tuple[MissingValuation, ...] | None:
+    """The (exchange, market) pairs of a documented 409 MissingTournamentValuation, or None.
+
+    None for anything else: another code, a malformed body, an empty list or a non-digit
+    id. The caller then raises SigConflictError exactly as for any other 409. Nothing
+    from the body is logged or put in an error, and titles and settlement labels are not
+    kept.
+    """
+    try:
+        data = json.loads(content, parse_float=Decimal, parse_constant=_reject_constant)
+        body = MissingTournamentValuation.model_validate(data)
+    except (ValueError, ValidationError):  # bad JSON or encoding, or not the schema
+        return None
+    return tuple(
+        MissingValuation(exchange_id=item.exchangeId, market_id=item.marketId)
+        for item in body.error.details.missingValuations
+    )
 
 
 class _Page(Protocol):
@@ -399,6 +587,7 @@ class SigRestClient:
         clock: Clock = time.monotonic,
         sleep: Sleep = asyncio.sleep,
         jitter: Jitter = equal_jitter,
+        wall_clock: WallClock = utc_now,
     ) -> None:
         if http.auth is not None:
             raise ValueError("the injected httpx client must not carry its own auth")
@@ -410,6 +599,7 @@ class SigRestClient:
         self._clock = clock
         self._sleep = sleep
         self._jitter = jitter
+        self._wall_clock = wall_clock
         # A shared limiter must use the same clock as this client (deadlines compare).
         self._limiter = limiter if limiter is not None else RateLimiter(clock=clock, sleep=sleep)
         self._retry = retry if retry is not None else ReadRetryPolicy()
@@ -417,6 +607,8 @@ class SigRestClient:
         self._verified: Tournament | None = None
         self._mismatch: SigContextMismatchError | None = None
         self._verify_lock = asyncio.Lock()
+        # Idempotent: Logger.addFilter ignores a filter that is already attached.
+        logging.getLogger("httpx").addFilter(_REQUEST_LOG_REDACTION)
 
     @classmethod
     def create(
@@ -473,22 +665,63 @@ class SigRestClient:
 
     async def get_tournament(self) -> Tournament:
         """GET /tournaments/{slug}, checking the echoed slug and UUID [client policy]."""
+        return (await self._read_tournament()).tournament
+
+    async def read_tournament_balance(self) -> TournamentBalanceRead:
+        """A fresh GET /tournaments/{slug} with its provenance (A2-A).
+
+        Always sends a request: it never returns the Tournament cached by
+        `verify_tournament`, which may be hours old. The echoed slug and UUID are checked
+        on every call, and a mismatch latches for the client's life as for any tournament
+        read. A mismatch latched by a concurrent read while this one was in flight also
+        fails this call. `myBalance` is kept exactly as sent; it is a candidate, not
+        established tournament cash (see account_reads.NUMERIC_FIELD_STATUS).
+        """
+        return await self._read_tournament()
+
+    async def _read_tournament(self) -> TournamentBalanceRead:
         if self._mismatch is not None:
             raise self._mismatch
         path = f"/tournaments/{_segment(self._config.tournament.slug)}"
-        tournament = await self._get_model(path, None, Tournament)
+        exchange = await self._get_observed(path, None)
+        tournament = self._validate(path, exchange.body, Tournament)
         self._check_tournament(path, tournament)
         self._verified = tournament
-        return tournament
+        return TournamentBalanceRead(
+            tournament=tournament,
+            provenance=self._provenance(TOURNAMENT_ROUTE, exchange, ScopeEvidence.ECHO),
+        )
 
     async def verify_tournament(self) -> Tournament:
         """Verify the slug/UUID pair once (its own logical read); later calls reuse it."""
         if self._mismatch is not None:
             raise self._mismatch
         async with self._verify_lock:
+            self._raise_if_latched()  # latched while this call waited for the lock
             if self._verified is None:
                 return await self.get_tournament()
             return self._verified
+
+    async def _verify_observed(self) -> tuple[VerificationUse, ReadProvenance | None]:
+        """`verify_tournament`, reporting whether this call made the verification read.
+
+        PERFORMED (with that read's own provenance) when this call sent it; CACHED when
+        an earlier read had verified the tournament and this call sent nothing.
+        """
+        if self._mismatch is not None:
+            raise self._mismatch
+        async with self._verify_lock:
+            self._raise_if_latched()  # latched while this call waited for the lock
+            if self._verified is None:
+                read = await self._read_tournament()
+                return VerificationUse.PERFORMED, read.provenance
+            return VerificationUse.CACHED, None
+
+    def _raise_if_latched(self) -> None:
+        # [client policy] once a mismatch is latched (by any read) the client no longer
+        # vouches for its tournament: no request or retry starts, nothing is returned.
+        if self._mismatch is not None:
+            raise self._mismatch
 
     def _check_tournament(self, path: str, tournament: Tournament) -> None:
         expected = self._config.tournament
@@ -504,15 +737,49 @@ class SigRestClient:
         if not same_id:
             problems.append("id")
         if problems:
-            self._mismatch = SigContextMismatchError(
-                method="GET",
-                path=path,
-                reason=(
-                    f"SIG reports a different tournament {' and '.join(problems)} than "
-                    f"configured ({expected.slug} / {expected.id})"
-                ),
-            )
+            if self._mismatch is None:  # the first mismatch observed stays latched
+                self._mismatch = SigContextMismatchError(
+                    method="GET",
+                    path=path,
+                    reason=(
+                        f"SIG reports a different tournament {' and '.join(problems)} than "
+                        f"configured ({expected.slug} / {expected.id})"
+                    ),
+                )
             raise self._mismatch
+
+    # --- positions (A2-A) ---------------------------------------------------------------
+
+    async def read_tournament_positions(self) -> PositionsRead | UnvaluedHoldingsRead:
+        """GET /tournaments/{slug}/portfolio/positions in the configured tournament.
+
+        One request, no pagination. The rows carry no tournament id: scope rests on the
+        verified slug in the path. Rows, lots and the summary are kept exactly as sent;
+        nothing is rounded, complemented, bounded or converted, and no cross-row check is
+        applied (that belongs to the account snapshot, A3).
+
+        [documented] 409 means "holdings exist without valuation prices". When the body
+        is a valid MissingTournamentValuation (code CONFLICT, a non-empty list, digit-
+        string ids), the result is UnvaluedHoldingsRead with the (exchange, market)
+        pairs. Any other 409 raises SigConflictError as before. Every other status is
+        handled as for any read (403 raises SigAuthError with its documented code).
+        """
+        verification, verification_read = await self._verify_observed()
+        path = f"/tournaments/{_segment(self._config.tournament.slug)}/portfolio/positions"
+        exchange = await self._get_observed(path, None, conflict=_missing_valuations)
+        provenance = self._provenance(
+            POSITIONS_ROUTE,
+            exchange,
+            ScopeEvidence.VERIFIED_SLUG_PATH,
+            verification=verification,
+            verification_read=verification_read,
+        )
+        if exchange.conflict is not None:
+            return UnvaluedHoldingsRead(missing=exchange.conflict, provenance=provenance)
+        positions = self._validate(path, exchange.body, TournamentPositions)
+        return PositionsRead(
+            rows=tuple(positions.positions), summary=positions.summary, provenance=provenance
+        )
 
     # --- markets ------------------------------------------------------------------------
 
@@ -751,14 +1018,29 @@ class SigRestClient:
         """One page of GET /orders in the configured tournament.
 
         The Order schema carries no tournament id, so the scope cannot be echo-checked.
+        `coverage` is optional but not nullable: an explicit null is rejected.
         """
+        observed = await self._orders_page_observed(
+            status=status, exchange_id=exchange_id, market_id=market_id, limit=limit, cursor=cursor
+        )
+        return observed.page
+
+    async def _orders_page_observed(
+        self,
+        *,
+        status: str,
+        exchange_id: str | None,
+        market_id: str | None,
+        limit: int,
+        cursor: str | None,
+    ) -> _ObservedOrdersPage:
         # Every argument is validated before verification, so bad input sends nothing.
         status = _check_choice("status", status, ORDER_STATUSES)
         limit = _check_int("limit", limit, 1, ORDERS_PAGE_MAX)
         cursor = _check_cursor(cursor)
         exchange_id = _check_optional_id("exchange_id", exchange_id)
         market_id = _check_optional_id("market_id", market_id)
-        await self.verify_tournament()
+        verification, verification_read = await self._verify_observed()
         path = "/orders"
         params: dict[str, str | int] = {
             "status": status,
@@ -771,14 +1053,62 @@ class SigRestClient:
             params["marketId"] = market_id
         if cursor is not None:
             params["cursor"] = cursor
-        page = await self._get_model(path, params, OrdersPage)
+        exchange = await self._get_observed(path, params)
+        page = self._validate(path, exchange.body, OrdersPage)
         self._check_page_size(path, len(page.data), limit)
         # [client policy] an exchange filter must be honoured.
         if exchange_id is not None and any(o.exchangeId != exchange_id for o in page.data):
             raise SigResponseError(
                 method="GET", path=path, reason="orders from another exchange were returned"
             )
-        return page
+        return _ObservedOrdersPage(page, exchange, verification, verification_read)
+
+    async def read_open_orders(
+        self, *, page_limit: int = ORDERS_PAGE_MAX, max_pages: int = DEFAULT_MAX_PAGES
+    ) -> OrdersWalk:
+        """Every open order in the configured tournament, with per-page provenance (A2-A).
+
+        Walks GET /orders with `status=open` and the configured `tournamentId` under the
+        same rules as `list_all_orders`: a repeated cursor, a duplicate order id, a
+        cursor on the last page or the page cap raises SigPaginationError, and no
+        partial walk is ever returned. Each page has its own read deadline; there is no
+        deadline for the whole walk.
+
+        Every page's coverage is kept exactly as sent, or recorded as omitted; an
+        explicit `coverage: null` fails the walk. Pages may report different
+        `projectedThroughSequence` values; none is compared with anything. A complete
+        walk shows that every page was read, not that the reporting projection had
+        caught up with the trading engine.
+        """
+        # Validated before anything is sent.
+        page_limit = _check_int("page_limit", page_limit, 1, ORDERS_PAGE_MAX)
+        max_pages = _check_int("max_pages", max_pages, 1, 10_000)
+        records: list[PageRecord] = []  # this call's pages only
+
+        async def fetch(cursor: str | None) -> OrdersPage:
+            observed = await self._orders_page_observed(
+                status="open", exchange_id=None, market_id=None, limit=page_limit, cursor=cursor
+            )
+            page = observed.page
+            provenance = self._provenance(
+                ORDERS_ROUTE,
+                observed.exchange,
+                ScopeEvidence.TOURNAMENT_ID_SENT,
+                page_index=len(records),
+                coverage_state=(
+                    CoverageState.OMITTED if page.coverage is None else CoverageState.PRESENT
+                ),
+                coverage=page.coverage,
+                verification=observed.verification,
+                verification_read=observed.verification_read,
+            )
+            records.append(PageRecord(provenance=provenance, item_count=len(page.data)))
+            return page
+
+        orders = await self._collect(
+            ORDERS_ROUTE, fetch, max_pages=max_pages, key=lambda order: order.id
+        )
+        return OrdersWalk(orders=tuple(orders), pages=tuple(records))
 
     async def list_all_orders(
         self,
@@ -1013,7 +1343,10 @@ class SigRestClient:
     async def _get_model(
         self, path: str, params: Mapping[str, str | int] | None, model: type[ModelT]
     ) -> ModelT:
-        data = await self._get_json(path, params)
+        return self._validate(path, await self._get_json(path, params), model)
+
+    @staticmethod
+    def _validate(path: str, data: object, model: type[ModelT]) -> ModelT:
         try:
             return model.model_validate(data)
         except ValidationError as exc:
@@ -1021,10 +1354,58 @@ class SigRestClient:
                 method="GET", path=path, reason=_validation_summary(exc)
             ) from None
 
+    @staticmethod
+    def _provenance(
+        route: str,
+        exchange: _Exchange,
+        scope: ScopeEvidence,
+        *,
+        page_index: int | None = None,
+        coverage_state: CoverageState = CoverageState.NOT_APPLICABLE,
+        coverage: OrderCoverage | None = None,
+        verification: VerificationUse = VerificationUse.NOT_APPLICABLE,
+        verification_read: ReadProvenance | None = None,
+    ) -> ReadProvenance:
+        params, cursor_sent = _recorded_params(exchange.params)
+        return ReadProvenance(
+            route=route,
+            path=exchange.path,
+            params=params,
+            cursor_sent=cursor_sent,
+            scope=scope,
+            attempts=exchange.attempts,
+            http_status=exchange.status,
+            started_mono=exchange.started_mono,
+            finished_mono=exchange.finished_mono,
+            finished_utc=exchange.finished_utc,
+            page_index=page_index,
+            coverage_state=coverage_state,
+            coverage=coverage,
+            verification=verification,
+            verification_read=verification_read,
+        )
+
     async def _get_json(self, path: str, params: Mapping[str, str | int] | None) -> object:
         """One logical GET under one overall deadline. Private by design."""
+        return (await self._get_observed(path, params)).body
+
+    async def _get_observed(
+        self,
+        path: str,
+        params: Mapping[str, str | int] | None,
+        *,
+        conflict: Callable[[bytes], tuple[MissingValuation, ...] | None] | None = None,
+    ) -> _Exchange:
+        """One logical GET under one overall deadline, with this call's own observations.
+
+        The attempt count and local times come only from this call's local variables.
+        `conflict`, if given, sees the body of a 409 that arrived within the deadline and
+        returns the validated missing-valuation pairs, or None to raise SigConflictError
+        exactly as for any other 409.
+        """
         method = "GET"
-        deadline = self._clock() + self._retry.total_budget_s
+        started = self._clock()
+        deadline = started + self._retry.total_budget_s
         attempts = 0
         last_error: SigApiError | SigTransportError | None = None
 
@@ -1053,6 +1434,8 @@ class SigRestClient:
         while True:
             if self._closed:
                 raise SigClientClosedError("the SIG client is closed")
+            # A mismatch latched before this attempt (or during a retry wait) stops it.
+            self._raise_if_latched()
             try:
                 # A cancelled admission consumes no token: the limiter admits only in a
                 # synchronous step after its wait, and keeps no queue of waiters.
@@ -1062,6 +1445,7 @@ class SigRestClient:
                 )
             except SigRateBudgetError:
                 raise expired("rate admission") from None
+            self._raise_if_latched()  # latched while this attempt waited for admission
             attempts += 1
             error: SigApiError | SigTransportError
             wait_floor = 0.0
@@ -1075,10 +1459,25 @@ class SigRestClient:
             except httpx.TransportError as exc:
                 raise SigTransportError(method=method, path=path, kind=type(exc).__name__) from None
             else:
-                if self._clock() >= deadline:
+                finished = self._clock()
+                if finished >= deadline:
                     raise expired("request")  # a late response is not returned
-                if 200 <= response.status_code < 300:
-                    return self._decode(method, path, response)
+                self._raise_if_latched()  # latched while the request was in flight
+                missing = None
+                if response.status_code == 409 and conflict is not None:
+                    missing = conflict(response.content)  # None: handled as any 409 below
+                if 200 <= response.status_code < 300 or missing is not None:
+                    return _Exchange(
+                        path=path,
+                        params=tuple((params or {}).items()),
+                        status=response.status_code,
+                        attempts=attempts,
+                        started_mono=started,
+                        finished_mono=finished,
+                        finished_utc=self._wall_clock(),
+                        body=None if missing is not None else self._decode(method, path, response),
+                        conflict=missing,
+                    )
                 retry_after = _parse_retry_after(response.headers.get("Retry-After"))
                 error = self._api_error(method, path, response, retry_after)
                 if not isinstance(error, (SigRateLimitedError, SigServiceUnavailableError)):
@@ -1141,7 +1540,12 @@ class SigRestClient:
             },
             timeout=self._config.timeout,
         )
-        return await self._http.send(request, follow_redirects=False)
+        key = id(request)
+        _SIG_REQUESTS_IN_FLIGHT[key] = request  # owned by _RequestLogRedaction until sent
+        try:
+            return await self._http.send(request, follow_redirects=False)
+        finally:
+            _SIG_REQUESTS_IN_FLIGHT.pop(key, None)
 
     @staticmethod
     def _api_error(

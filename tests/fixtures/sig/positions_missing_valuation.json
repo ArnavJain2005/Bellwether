@@ -1,0 +1,19 @@
+{
+  "provenance": "synthetic, spec-derived: the documented 409 MissingTournamentValuation body; code and message are the spec examples; ids, titles and settlement options are placeholders",
+  "openapi": [
+    "#/paths/~1tournaments~1{slug}~1portfolio~1positions/get/responses/409",
+    "#/components/schemas/MissingTournamentValuation"
+  ],
+  "body": {
+    "error": {
+      "code": "CONFLICT",
+      "message": "Tournament holdings cannot be valued because one or more exchanges have no valuation price.",
+      "details": {
+        "missingValuations": [
+          {"exchangeId": "36", "marketId": "26", "marketTitle": "Placeholder market A", "settlementOption": null},
+          {"exchangeId": "41", "marketId": "29", "marketTitle": "Placeholder market D", "settlementOption": "Placeholder option D"}
+        ]
+      }
+    }
+  }
+}

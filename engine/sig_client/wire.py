@@ -20,10 +20,18 @@ Each model names the OpenAPI JSON pointer it mirrors (docs/api/openapi.json).
 
 from __future__ import annotations
 
+import re
 from decimal import Decimal
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    field_validator,
+)
 from pydantic_core import PydanticCustomError
 
 
@@ -279,7 +287,111 @@ class OrderCoverage(WireModel):
 class OrdersPage(WireModel):
     data: list[Order]
     pagination: OrderPagination
-    coverage: OrderCoverage | None = None  # documented as optional (not in `required`)
+    # Documented as optional (not in `required`) but not nullable: None here means only
+    # that SIG omitted it. An explicit null is rejected; the default is not validated.
+    coverage: OrderCoverage | None = None
+
+    @field_validator("coverage", mode="before")
+    @classmethod
+    def _coverage_not_null(cls, value: object) -> object:
+        if value is None:
+            raise PydanticCustomError("coverage_null", "coverage may be omitted but not null")
+        return value
+
+
+# --- GET /tournaments/{slug}/portfolio/positions ----------------------------------------
+# #/paths/~1tournaments~1{slug}~1portfolio~1positions/get/responses/200/content/application~1json/schema
+# Items: #/components/schemas/TournamentPortfolioPosition
+#
+# No price, cost or value field here documents its denomination, so none is bounded to
+# [0, 1] and none is converted; every number is kept exactly as sent. The units and
+# open questions of each field are in account_reads.NUMERIC_FIELD_STATUS.
+
+
+class PositionLot(WireModel):
+    """One FIFO lot. `side` is a free string in the spec (not an enum) and is kept as sent;
+    `quantity` has no documented sign rule."""
+
+    lotId: str
+    side: str
+    quantity: WireNumber
+    entryPrice: WireNumber
+    openedAt: str
+
+
+class TournamentPosition(WireModel):
+    """One position row. `quantity`: positive = YES shares, negative = NO shares.
+
+    `currentPrice` is documented as null only for zero-quantity rows; a row that breaks
+    that rule is kept as sent (a consistency check belongs to the account snapshot, A3).
+    """
+
+    exchangeId: str
+    marketId: str
+    marketTitle: str
+    option: str | None
+    settled: bool
+    quantity: WireNumber
+    avgCost: WireNumber
+    currentPrice: WireNumber | None
+    marketValue: WireNumber
+    costBasis: WireNumber
+    unrealizedPnl: WireNumber
+    unrealizedPnlPct: WireNumber
+    moneyEarned: WireNumber
+    lots: list[PositionLot]
+
+
+class PositionsSummary(WireModel):
+    totalMarketValue: WireNumber
+    totalCostBasis: WireNumber
+    totalUnrealizedPnl: WireNumber
+
+
+class TournamentPositions(WireModel):
+    positions: list[TournamentPosition]
+    summary: PositionsSummary
+
+
+# The documented 409 body: #/components/schemas/MissingTournamentValuation.
+# [documented] code is the enum ["CONFLICT"]; message, details and missingValuations are
+# required; each item requires exchangeId, marketId, marketTitle and settlementOption.
+# [client policy] the list must be non-empty and both ids must be ASCII digit strings,
+# as the client requires of every id it sends. Titles and settlement labels are checked
+# for type only and then dropped by the client.
+
+
+_DIGITS = re.compile(r"[0-9]+")  # applied with fullmatch(), so a final "\n" is rejected
+
+
+def _digit_string(value: str) -> str:
+    if not _DIGITS.fullmatch(value):
+        raise PydanticCustomError("digit_string", "expected a string of ASCII digits")
+    return value
+
+
+DigitString = Annotated[str, AfterValidator(_digit_string)]
+
+
+class MissingValuationItem(WireModel):
+    exchangeId: DigitString
+    marketId: DigitString
+    marketTitle: str
+    settlementOption: str | None
+
+
+class MissingValuationDetails(WireModel):
+    missingValuations: list[MissingValuationItem] = Field(min_length=1)
+
+
+class MissingValuationError(WireModel):
+    code: Literal["CONFLICT"]
+    message: str
+    details: MissingValuationDetails
+
+
+class MissingTournamentValuation(WireModel):
+    error: MissingValuationError
 
 
 # --- GET /markets/{id} ------------------------------------------------------------------
