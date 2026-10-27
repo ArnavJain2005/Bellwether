@@ -508,3 +508,153 @@ class ExchangeTradesPage(WireModel):
         if value is None:
             raise PydanticCustomError("coverage_null", "coverage may be omitted but not null")
         return value
+
+
+# --- A2-B: further tournament account reads ----------------------------------------------
+# None of the price, cost, value or quantity fields below documents a denomination or a
+# range, so none is bounded and none is converted; every number is kept exactly as sent.
+# Their units and open questions are in account_reads.NUMERIC_FIELD_STATUS.
+
+
+class TournamentPagination(WireModel):
+    """#/components/schemas/TournamentPagination."""
+
+    limit: int
+    hasMore: bool
+    nextCursor: str | None
+
+
+# GET /tournaments/{slug}/portfolio/fills
+# #/paths/~1tournaments~1{slug}~1portfolio~1fills/get/responses/200/content/application~1json/schema
+# Items: #/components/schemas/Fill
+
+
+class TournamentFill(WireModel):
+    """One fill (#/components/schemas/Fill). `quantity` is outcome-signed (negative: NO)."""
+
+    id: int
+    orderId: int | None
+    exchangeId: str
+    marketId: str
+    price: WireNumber | None
+    quantity: WireNumber
+    side: Literal["yes", "no"]
+    filledAt: str
+
+
+class FillsCoverage(WireModel):
+    """Projection coverage on the fills read: `complete` is the enum [true]."""
+
+    complete: JsonTrue
+    projectedThroughSequence: int | None
+
+
+class TournamentFillsPage(WireModel):
+    data: list[TournamentFill]
+    pagination: TournamentPagination
+    # Documented as optional (not in `required`) but not nullable: None here means only
+    # that SIG omitted it. An explicit null is rejected; the default is not validated.
+    coverage: FillsCoverage | None = None
+
+    @field_validator("coverage", mode="before")
+    @classmethod
+    def _coverage_not_null(cls, value: object) -> object:
+        if value is None:
+            raise PydanticCustomError("coverage_null", "coverage may be omitted but not null")
+        return value
+
+
+# GET /tournaments/{slug}/portfolio/pnl
+# #/paths/~1tournaments~1{slug}~1portfolio~1pnl/get/responses/200/content/application~1json/schema
+# Its 409 body is MissingTournamentValuation, as for positions.
+
+PnlPeriod = Literal["day", "week", "month", "quarter", "year", "all"]
+
+
+class TournamentPnl(WireModel):
+    period: PnlPeriod
+    periodStart: str | None
+    periodEnd: str
+    periodPnl: WireNumber | None
+    unrealizedPnl: WireNumber
+    totalAccountValue: WireNumber
+    totalHoldingsValue: WireNumber
+    totalCostBasis: WireNumber
+    roi: WireNumber | None
+    sharpe: WireNumber | None
+
+
+# GET /tournaments/{slug}/portfolio/settlements
+# #/paths/~1tournaments~1{slug}~1portfolio~1settlements/get/responses/200/content/application~1json/schema
+# Items: #/components/schemas/TournamentSettlementEntry
+
+
+class TournamentSettlementEntry(WireModel):
+    id: str
+    type: Literal["win", "loss", "refund", "correction"] | None
+    createdAt: str | None
+    marketId: str | None
+    marketTitle: str | None
+    exchangeId: str | None
+    settlementOption: str | None
+    settlementOutcome: str | None
+    shares: WireNumber | None
+    avgEntryPrice: WireNumber | None
+    costBasis: WireNumber | None
+    payout: WireNumber
+    realizedPnl: WireNumber | None
+
+
+class EconomicCommandCoverage(WireModel):
+    """#/components/schemas/TournamentEconomicCommandCoverage: `complete` only.
+
+    Documented as false when SIG's economic-command history walk hit its hard 20-page
+    budget, so a page can legitimately be incomplete; the value is kept as sent. There is
+    no projection checkpoint here: any other field (a `projectedThroughSequence`
+    included) is ignored as unknown, never kept.
+    """
+
+    complete: bool
+
+
+class TournamentSettlementsPage(WireModel):
+    data: list[TournamentSettlementEntry]
+    pagination: TournamentPagination
+    coverage: EconomicCommandCoverage  # required, not nullable
+
+
+# GET /orders/{id}/fills
+# #/paths/~1orders~1{id}~1fills/get/responses/200/content/application~1json/schema
+
+
+class OrderFill(WireModel):
+    """One fill of one order. `quantity` is outcome-signed (negative: NO)."""
+
+    id: int
+    price: WireNumber | None
+    quantity: WireNumber
+    side: Literal["yes", "no"]
+    filledAt: str
+
+
+class OrderFillsCoverage(WireModel):
+    complete: JsonTrue
+    projectedThroughSequence: int | None
+
+
+class OrderFillsPage(WireModel):
+    """One page of one order's fills.
+
+    `tournamentId` is the order's echoed context (null for global orders); the client
+    checks it. `totalQuantityFilled` and `avgFillPrice` are documented as exact lifetime
+    totals for the whole order, independent of the page.
+    """
+
+    orderId: int
+    exchangeId: str
+    tournamentId: str | None
+    data: list[OrderFill]
+    pagination: OrderPagination
+    coverage: OrderFillsCoverage  # required here, not nullable
+    totalQuantityFilled: WireNumber
+    avgFillPrice: WireNumber | None

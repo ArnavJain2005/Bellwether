@@ -1,0 +1,16 @@
+{
+  "provenance": "synthetic, spec-derived: entry placeholder-settlement-1 uses the spec examples; entry placeholder-settlement-2 is a placeholder correction with every nullable field null; ids and titles are placeholders",
+  "openapi": [
+    "#/paths/~1tournaments~1{slug}~1portfolio~1settlements/get/responses/200/content/application~1json/schema",
+    "#/components/schemas/TournamentSettlementEntry",
+    "#/components/schemas/TournamentEconomicCommandCoverage"
+  ],
+  "body": {
+    "data": [
+      {"id": "placeholder-settlement-1", "type": "win", "createdAt": "2026-04-04T18:00:00.000Z", "marketId": "26", "marketTitle": "Placeholder market A", "exchangeId": "36", "settlementOption": "YES", "settlementOutcome": "YES", "shares": 100, "avgEntryPrice": 0.42, "costBasis": 42, "payout": 100, "realizedPnl": 58},
+      {"id": "placeholder-settlement-2", "type": null, "createdAt": null, "marketId": null, "marketTitle": null, "exchangeId": null, "settlementOption": null, "settlementOutcome": null, "shares": null, "avgEntryPrice": null, "costBasis": null, "payout": 0, "realizedPnl": null}
+    ],
+    "pagination": {"limit": 200, "hasMore": false, "nextCursor": null},
+    "coverage": {"complete": true}
+  }
+}

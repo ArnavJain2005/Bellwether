@@ -29,12 +29,19 @@ from engine.sig_client.account_reads import (
     numeric_field_status,
 )
 from engine.sig_client.wire import (
+    FillsCoverage,
     Order,
     OrderCoverage,
+    OrderFill,
+    OrderFillsCoverage,
+    OrderFillsPage,
     PositionLot,
     PositionsSummary,
     Tournament,
+    TournamentFill,
+    TournamentPnl,
     TournamentPosition,
+    TournamentSettlementEntry,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -48,6 +55,14 @@ ACCOUNT_MODELS: tuple[type[BaseModel], ...] = (
     PositionsSummary,
     Order,
     OrderCoverage,
+    # A2-B
+    TournamentFill,
+    FillsCoverage,
+    TournamentPnl,
+    TournamentSettlementEntry,
+    OrderFillsPage,
+    OrderFill,
+    OrderFillsCoverage,
 )
 
 
@@ -72,7 +87,7 @@ def resolve(pointer: str) -> Any:
     return node
 
 
-def test_every_numeric_field_of_the_a2a_models_has_a_status() -> None:
+def test_every_numeric_field_of_the_a2_models_has_a_status() -> None:
     numeric = {
         (model.__name__, name)
         for model in ACCOUNT_MODELS

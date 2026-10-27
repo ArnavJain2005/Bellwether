@@ -1,7 +1,7 @@
 """Read-only SIG REST client (S1-T2-B; market detail and trade tape added in S1-T3-B;
 raw tournament account reads added in A2-A).
 
-Scope: nine documented GET endpoints, always pinned to the configured tournament. There
+Scope: thirteen documented GET endpoints, always pinned to the configured tournament. There
 are no write methods (orders, cancels, realtime tokens) and no public way to issue an
 arbitrary request.
 
@@ -14,6 +14,15 @@ Account reads (A2-A; docs/design/account-state-contracts.md, section 8):
   other 409 raises SigConflictError as before.
 - `read_open_orders` walks GET /orders?status=open and keeps every page's coverage and
   provenance.
+
+Further account reads (A2-B), on the same machinery:
+- `read_tournament_fills` walks GET /tournaments/{slug}/portfolio/fills.
+- `read_tournament_pnl` reads GET /tournaments/{slug}/portfolio/pnl, sending `period`
+  explicitly ("all" by default), with the same typed 409 as positions.
+- `read_tournament_settlements` walks GET /tournaments/{slug}/portfolio/settlements and
+  is never labelled complete if any page's economic-command coverage reported false.
+- `read_order_fills` walks GET /orders/{id}/fills; every page must echo the configured
+  tournament and the same lifetime totals.
 Each returns a `ReadProvenance` built from that call's own local variables: there is no
 shared "last response" state, so concurrent calls and retries cannot mix observations.
 Provenance is our own local record, never evidence of server freshness, atomicity or
@@ -109,12 +118,17 @@ from pydantic import BaseModel, ValidationError
 from engine.config import SigConfig, TournamentRef
 from engine.sig_client.account_reads import (
     CoverageState,
+    FillsWalk,
     MissingValuation,
+    OrderFillsWalk,
     OrdersWalk,
+    PageCoverage,
     PageRecord,
+    PnlRead,
     PositionsRead,
     ReadProvenance,
     ScopeEvidence,
+    SettlementsWalk,
     TournamentBalanceRead,
     UnvaluedHoldingsRead,
     VerificationUse,
@@ -153,6 +167,7 @@ from engine.sig_client.realtime_wire import epoch_seconds, parse_instant
 from engine.sig_client.wire import (
     BulkExchangePrices,
     CombinedMarketOrderbook,
+    EconomicCommandCoverage,
     ExchangeOrderbook,
     ExchangeTrade,
     ExchangeTradesPage,
@@ -163,12 +178,15 @@ from engine.sig_client.wire import (
     MissingTournamentValuation,
     Order,
     OrderbookLevel,
-    OrderCoverage,
+    OrderFillsPage,
     OrdersPage,
     Tournament,
+    TournamentFillsPage,
     TournamentMarket,
     TournamentMarketsPage,
+    TournamentPnl,
     TournamentPositions,
+    TournamentSettlementsPage,
     TradeCoverage,
 )
 
@@ -183,6 +201,11 @@ ORDERBOOK_DEPTH_MAX = 200  # #/paths/~1exchanges~1{id}~1orderbook/get/parameters
 DEFAULT_ORDERBOOK_DEPTH = 20
 MARKET_STATUSES = frozenset({"open", "closed", "settled", "any"})  # "resolved" is deprecated
 ORDER_STATUSES = frozenset({"open", "closed", "expired", "all"})
+FILLS_PAGE_MAX = 200  # #/paths/~1tournaments~1{slug}~1portfolio~1fills/get/parameters/3
+SETTLEMENTS_PAGE_MAX = 200  # #/paths/~1tournaments~1{slug}~1portfolio~1settlements/get/parameters/1
+ORDER_FILLS_PAGE_MAX = 200  # #/paths/~1orders~1{id}~1fills/get/parameters/1
+# #/paths/~1tournaments~1{slug}~1portfolio~1pnl/get/parameters/1 (documented default: quarter)
+PNL_PERIODS = frozenset({"day", "week", "month", "quarter", "year", "all"})
 DEFAULT_MAX_PAGES = 50
 
 # All token patterns are applied with fullmatch(); `$` with match() accepts a final "\n".
@@ -278,6 +301,10 @@ def utc_now() -> datetime:
 TOURNAMENT_ROUTE = "/tournaments/{slug}"
 POSITIONS_ROUTE = "/tournaments/{slug}/portfolio/positions"
 ORDERS_ROUTE = "/orders"
+FILLS_ROUTE = "/tournaments/{slug}/portfolio/fills"
+PNL_ROUTE = "/tournaments/{slug}/portfolio/pnl"
+SETTLEMENTS_ROUTE = "/tournaments/{slug}/portfolio/settlements"
+ORDER_FILLS_ROUTE = "/orders/{id}/fills"
 
 # Query parameters a ReadProvenance may record (design 4.1 R6). A cursor is response
 # data: only the fact that one was sent is recorded, never its value.
@@ -532,6 +559,50 @@ def _format_instant(moment: datetime) -> str:
         f"{moment.hour:02d}:{moment.minute:02d}:{moment.second:02d}."
         f"{moment.microsecond // 1000:03d}Z"
     )
+
+
+def _check_order_id(order_id: object) -> int:
+    # Order ids are integers on the wire (#/components/schemas/Order/properties/id).
+    if isinstance(order_id, bool) or not isinstance(order_id, int) or order_id < 0:
+        raise SigArgumentError("order_id must be a non-negative integer")
+    return order_id
+
+
+def _optional_coverage(page: Any) -> tuple[CoverageState, PageCoverage | None]:
+    """A page whose coverage is documented as optional: kept as sent, or omitted."""
+    if page.coverage is None:
+        return CoverageState.OMITTED, None
+    return CoverageState.PRESENT, page.coverage
+
+
+class _NewestFirst:
+    """[documented] newest-first order, checked within each page and across pages.
+
+    Timestamps are compared as exact instants; equal timestamps are allowed. Values are
+    response data and are never repeated in an error.
+    """
+
+    def __init__(self, path: str, field: str) -> None:
+        self._path = path
+        self._field = field
+        self._oldest: Decimal | None = None  # the previous page's last (oldest) instant
+
+    def check(self, stamps: Sequence[str]) -> None:
+        times = [_response_instant(self._path, self._field, stamp) for stamp in stamps]
+        if any(newer < older for newer, older in itertools.pairwise(times)):
+            raise SigResponseError(
+                method="GET",
+                path=self._path,
+                reason=f"items are not sorted newest first by {self._field}",
+            )
+        if times:
+            if self._oldest is not None and times[0] > self._oldest:
+                raise SigPaginationError(
+                    method="GET",
+                    path=self._path,
+                    reason="a page holds items newer than the previous page's",
+                )
+            self._oldest = times[-1]
 
 
 def _response_instant(path: str, field: str, text: str) -> Decimal:
@@ -1136,6 +1207,252 @@ class SigRestClient:
             key=lambda order: order.id,
         )
 
+    # --- further account reads (A2-B) ---------------------------------------------------
+
+    async def read_tournament_fills(
+        self, *, page_limit: int = FILLS_PAGE_MAX, max_pages: int = DEFAULT_MAX_PAGES
+    ) -> FillsWalk:
+        """Every fill of the caller in the configured tournament, newest first (A2-B).
+
+        Walks GET /tournaments/{slug}/portfolio/fills (verified slug in the path; rows
+        carry no tournament id). A repeated cursor, a duplicate fill id, a cursor on the
+        last page or the page cap raises SigPaginationError; no partial walk is returned.
+        [documented] fills are newest first; [client policy] a page out of that order, or
+        a page holding fills newer than the previous page's, is rejected. Each page's
+        coverage is kept exactly as sent or recorded as omitted; an explicit
+        `coverage: null` fails the walk. Every number is kept exactly as sent.
+        """
+        page_limit = _check_int("page_limit", page_limit, 1, FILLS_PAGE_MAX)
+        max_pages = _check_int("max_pages", max_pages, 1, 10_000)
+        path = f"/tournaments/{_segment(self._config.tournament.slug)}/portfolio/fills"
+        newest_first = _NewestFirst(path, "filledAt")
+
+        def check(page: TournamentFillsPage) -> None:
+            newest_first.check([fill.filledAt for fill in page.data])
+
+        fills, pages = await self._walk_observed(
+            FILLS_ROUTE,
+            path,
+            TournamentFillsPage,
+            ScopeEvidence.VERIFIED_SLUG_PATH,
+            page_limit=page_limit,
+            max_pages=max_pages,
+            key=lambda fill: fill.id,
+            check=check,
+            coverage=_optional_coverage,
+        )
+        return FillsWalk(fills=tuple(fills), pages=pages)
+
+    async def read_tournament_pnl(self, *, period: str = "all") -> PnlRead | UnvaluedHoldingsRead:
+        """GET /tournaments/{slug}/portfolio/pnl for `period` (A2-B), sent explicitly.
+
+        `period` defaults to "all" and is always sent, never left to SIG's documented
+        default ("quarter"). [client policy] the echoed `period` must be the one sent.
+        [documented] 409 means "holdings exist without valuation prices"; a valid
+        MissingTournamentValuation body becomes UnvaluedHoldingsRead, exactly as for
+        positions, and any other 409 raises SigConflictError. Fields are kept exactly as
+        sent; nothing is derived from them.
+        """
+        period = _check_choice("period", period, PNL_PERIODS)
+        verification, verification_read = await self._verify_observed()
+        path = f"/tournaments/{_segment(self._config.tournament.slug)}/portfolio/pnl"
+        exchange = await self._get_observed(path, {"period": period}, conflict=_missing_valuations)
+        provenance = self._provenance(
+            PNL_ROUTE,
+            exchange,
+            ScopeEvidence.VERIFIED_SLUG_PATH,
+            verification=verification,
+            verification_read=verification_read,
+        )
+        if exchange.conflict is not None:
+            return UnvaluedHoldingsRead(missing=exchange.conflict, provenance=provenance)
+        pnl = self._validate(path, exchange.body, TournamentPnl)
+        if pnl.period != period:
+            raise SigResponseError(
+                method="GET", path=path, reason="P&L is for a different period than requested"
+            )
+        return PnlRead(pnl=pnl, provenance=provenance)
+
+    async def read_tournament_settlements(
+        self, *, page_limit: int = SETTLEMENTS_PAGE_MAX, max_pages: int = DEFAULT_MAX_PAGES
+    ) -> SettlementsWalk:
+        """Every settlement entry of the caller in the configured tournament (A2-B).
+
+        Walks GET /tournaments/{slug}/portfolio/settlements under the same pagination
+        rules as the other walks (duplicate entry ids raise). [documented] each page's
+        economic-command `coverage.complete` is false when SIG's own history walk hit its
+        20-page budget. Such a page is kept as sent and the walk continues; the result
+        lists those page indexes and is `complete` only when no page reported false. It
+        is never presented as complete otherwise, and never silently truncated.
+        """
+        page_limit = _check_int("page_limit", page_limit, 1, SETTLEMENTS_PAGE_MAX)
+        max_pages = _check_int("max_pages", max_pages, 1, 10_000)
+        path = f"/tournaments/{_segment(self._config.tournament.slug)}/portfolio/settlements"
+        entries, pages = await self._walk_observed(
+            SETTLEMENTS_ROUTE,
+            path,
+            TournamentSettlementsPage,
+            ScopeEvidence.VERIFIED_SLUG_PATH,
+            page_limit=page_limit,
+            max_pages=max_pages,
+            key=lambda entry: entry.id,
+            coverage=lambda page: (CoverageState.PRESENT, page.coverage),
+        )
+        incomplete = tuple(
+            index
+            for index, page in enumerate(pages)
+            if isinstance(page.provenance.coverage, EconomicCommandCoverage)
+            and page.provenance.coverage.complete is not True
+        )
+        return SettlementsWalk(
+            entries=tuple(entries),
+            pages=pages,
+            complete=not incomplete,
+            incomplete_pages=incomplete,
+        )
+
+    async def read_order_fills(
+        self,
+        order_id: int,
+        *,
+        page_limit: int = ORDER_FILLS_PAGE_MAX,
+        max_pages: int = DEFAULT_MAX_PAGES,
+    ) -> OrderFillsWalk:
+        """Every fill of one order, with its lifetime totals (A2-B).
+
+        Walks GET /orders/{id}/fills. "The order ID determines its trading context" and
+        the response echoes `tournamentId`: [client policy] every page must echo the
+        configured tournament, and a null (a global order) or any other value raises
+        SigContextMismatchError for this order. That is about the order, not about the
+        client's tournament identity, so it does not latch the client. Every page must
+        also echo the requested order and one exchange, and the same lifetime totals
+        (`totalQuantityFilled`, `avgFillPrice`, documented as independent of the page);
+        otherwise the walk raises. [documented] fills are newest first, checked as for
+        the tournament fills. An order with no fills is one request and an empty walk.
+        """
+        order_id = _check_order_id(order_id)
+        page_limit = _check_int("page_limit", page_limit, 1, ORDER_FILLS_PAGE_MAX)
+        max_pages = _check_int("max_pages", max_pages, 1, 10_000)
+        path = f"/orders/{order_id}/fills"
+        newest_first = _NewestFirst(path, "filledAt")
+        firsts: list[OrderFillsPage] = []
+
+        def check(page: OrderFillsPage) -> None:
+            if page.orderId != order_id:
+                raise SigResponseError(
+                    method="GET", path=path, reason="fills are for a different order"
+                )
+            self._check_order_tournament(path, page.tournamentId)
+            if firsts:
+                first = firsts[0]
+                # Response values are not repeated in the errors.
+                if page.exchangeId != first.exchangeId:
+                    raise SigPaginationError(
+                        method="GET", path=path, reason="a page reports a different exchange"
+                    )
+                if (page.totalQuantityFilled, page.avgFillPrice) != (
+                    first.totalQuantityFilled,
+                    first.avgFillPrice,
+                ):
+                    raise SigPaginationError(
+                        method="GET",
+                        path=path,
+                        reason="the order's lifetime totals differ between pages",
+                    )
+            else:
+                firsts.append(page)
+            newest_first.check([fill.filledAt for fill in page.data])
+
+        fills, pages = await self._walk_observed(
+            ORDER_FILLS_ROUTE,
+            path,
+            OrderFillsPage,
+            ScopeEvidence.ECHO,
+            page_limit=page_limit,
+            max_pages=max_pages,
+            key=lambda fill: fill.id,
+            check=check,
+            coverage=lambda page: (CoverageState.PRESENT, page.coverage),
+        )
+        first = firsts[0]  # _collect reads at least one page or raises
+        assert first.tournamentId is not None  # checked by _check_order_tournament
+        return OrderFillsWalk(
+            order_id=first.orderId,
+            exchange_id=first.exchangeId,
+            echoed_tournament_id=first.tournamentId,
+            fills=tuple(fills),
+            total_quantity_filled=first.totalQuantityFilled,
+            avg_fill_price=first.avgFillPrice,
+            pages=pages,
+        )
+
+    def _check_order_tournament(self, path: str, echoed: str | None) -> None:
+        # [documented] "Tournament this order belongs to, or null for global orders".
+        # The echoed value is response data and is not repeated in the error.
+        expected = self._config.tournament
+        if echoed is None:
+            raise SigContextMismatchError(
+                method="GET",
+                path=path,
+                reason=f"the order is a global order, not in {expected.slug} / {expected.id}",
+            )
+        if _same_uuid(echoed, expected.id) is not True:
+            raise SigContextMismatchError(
+                method="GET",
+                path=path,
+                reason=f"the order belongs to a different tournament than {expected.slug}",
+            )
+
+    async def _walk_observed(
+        self,
+        route: str,
+        path: str,
+        model: type[PageT],
+        scope: ScopeEvidence,
+        *,
+        page_limit: int,
+        max_pages: int,
+        key: Callable[[Any], object],
+        coverage: Callable[[Any], tuple[CoverageState, PageCoverage | None]],
+        check: Callable[[Any], None] | None = None,
+    ) -> tuple[list[Any], tuple[PageRecord, ...]]:
+        """A complete cursor walk of one account read, with one PageRecord per page.
+
+        Every page re-runs the (cached) tournament verification, has its own read
+        deadline and is validated, size-checked and passed to `check` before it is
+        recorded. `_collect` enforces the pagination rules. Records live only in this
+        call, so concurrent walks never share them.
+        """
+        records: list[PageRecord] = []
+
+        async def fetch(cursor: str | None) -> Any:
+            cursor = _check_cursor(cursor)
+            verification, verification_read = await self._verify_observed()
+            params: dict[str, str | int] = {"limit": page_limit}
+            if cursor is not None:
+                params["cursor"] = cursor
+            exchange = await self._get_observed(path, params)
+            page = self._validate(path, exchange.body, model)
+            self._check_page_size(path, len(page.data), page_limit)
+            if check is not None:
+                check(page)
+            state, kept = coverage(page)
+            provenance = self._provenance(
+                route,
+                exchange,
+                scope,
+                page_index=len(records),
+                coverage_state=state,
+                coverage=kept,
+                verification=verification,
+                verification_read=verification_read,
+            )
+            records.append(PageRecord(provenance=provenance, item_count=len(page.data)))
+            return page
+
+        items = await self._collect(path, fetch, max_pages=max_pages, key=key)
+        return items, tuple(records)
+
     # --- trade tape ---------------------------------------------------------------------
 
     async def list_exchange_trades_page(
@@ -1362,7 +1679,7 @@ class SigRestClient:
         *,
         page_index: int | None = None,
         coverage_state: CoverageState = CoverageState.NOT_APPLICABLE,
-        coverage: OrderCoverage | None = None,
+        coverage: PageCoverage | None = None,
         verification: VerificationUse = VerificationUse.NOT_APPLICABLE,
         verification_read: ReadProvenance | None = None,
     ) -> ReadProvenance:

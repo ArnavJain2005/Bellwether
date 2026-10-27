@@ -1,0 +1,18 @@
+{
+  "provenance": "synthetic, spec-derived: numbers are the spec examples; period is all (as the client sends); periodStart and periodEnd are placeholders",
+  "openapi": [
+    "#/paths/~1tournaments~1{slug}~1portfolio~1pnl/get/responses/200/content/application~1json/schema"
+  ],
+  "body": {
+    "period": "all",
+    "periodStart": null,
+    "periodEnd": "2026-10-20T00:00:00.000Z",
+    "periodPnl": 42.5,
+    "unrealizedPnl": 30,
+    "totalAccountValue": 930.5,
+    "totalHoldingsValue": 310.5,
+    "totalCostBasis": 280.5,
+    "roi": -6.95,
+    "sharpe": 0.84
+  }
+}

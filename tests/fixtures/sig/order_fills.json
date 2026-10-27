@@ -1,0 +1,19 @@
+{
+  "provenance": "synthetic, spec-derived: order 1001, fill 5001, coverage and totals are the spec examples; tournamentId is the test tournament of tournament.json (the spec example is null, a global order)",
+  "openapi": [
+    "#/paths/~1orders~1{id}~1fills/get/responses/200/content/application~1json/schema",
+    "#/components/schemas/OrderPagination"
+  ],
+  "body": {
+    "orderId": 1001,
+    "exchangeId": "36",
+    "tournamentId": "550e8400-e29b-41d4-a716-446655440000",
+    "data": [
+      {"id": 5001, "price": 0.42, "quantity": 100, "side": "yes", "filledAt": "2025-06-14T12:05:00.000Z"}
+    ],
+    "pagination": {"limit": 200, "hasMore": false, "nextCursor": null},
+    "coverage": {"complete": true, "projectedThroughSequence": 184233},
+    "totalQuantityFilled": 100,
+    "avgFillPrice": 0.42
+  }
+}

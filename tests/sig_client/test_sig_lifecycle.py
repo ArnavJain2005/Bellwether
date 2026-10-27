@@ -173,8 +173,12 @@ def test_no_public_write_or_arbitrary_request_methods() -> None:
         "list_orders_page",
         "list_tournament_markets_page",
         "read_open_orders",  # A2-A
+        "read_order_fills",  # A2-B
         "read_tournament_balance",  # A2-A
+        "read_tournament_fills",  # A2-B
+        "read_tournament_pnl",  # A2-B
         "read_tournament_positions",  # A2-A
+        "read_tournament_settlements",  # A2-B
         "tournament",  # read-only accessor for the configured TournamentRef
         "verify_tournament",
     }
