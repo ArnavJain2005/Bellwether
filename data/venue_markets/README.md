@@ -81,7 +81,7 @@ A market is kept only with affirmative evidence of a **2026 U.S. Senate, House, 
 - Candidate and outcome labels (`yes_sub_title`, candidate `subtitle`) never establish jurisdiction or the election cycle, even when a label is exactly a state name or abbreviation (e.g. Washington). State extraction uses structured contest symbols and market/parent-event contest context. The targeted exclusion of Lieutenant Governor primary-office subtitles remains in place.
 - Explicit U.S., United States, or federal Senate/House wording identifies federal seat-count contracts without requiring the particular phrase "in the U.S. Senate" or "U.S. congressional elections". Explicit state-legislature wording and recognised state-legislature series remain excluded.
 
-**Recognised structured Kalshi symbols:** `CONTROLS`/`CONTROLH` and state-validated `SENATE<ST>`, `SENATEPARTY<ST>`, `GOV<ST>`/`GOVPARTY<ST>`, `HOUSE<ST><district|AL>`, and corroborated generic `KXHOUSERACE-<ST><dist>-26-[D|R]` (optionally `KX`-prefixed, where `<ST>` is a real two-letter U.S. state code). Generic Kalshi SENATE/HOUSE/GOV prefixes are recognized by year extraction; they do not alone supply the office/jurisdiction evidence that the structured eligibility helper requires.
+**Recognised structured Kalshi symbols:** `CONTROLS`/`CONTROLH` and state-validated `SENATE<ST>`, `SENATEPARTY<ST>`, `GOV<ST>`/`GOVPARTY<ST>`, `HOUSE<ST><district|AL>` (per-district series admitted only through their own rules; see "Kalshi per-district series"), and corroborated generic `KXHOUSERACE-<ST><dist>-26-[D|R]` (optionally `KX`-prefixed, where `<ST>` is a real two-letter U.S. state code). Generic Kalshi SENATE/HOUSE/GOV prefixes are recognized by year extraction; they do not alone supply the office/jurisdiction evidence that the structured eligibility helper requires.
 
 ## House Admission Grammar & Verification (S1-T5-F6 / R1 / R2 / R3 / C1)
 
@@ -99,10 +99,24 @@ State names are matched longest first, so `West Virginia` never also yields `Vir
 - Relationships: `event.series_ticker == "KXHOUSERACE"`, explicit `market.event_ticker` equal to the parent's, and `market.series_ticker` absent (as recorded upstream) or `KXHOUSERACE`. Event ticker `KXHOUSERACE-<ST><DD|AL>-26`; market suffix `D`/`R` (`DEM`/`REP` accepted).
 - Title (recorded shape): `Will <Democratic|Republican> win the House race for <ST>-<DD>?`, agreeing with the suffix party and ticker district. Titles naming a candidate, turnout, vote share, margin or percentage are rejected.
 - Decisive sentence: the first sentence of `rules_primary`, framed `If <condition>, then the market resolves to Yes.` (a `No` payout is contradictory). Supported conditions:
-  - **K1 (recorded; 697 of 706 cached contracts):** `the House member sworn in for <district> for the term beginning in 2027 is a member of the <Democratic|Republican> Party` (`Party`/`party`).
+  - **K1 (recorded; 697 of 706 cached contracts):** `the House member sworn in for <district> for the term beginning in 2027 is a member of the <Democratic|Republican> Party` (`Party`/`party`). `Democratic (DFL) Party` (recorded on `HOUSEMN2-26-D`) is read as Democratic only for Minnesota districts; any other `(DFL)` label is rejected as `unsupported_party_label`. This parser is shared by both Kalshi paths.
   - **K2 (synthetic control, not observed upstream):** `the <Democratic|Republican> Party wins the <district> House <race|seat> in the 2026 election`.
 - The district must come from the condition itself and equal the ticker district; the title and parent title/subtitle may only corroborate it. The term year must be 2027 (K1) and the election year 2026 (K2); a 2027 term never excuses another election year.
 - Background: every remaining `rules_primary` sentence and every `rules_secondary` sentence must be a supported background shape (see "Background acceptance"); any other sentence is rejected.
+
+### Kalshi per-district series (`HOUSE<ST><N>`, `KXHOUSE<ST><N>`)
+Before this repair these contracts were admitted on ticker symbol and year alone; their rules were never read. A recorded named-candidate contract (`HOUSEAKAL-26-BHIL`, "If Bill Hill is sworn in for AK-AL ...") was admitted as a House reference that way. They are now admitted only through their own rules:
+- Relationships: the parent's `series_ticker` is the per-district series, `market.event_ticker` equals the parent's, and `market.series_ticker` is absent (as recorded) or equal. Event ticker `<series>-26`; any other cycle is rejected.
+- Decisive sentence: the complete K1 sentence above, naming Democratic or Republican. It alone establishes the claimed outcome, and its district must equal the series district.
+  - A party other than Democratic or Republican (`member of the Independent party`, recorded on `HOUSEIA1-26-I`) is rejected as `unsupported_party_outcome`.
+  - Named persons and unreviewed wording (`If a member of the <party> party is sworn in for AK-AL ...`, recorded on `HOUSEAKAL-26-D/R`) are rejected as `unsupported_resolution_subject`.
+- Minnesota DFL: `Democratic (DFL) Party` counts as Democratic only for a Minnesota district (see K1).
+- Background: same allowlist as `KXHOUSERACE`.
+- Corroboration only: the ticker suffix, the title and the parent title/subtitle must agree with the rules' party and district; party is never inferred from them.
+  - Suffixes: `D`/`DEM` or `R`/`REP`/`GOP` (`DEM`/`GOP` recorded on NC-11).
+  - Recorded title shapes: `Will Democratic|a Democrat|Democrats|Republican|a Republican|Republicans win the House race for <ST>-<N>?`.
+- Fresh-snapshot effect: 154 per-district contracts, 150 admitted. All 58 D/R contracts in the 29 SIG districts on this path are retained. Excluded: `HOUSEIA1-26-I`, `HOUSEAKAL-26-BHIL`, `HOUSEAKAL-26-D`, `HOUSEAKAL-26-R`.
+- Admission is a reference-data identity check. It does **not** establish settlement equivalence with SIG: every SIG-to-venue pairing remains unknown until SIG's Info-tab rules are captured and reviewed.
 
 ### Polymarket
 - Applies only when the baseline identity check returns `lacks_2026_contest_year` (no conflicting year) and the question mentions the House; other records keep their baseline reason.
@@ -136,11 +150,17 @@ Every other sentence is rejected as `unsupported_background_sentence`, whatever 
 | `sub_district_resolution_scope` | Polymarket clause restricted to counties, precincts or cities |
 | `unsupported_market_identity` | Polymarket slug or question district outside the supported shapes |
 | `non_2026_primary_contest` | Primary contest, or a non-2026 election / non-2027 term year |
+| `unsupported_party_outcome` | Kalshi per-district rules name a party other than Democratic or Republican |
+| `unsupported_party_label` | A `(DFL)` label outside a Minnesota district, or not attached to Democratic |
+| `arbitrary_ticker_suffix` | Kalshi market suffix is not a recognised party code |
 
 ### Remaining limitations
 - The grammar covers the recorded wording plus documented synthetic controls only. If a venue rewords its rules or boilerplate, affected records are excluded (fail closed) and must be reviewed before the grammar is extended.
 - Background acceptance is an explicit allowlist of complete sentences. Rewording, punctuation changes or new neutral sentences are excluded until reviewed and added. Omitting recorded boilerplate is not rejected: a description consisting of the opening clause alone, or of the clause and a subset of the recorded sentences, is admitted.
 - Kalshi K2 and the Polymarket county-aggregation tail are synthetic controls with no upstream example.
+- Only the recorded per-district series shape (`HOUSE<ST><N>`, `KXHOUSE<ST><N>`) is routed through rules checks. Other structured House symbols still use the baseline symbol path, so this does not make federal House admission safe in general.
+  - Known false admission: the statewide `KXTXHOUSE` (`KXTXHOUSE-26-D`/`-R`, "Who will win the Texas House of Representatives?") concerns a state legislative chamber but is admitted as federal House. It is a separate open issue, not addressed here.
+- The Alaska `If a member of the <party> party is sworn in ...` wording and Independent outcomes stay excluded until a reviewed grammar supports them.
 - Admission is reference-data ingestion only. Settlement equivalence with SIG, whole-venue completeness and fair-value eligibility remain separate, unaccepted gates; fair-value eligibility stays disabled.
 
 ### Test History & Explanation

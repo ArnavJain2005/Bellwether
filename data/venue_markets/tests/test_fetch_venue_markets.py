@@ -1198,7 +1198,19 @@ KALSHI_ELIGIBLE = [
         id="chamber-control-title",
     ),
     pytest.param(("SENATEAZ-26-D", "SENATEAZ", "Democratic Party"), id="structured-senate-state"),
-    pytest.param(("HOUSETX12-26-D", "HOUSETX12", "Democratic Party"), id="structured-house-district"),
+    # Per-district House symbols are admitted only through their own decisive rules and an explicit
+    # market/event link; fields follow the recorded HOUSE<ST><N> shape (TX-12 itself is synthetic).
+    pytest.param(
+        (
+            "HOUSETX12-26-D", "HOUSETX12", "Will Democratic win the House race for TX-12?", "",
+            (
+                "If the House member sworn in for TX-12 for the term beginning in 2027 is a member of the "
+                "Democratic Party, then the market resolves to Yes."
+            ),
+            "open", {"event_ticker": "HOUSETX12-26"},
+        ),
+        id="structured-house-district",
+    ),
     pytest.param(("GOVPARTYTX-26-D", "GOVPARTYTX", "Democratic Party"), id="structured-governor-state"),
     pytest.param(("CONTROLS-26-D", "CONTROLS", "Democratic Party"), id="structured-senate-control"),
     pytest.param(("KXCONTROLH-26-R", "KXCONTROLH", "Republican Party"), id="structured-house-control"),
@@ -1218,7 +1230,8 @@ KALSHI_ELIGIBLE = [
 @pytest.mark.parametrize("args", KALSHI_ELIGIBLE)
 @pytest.mark.parametrize("primary_flag", [False, True])
 def test_kalshi_eligible_contests(args: tuple, primary_flag: bool) -> None:
-    market, event = _kalshi_market(*args)
+    extra = args[6] if len(args) > 6 else {}
+    market, event = _kalshi_market(*args[:6], **extra)
     assert is_2026_kalshi_market(market, event, is_primary_match=primary_flag) == (True, None)
 
 
