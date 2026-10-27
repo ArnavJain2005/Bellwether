@@ -51,7 +51,7 @@ data feed only.
 | Recovery ledger and readiness | `recovery.py`, `readiness.py` | In-memory record of what the feed may have missed (M2-A), and a per-market readiness result. Nothing clears a blocker yet. In production a ledger's history is always "unknown", so **no market ever reports ready**. |
 | Fixture recorder | `engine/sig_client/record_fixtures.py` ([RECORDER.md](engine/sig_client/RECORDER.md)) | A bounded, read-only capture of SIG responses for tests. Only Arnav runs it against SIG. |
 | Shared schemas | `shared/schemas.py` → `shared/schemas.json` | Pydantic contracts between engine and dashboard. Some models (`RiskLimits`, `RiskState`, `Mode`, `ModeCommand`, `OverrideCommand`) reflect superseded Oct 2 policy. Do not build on them. |
-| Venue market lists | `data/venue_markets/` ([README](data/venue_markets/README.md)) | A one-off script that fetches 2026 midterm markets from Polymarket and Kalshi and filters them for eligibility. It does not map them to SIG contracts. |
+| Venue market lists | `data/venue_markets/` ([README](data/venue_markets/README.md)) | A fetcher and validator for 2026 midterm markets from Polymarket and Kalshi, enforcing decisive rules corroboration for House party-winner contracts. It does not map them to SIG contracts. |
 
 The planned data flow is reference prices → fair value → signals → `risk.check` → SIG
 orders, with everything logged to SQLite. None of it exists yet. These folders are
@@ -69,7 +69,7 @@ The PRD records **no acceptance gate with evidence yet.**
 | Implemented, tested offline | Shared schemas and JSON Schema export (S1-T1) | PRs #3, #4 |
 | Implemented, tested offline | SIG REST read client, rate limiter, retries and deadlines (S1-T2) | PRs #6–#8, #19 |
 | Implemented, tested offline | Fixture recorder; derived fixtures from three recorded captures (S1-T4, S1-T3-B) | PRs #9, #12–#14, #20, #22 |
-| Implemented, tested offline | Venue market fetch script (S1-T5) | PRs #2, #11, #18, #21, #31 |
+| Implemented, tested offline | Venue market fetch script (S1-T5) | PRs #2, #11, #18, #21, #31, #34 |
 | Implemented, awaiting validation | Realtime feed logic (S1-T3-A). Tested only against a fake transport, never run against SIG. | PRs #16, #17 |
 | Implemented, awaiting validation | Recovery ledger and readiness foundation (M2-A). Tests only, and it cannot clear any blocker. | PR #28 |
 | Implemented, awaiting validation | Raw tournament account reads (A2-A). The units, and whether the data belongs to our tournament, are still open questions (PRD section W). | PR #30 |
@@ -116,11 +116,12 @@ python -m shared.export_schema
 
 Pre-commit runs gitleaks and ruff (`.pre-commit-config.yaml`).
 
-Checked on Oct 27, 2026 at `2d67b85`:
+Checked on Oct 27, 2026 (including PR #34 per-district House admission hardening):
 
 - `ruff check .` passed (ruff 0.16.10);
 - `pytest` ran 1,569 tests, all passed;
-- the venue-market tests ran 615 tests, all passed;
+- the venue-market tests (`pytest data/venue_markets/tests`) ran 651 tests, all passed;
+- combined tests (`pytest tests data/venue_markets/tests`) ran 2,220 tests, all passed;
 - `shared/schemas.json` matched a fresh export;
 - CI passed on that commit.
 
