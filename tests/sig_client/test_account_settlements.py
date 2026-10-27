@@ -108,13 +108,18 @@ def test_t16_a_projection_checkpoint_on_settlements_is_ignored_not_kept() -> Non
 
 def test_the_walk_result_cannot_claim_completeness_it_does_not_have() -> None:
     result, _ = walk({None: page([entry("s1")], cursor=None, complete=False)})
-    with pytest.raises(ValueError, match="complete"):
+    # The incomplete page is listed correctly, so only the completeness rule applies.
+    with pytest.raises(ValueError, match="complete is True exactly when no page reported false"):
         SettlementsWalk(
-            entries=result.entries, pages=result.pages, complete=True, incomplete_pages=()
+            entries=result.entries, pages=result.pages, complete=True, incomplete_pages=(0,)
         )
-    with pytest.raises(ValueError, match="incomplete_pages"):
+    with pytest.raises(ValueError, match="incomplete_pages must list exactly"):
         SettlementsWalk(
             entries=result.entries, pages=result.pages, complete=False, incomplete_pages=(3,)
+        )
+    with pytest.raises(ValueError, match="incomplete_pages must list exactly"):
+        SettlementsWalk(
+            entries=result.entries, pages=result.pages, complete=False, incomplete_pages=()
         )
 
 
