@@ -681,7 +681,11 @@ _KALSHI_SWORN_MEMBER_RE = re.compile(
     r"(?P<term_rest>.*?) is (?P<predicate>.+)",
     re.IGNORECASE,
 )
-_KALSHI_PARTY_MEMBER_RE = re.compile(r"a member of the (?P<party>[A-Za-z]+) party(?P<rest>.*)", re.IGNORECASE)
+# "(DFL)" is the recorded Minnesota label for the Democratic affiliate (HOUSEMN2-26-D); it is
+# accepted only with "Democratic" and only for Minnesota districts.
+_KALSHI_PARTY_MEMBER_RE = re.compile(
+    r"a member of the (?P<party>[A-Za-z]+)(?P<affiliate> \(DFL\))? party(?P<rest>.*)", re.IGNORECASE
+)
 _KALSHI_NEGATED_PREDICATE_RE = re.compile(r"(?:not|never|no longer)\b", re.IGNORECASE)
 # K2 (synthetic control): "the <party> Party wins the <district> House <race|seat> in the
 # <year> election"
@@ -705,8 +709,29 @@ _KXHOUSERACE_TITLE_SCREEN_RE = re.compile(
 )
 
 
+# Per-district House series (HOUSE<ST><N>, KXHOUSE<ST><N>; event "<series>-26"). Recorded
+# suffixes are D, R, DEM and GOP (REP mirrors KXHOUSERACE). Suffix and title only corroborate
+# the party that the contract's own rules establish.
+_KALSHI_PER_DISTRICT_SERIES_RE = re.compile(r"(?:KX)?HOUSE(?P<st>[A-Z]{2})(?P<dist>\d{1,2}|AL)")
+_KALSHI_PER_DISTRICT_PREFIX_RE = re.compile(r"^(?:KX)?HOUSE[A-Z]{2}(?:\d{1,2}|AL)-")
+_KALSHI_PER_DISTRICT_SUFFIX_PARTY = {"D": "D", "DEM": "D", "R": "R", "REP": "R", "GOP": "R"}
+# Recorded titles: "Will Democratic win ...", "Will a Democrat win ...", "Will Democrats win ...".
+_KALSHI_PER_DISTRICT_TITLE_RE = re.compile(
+    r"Will (?P<party>Democratic|a Democrat|Democrats|Republican|a Republican|Republicans)"
+    r" win the House race for (?P<district>[A-Z]{2}-\S+)\?"
+)
+_KALSHI_PER_DISTRICT_TITLE_PARTY = {
+    "democratic": "D", "a democrat": "D", "democrats": "D",
+    "republican": "R", "a republican": "R", "republicans": "R",
+}
+# Classifies a non-major-party outcome for a specific rejection reason only.
+_KALSHI_RULES_MEMBER_PARTY_RE = re.compile(
+    r"\bis a member of the (?P<party>[A-Za-z]+)(?: \(DFL\))? party\b", re.IGNORECASE
+)
+
+
 def _parse_kalshi_house_rules(rules_primary: str) -> _HouseParse:
-    """Parse a KXHOUSERACE ``rules_primary``: (evidence, rejection reason, background sentences)."""
+    """Parse a Kalshi House ``rules_primary``: (evidence, rejection reason, background sentences)."""
     sentences = _split_sentences(rules_primary)
     frame = _KALSHI_DECISIVE_RE.fullmatch(sentences[0]) if sentences else None
     if frame is None:
@@ -733,6 +758,8 @@ def _parse_kalshi_house_rules(rules_primary: str) -> _HouseParse:
         party = _PARTY_CODES.get(member["party"].lower())
         if party is None:
             return None, "contradictory_party_winner_rules", []
+        if member["affiliate"] and (party != "D" or district[0] != "MN"):
+            return None, "unsupported_party_label", []
         if member["rest"]:
             return None, _unconsumed_reason(member["rest"]), []
         evidence = HouseResolutionEvidence(
@@ -845,6 +872,97 @@ def _corroborate_kxhouserace_contract(
 
     # Parent context corroborates; it never supplies the district.
     if any(ref != ticker_district for ref in _scan_district_references(f"{ev_title} {ev_subtitle}")):
+        return False, "mismatched_district", set()
+
+    return True, None, {CONTEST_YEAR}
+
+
+def _is_per_district_house_symbol(series: str, ticker: str, event_ticker: str) -> bool:
+    return bool(
+        _KALSHI_PER_DISTRICT_SERIES_RE.fullmatch(series)
+        or _KALSHI_PER_DISTRICT_PREFIX_RE.match(ticker)
+        or _KALSHI_PER_DISTRICT_PREFIX_RE.match(event_ticker)
+    )
+
+
+def _corroborate_per_district_house_contract(
+    m: dict[str, Any], ev: dict[str, Any]
+) -> tuple[bool, str | None, set[int]]:
+    """Corroborate a per-district House series market through its own decisive rules.
+
+    The claimed party outcome must be established by the complete decisive rules sentence; the
+    series, ticker suffix, title and parent event only corroborate party and district.
+    """
+    m_ticker = (m.get("ticker") or "").upper()
+    event_ticker = (ev.get("event_ticker") or ev.get("ticker") or "").upper()
+    m_event_ticker = (m.get("event_ticker") or "").upper()
+    m_series_ticker = (m.get("series_ticker") or "").upper()
+    ev_series_ticker = (ev.get("series_ticker") or "").upper()
+
+    series = _KALSHI_PER_DISTRICT_SERIES_RE.fullmatch(ev_series_ticker)
+    if series is None:
+        return False, "mismatched_market_event_relationship", set()
+    if m_series_ticker and m_series_ticker != ev_series_ticker:
+        return False, "mismatched_market_event_relationship", set()
+    if not m_event_ticker or m_event_ticker != event_ticker:
+        return False, "mismatched_market_event_relationship", set()
+    series_district = _normalise_district(series["st"], series["dist"])
+    if series_district is None:
+        return False, "lacks_us_jurisdiction", set()
+    if event_ticker != ev_series_ticker and not event_ticker.startswith(f"{ev_series_ticker}-"):
+        return False, "mismatched_market_event_relationship", set()
+    yr_str = event_ticker[len(ev_series_ticker) + 1:]
+    if not re.fullmatch(r"20[23]\d|[23]\d", yr_str):
+        return False, "lacks_2026_contest_year", set()
+    if (int(yr_str) if len(yr_str) == 4 else 2000 + int(yr_str)) != CONTEST_YEAR:
+        return False, "non_2026_primary_contest", set()
+    expected_prefix = f"{event_ticker}-"
+    if not m_ticker.startswith(expected_prefix):
+        return False, "mismatched_market_event_relationship", set()
+    m_suffix = m_ticker[len(expected_prefix):]
+
+    m_title = (m.get("title") or "").strip()
+    ev_title = (ev.get("title") or "").strip()
+    ev_subtitle = (ev.get("sub_title") or "").strip()
+    rules_primary = m.get("rules_primary") or ""
+    rules_secondary = m.get("rules_secondary") or ""
+
+    if _PRIMARY_CONTEST_RE.search(f"{m_title} {rules_primary} {ev_title} {ev_subtitle}"):
+        return False, "non_2026_primary_contest", set()
+    if _KXHOUSERACE_TITLE_SCREEN_RE.search(m_title):
+        return False, "not_party_winner_proposition", set()
+
+    # Decisive rules first: only they establish the outcome.
+    claimed = _KALSHI_RULES_MEMBER_PARTY_RE.search(rules_primary)
+    if claimed and claimed["party"].lower() not in _PARTY_CODES:
+        return False, "unsupported_party_outcome", set()
+    evidence, reason, background = _parse_kalshi_house_rules(rules_primary)
+    if evidence is None:
+        return False, reason, set()
+    if (evidence.state, evidence.district) != series_district:
+        return False, "mismatched_district", set()
+    background_reason = _check_background(
+        background + _split_sentences(rules_secondary),
+        _KALSHI_HOUSE_BACKGROUND,
+        _KALSHI_REVIEWED_BACKGROUND_SHAPES,
+    )
+    if background_reason:
+        return False, background_reason, set()
+
+    # Corroboration: suffix, title and parent must agree with the rules.
+    suffix_party = _KALSHI_PER_DISTRICT_SUFFIX_PARTY.get(m_suffix)
+    if suffix_party is None:
+        return False, "arbitrary_ticker_suffix", set()
+    if suffix_party != evidence.party:
+        return False, "contradictory_party_winner_rules", set()
+    title = _KALSHI_PER_DISTRICT_TITLE_RE.fullmatch(m_title)
+    if title is None:
+        return False, "not_party_winner_proposition", set()
+    if _KALSHI_PER_DISTRICT_TITLE_PARTY[title["party"].lower()] != evidence.party:
+        return False, "contradictory_party_winner_rules", set()
+    if _parse_house_district(title["district"]) != series_district:
+        return False, "mismatched_district", set()
+    if any(ref != series_district for ref in _scan_district_references(f"{ev_title} {ev_subtitle}")):
         return False, "mismatched_district", set()
 
     return True, None, {CONTEST_YEAR}
@@ -1060,6 +1178,13 @@ def is_2026_kalshi_market(
     # Bounded repair (S1-T5-F6): support KXHOUSERACE generic House contract family
     if m_series == "KXHOUSERACE" or m_ticker.startswith("KXHOUSERACE-") or event_ticker.startswith("KXHOUSERACE-"):
         corroborated, reason, years = _corroborate_kxhouserace_contract(m, ev)
+        if not corroborated:
+            return False, reason
+        structured = "house"
+        symbol_years = years
+    elif _is_per_district_house_symbol(m_series, m_ticker, event_ticker):
+        # Per-district House series: admitted only through their own decisive rules.
+        corroborated, reason, years = _corroborate_per_district_house_contract(m, ev)
         if not corroborated:
             return False, reason
         structured = "house"
