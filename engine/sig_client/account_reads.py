@@ -1,8 +1,9 @@
-"""Raw tournament account reads (A2-A): results, provenance and numeric-field status.
+"""Raw tournament account reads (A2-A, A2-B): results, provenance and numeric-field status.
 
 Engine-internal types for `SigRestClient.read_tournament_balance`,
-`read_tournament_positions` and `read_open_orders` (docs/design/account-state-contracts.md,
-sections 4 and 8). Nothing here is a `shared/` schema, and nothing converts a wire value
+`read_tournament_positions` and `read_open_orders` (A2-A), and `read_tournament_fills`,
+`read_tournament_pnl`, `read_tournament_settlements` and `read_order_fills` (A2-B)
+(docs/design/account-state-contracts.md, sections 4 and 8). Nothing here is a `shared/` schema, and nothing converts a wire value
 into Bellwether's domain units: every number stays the exact `Decimal` SIG sent.
 
 What a result shows, and what it does not:
@@ -27,17 +28,32 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from decimal import Decimal
 from enum import Enum
 from types import MappingProxyType
 
 from engine.sig_client.wire import (
+    EconomicCommandCoverage,
+    FillsCoverage,
     Order,
     OrderCoverage,
+    OrderFill,
+    OrderFillsCoverage,
+    OrderFillsPage,
     PositionLot,
     PositionsSummary,
     Tournament,
+    TournamentFill,
+    TournamentPnl,
     TournamentPosition,
+    TournamentSettlementEntry,
 )
+
+ProjectionCoverage = OrderCoverage | FillsCoverage | OrderFillsCoverage
+"""Projection coverage (`complete` always true, plus a checkpoint), as sent per page."""
+
+PageCoverage = ProjectionCoverage | EconomicCommandCoverage
+"""Any coverage object a page may carry, kept exactly as sent."""
 
 
 class ScopeEvidence(Enum):
@@ -59,7 +75,7 @@ class ScopeEvidence(Enum):
 
 
 class CoverageState(Enum):
-    """Whether a response carried projection coverage."""
+    """Whether a response carried coverage (projection or economic-command)."""
 
     NOT_APPLICABLE = "not applicable"  # the endpoint documents no coverage
     OMITTED = "omitted"  # documented as optional; SIG did not send it
@@ -117,7 +133,7 @@ class ReadProvenance:
     finished_utc: datetime
     page_index: int | None
     coverage_state: CoverageState
-    coverage: OrderCoverage | None
+    coverage: PageCoverage | None
     verification: VerificationUse
     verification_read: ReadProvenance | None
 
@@ -187,7 +203,9 @@ class MissingValuation:
 
 @dataclass(frozen=True)
 class UnvaluedHoldingsRead:
-    """The documented 409 from the positions read: holdings exist without valuations.
+    """The documented 409 from the positions or P&L read: holdings lack valuations.
+
+    `provenance.route` says which read returned it.
 
     `missing` holds the validated (exchange id, market id) pairs in the order SIG sent
     them, duplicates included. Market titles and settlement labels are dropped. Nothing
@@ -217,6 +235,85 @@ class OrdersWalk:
     """
 
     orders: tuple[Order, ...]
+    pages: tuple[PageRecord, ...]
+
+
+# --- A2-B results ----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FillsWalk:
+    """Every page of GET /tournaments/{slug}/portfolio/fills, newest first, or nothing.
+
+    Returned only when the last page reported `hasMore: false`, with no repeated cursor,
+    duplicate fill id or page-cap overrun, and no fill newer than the one before it,
+    across all pages. Each page's projection coverage is kept as sent, or recorded as
+    omitted. Units and denominations are unresolved (NUMERIC_FIELD_STATUS).
+    """
+
+    fills: tuple[TournamentFill, ...]
+    pages: tuple[PageRecord, ...]
+
+
+@dataclass(frozen=True)
+class PnlRead:
+    """A 200 from GET /tournaments/{slug}/portfolio/pnl, fields exactly as sent.
+
+    `pnl.totalAccountValue` is a candidate equity figure only (OQ-D1); no cash figure is
+    derived from it and no field is reconciled with any other read.
+    """
+
+    pnl: TournamentPnl
+    provenance: ReadProvenance
+
+
+@dataclass(frozen=True)
+class SettlementsWalk:
+    """Every page of GET /tournaments/{slug}/portfolio/settlements, or nothing.
+
+    Economic-command coverage can legitimately be incomplete: SIG documents
+    `coverage.complete` as false when its own history walk hit a 20-page budget. The walk
+    still reads every page SIG offers, keeps each page's `complete` as sent, and lists the
+    0-based indexes of the pages that reported false in `incomplete_pages`. `complete` is
+    True only when every page reported true, and never otherwise.
+    """
+
+    entries: tuple[TournamentSettlementEntry, ...]
+    pages: tuple[PageRecord, ...]
+    complete: bool
+    incomplete_pages: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        reported = []
+        for record in self.pages:
+            coverage = record.provenance.coverage
+            if not isinstance(coverage, EconomicCommandCoverage):
+                raise TypeError("every settlements page keeps its economic-command coverage")
+            if coverage.complete is not True:
+                reported.append(record.provenance.page_index)
+        if tuple(reported) != self.incomplete_pages:
+            raise ValueError("incomplete_pages must list exactly the pages reporting false")
+        if self.complete != (not self.incomplete_pages):
+            raise ValueError("complete is True exactly when no page reported false")
+
+
+@dataclass(frozen=True)
+class OrderFillsWalk:
+    """Every page of GET /orders/{id}/fills for one order, or nothing.
+
+    `echoed_tournament_id` is the order's tournament as SIG echoed it on every page; the
+    client checked that it is the configured tournament (a null or other value raises).
+    `total_quantity_filled` and `avg_fill_price` are SIG's lifetime totals for the whole
+    order, exactly as sent and identical on every page; they are not recomputed from
+    `fills`. An order with no fills is one page with no fills.
+    """
+
+    order_id: int
+    exchange_id: str
+    echoed_tournament_id: str
+    fills: tuple[OrderFill, ...]
+    total_quantity_filled: Decimal
+    avg_fill_price: Decimal | None
     pages: tuple[PageRecord, ...]
 
 
@@ -268,7 +365,25 @@ _ORDER_COVERAGE = (
     "coverage/properties"
 )
 
+_FILL = "#/components/schemas/Fill/properties"
+_FILLS_COVERAGE = (
+    "#/paths/~1tournaments~1{slug}~1portfolio~1fills/get/responses/200/content/"
+    "application~1json/schema/properties/coverage/properties"
+)
+_PNL = (
+    "#/paths/~1tournaments~1{slug}~1portfolio~1pnl/get/responses/200/content/"
+    "application~1json/schema/properties"
+)
+_SETTLEMENT = "#/components/schemas/TournamentSettlementEntry/properties"
+_ORDER_FILLS = (
+    "#/paths/~1orders~1{id}~1fills/get/responses/200/content/application~1json/schema/properties"
+)
+
 _POSITION_VALUE = "units and sign for a NO holding are undocumented"
+_PNL_VALUE = "meaning as equity or P&L for Bellwether; behaviour with stale or missing marks"
+_PNL_QUESTIONS = ("OQ-D1", "OQ-D3")
+_FILL_PRICE = "denomination (YES or held-side price) on REST; whether on the 0.005 grid; null"
+_FILL_QUANTITY = "unit and granularity"
 
 
 def _entry(
@@ -441,6 +556,174 @@ _ENTRIES: tuple[NumericFieldStatus, ...] = (
         "what it guarantees relative to balance, positions and other reads",
         ("A1-N1",),
     ),
+    # GET /tournaments/{slug}/portfolio/fills
+    _entry(TournamentFill, "id", f"{_FILL}/id", "the fill record id (an identifier)"),
+    _entry(TournamentFill, "orderId", f"{_FILL}/orderId", "the filled order's id, or null"),
+    _entry(
+        TournamentFill,
+        "price",
+        f"{_FILL}/price",
+        "a number or null; no description (YES-denominated is documented for realtime only)",
+        _FILL_PRICE,
+        ("OQ-W4", "OQ-W7"),
+    ),
+    _entry(
+        TournamentFill,
+        "quantity",
+        f"{_FILL}/quantity",
+        "outcome-signed fill quantity; negative values indicate the NO side",
+        _FILL_QUANTITY,
+        ("OQ-W4",),
+    ),
+    _entry(
+        FillsCoverage,
+        "projectedThroughSequence",
+        f"{_FILLS_COVERAGE}/projectedThroughSequence",
+        "latest trading-engine sequence reflected by the reporting projection, or null",
+        "what it guarantees relative to balance, positions and other reads",
+        ("A1-N1",),
+    ),
+    # GET /tournaments/{slug}/portfolio/pnl
+    _entry(
+        TournamentPnl,
+        "periodPnl",
+        f"{_PNL}/periodPnl",
+        "tournament-scoped; no description",
+        _PNL_VALUE,
+        _PNL_QUESTIONS,
+    ),
+    _entry(
+        TournamentPnl,
+        "unrealizedPnl",
+        f"{_PNL}/unrealizedPnl",
+        "tournament-scoped; no description",
+        _PNL_VALUE,
+        _PNL_QUESTIONS,
+    ),
+    _entry(
+        TournamentPnl,
+        "totalAccountValue",
+        f"{_PNL}/totalAccountValue",
+        "tournament-scoped; no description",
+        _PNL_VALUE,
+        _PNL_QUESTIONS,
+    ),
+    _entry(
+        TournamentPnl,
+        "totalHoldingsValue",
+        f"{_PNL}/totalHoldingsValue",
+        "tournament-scoped; no description",
+        _PNL_VALUE,
+        _PNL_QUESTIONS,
+    ),
+    _entry(
+        TournamentPnl,
+        "totalCostBasis",
+        f"{_PNL}/totalCostBasis",
+        "tournament-scoped; no description",
+        _PNL_VALUE,
+        _PNL_QUESTIONS,
+    ),
+    _entry(
+        TournamentPnl,
+        "roi",
+        f"{_PNL}/roi",
+        "return vs initial balance (period=all) or vs snapshot baseline",
+        f"scale (fraction or percent); {_PNL_VALUE}",
+        _PNL_QUESTIONS,
+    ),
+    _entry(
+        TournamentPnl,
+        "sharpe",
+        f"{_PNL}/sharpe",
+        "tournament-scoped; no description",
+        _PNL_VALUE,
+        _PNL_QUESTIONS,
+    ),
+    # GET /tournaments/{slug}/portfolio/settlements
+    _entry(
+        TournamentSettlementEntry,
+        "shares",
+        f"{_SETTLEMENT}/shares",
+        "a number or null; no description on the tournament row",
+        "sign and unit (the default-scope row's sign rule is not carried over)",
+        ("OQ-W5",),
+    ),
+    _entry(
+        TournamentSettlementEntry,
+        "avgEntryPrice",
+        f"{_SETTLEMENT}/avgEntryPrice",
+        "a number or null; no description",
+        "denomination (YES or held-side price)",
+        ("OQ-W5",),
+    ),
+    _entry(
+        TournamentSettlementEntry,
+        "costBasis",
+        f"{_SETTLEMENT}/costBasis",
+        "a number or null; no description",
+        _POSITION_VALUE,
+        ("OQ-W5",),
+    ),
+    _entry(
+        TournamentSettlementEntry,
+        "payout",
+        f"{_SETTLEMENT}/payout",
+        "cash credited to the tournament virtual balance (or 0 for losses)",
+        "when it is reflected in myBalance relative to positions",
+        ("A1-N3",),
+    ),
+    _entry(
+        TournamentSettlementEntry,
+        "realizedPnl",
+        f"{_SETTLEMENT}/realizedPnl",
+        "a number or null; no description",
+        _POSITION_VALUE,
+        ("OQ-W5",),
+    ),
+    # GET /orders/{id}/fills
+    _entry(OrderFillsPage, "orderId", f"{_ORDER_FILLS}/orderId", "the order id (an identifier)"),
+    _entry(
+        OrderFillsPage,
+        "totalQuantityFilled",
+        f"{_ORDER_FILLS}/totalQuantityFilled",
+        "exact outcome-signed filled quantity for the whole order; negative indicates NO",
+        _FILL_QUANTITY,
+        ("OQ-W4",),
+    ),
+    _entry(
+        OrderFillsPage,
+        "avgFillPrice",
+        f"{_ORDER_FILLS}/avgFillPrice",
+        "exact average fill price for the whole order, or null before the first fill",
+        _FILL_PRICE,
+        ("OQ-W4", "OQ-W7"),
+    ),
+    _entry(OrderFill, "id", f"{_ORDER_FILLS}/data/items/properties/id", "the fill record id"),
+    _entry(
+        OrderFill,
+        "price",
+        f"{_ORDER_FILLS}/data/items/properties/price",
+        "a number or null; no description",
+        _FILL_PRICE,
+        ("OQ-W4", "OQ-W7"),
+    ),
+    _entry(
+        OrderFill,
+        "quantity",
+        f"{_ORDER_FILLS}/data/items/properties/quantity",
+        "outcome-signed fill quantity; negative values indicate the NO side",
+        _FILL_QUANTITY,
+        ("OQ-W4",),
+    ),
+    _entry(
+        OrderFillsCoverage,
+        "projectedThroughSequence",
+        f"{_ORDER_FILLS}/coverage/properties/projectedThroughSequence",
+        "latest trading-engine sequence reflected by the reporting projection, or null",
+        "what it guarantees relative to balance, positions and other reads",
+        ("A1-N1",),
+    ),
 )
 
 
@@ -455,7 +738,7 @@ def _index(entries: tuple[NumericFieldStatus, ...]) -> Mapping[tuple[str, str], 
 
 
 NUMERIC_FIELD_STATUS: Mapping[tuple[str, str], NumericFieldStatus] = _index(_ENTRIES)
-"""(wire model name, field name) -> status, for every numeric field the A2-A reads expose."""
+"""(wire model name, field name) -> status, for every numeric field the A2 reads expose."""
 
 
 def numeric_field_status(model: type | str, field: str) -> NumericFieldStatus:

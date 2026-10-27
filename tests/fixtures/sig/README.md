@@ -25,6 +25,14 @@ Their numbers are placeholders chosen for type and nullability. They say nothing
 the units, denomination or sign conventions SIG uses (OQ-W5), and nothing about the
 account.
 
+The A2-B reads have never been captured either: `tournament_fills.json`,
+`tournament_pnl.json`, `tournament_settlements.json` and `order_fills.json` are synthetic
+too, built from the spec's examples plus placeholders. The tests derive multi-page,
+incomplete-coverage and malformed variants from them in code. Like the positions
+fixtures, they say nothing about SIG's fill, P&L or settlement units (OQ-W4, OQ-W5,
+OQ-W7, OQ-D1) or about the account, and no A2-B read is validated against a real SIG
+response.
+
 ## Fixtures derived from recorded responses: `recorded/<run id>/`
 
 Each directory comes from one genuine, read-only capture made with

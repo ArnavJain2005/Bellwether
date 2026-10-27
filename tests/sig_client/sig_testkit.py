@@ -95,6 +95,16 @@ class Router:
             f"{API}/tournaments/alpha-tournament/portfolio/positions": json_response(
                 200, fixture("tournament_positions")
             ),
+            f"{API}/tournaments/alpha-tournament/portfolio/fills": json_response(
+                200, fixture("tournament_fills")
+            ),
+            f"{API}/tournaments/alpha-tournament/portfolio/pnl": json_response(
+                200, fixture("tournament_pnl")
+            ),
+            f"{API}/tournaments/alpha-tournament/portfolio/settlements": json_response(
+                200, fixture("tournament_settlements")
+            ),
+            f"{API}/orders/1001/fills": json_response(200, fixture("order_fills")),
         }
         self.routes.update(overrides or {})
 
