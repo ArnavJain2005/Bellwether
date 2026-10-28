@@ -58,7 +58,9 @@ from engine.sig_client.wire import TournamentMarket
 
 QUIET = RealtimeFeedPolicy(tick_s=1e6)  # the timer never fires within these tests
 INTERVAL = 60.0  # test value only
-SWEEP = SweepPolicy(interval_s=INTERVAL, deadline_s=10.0, max_pages=3)  # test values only
+SWEEP = SweepPolicy(  # test values only
+    interval_s=INTERVAL, deadline_s=10.0, max_pages=3, pages_per_window=10
+)
 MARKETS_ROUTE = f"/api/v1/tournaments/{TOURNAMENT.slug}/markets"
 MARKETS = f"/tournaments/{TOURNAMENT.slug}/markets"
 DETAIL_ROUTE = f"/api/v1/markets/{MARKET}"
@@ -97,6 +99,8 @@ class Listing:
         self.requests: list[httpx.Request] = []
         self.waiting: list[asyncio.Future[None]] = []
         self.cancelled = 0
+        self.clock: Any = None  # set to a ManualClock to record request times
+        self.times: list[float] = []
 
     def body(self, index: int) -> dict[str, Any]:
         last = index == len(self.pages) - 1
@@ -112,6 +116,8 @@ class Listing:
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
+        if self.clock is not None:
+            self.times.append(self.clock())
         cursor = request.url.params.get("cursor")
         index = 0 if cursor is None else int(cursor[1:])
         if index in self.held:
@@ -198,6 +204,7 @@ def test_sweep_is_disabled_by_default() -> None:
         for _ in range(5):
             await h.clock.advance(3600.0 / 5)
         assert h.count(MARKETS) == 0 and walks(h) == 0
+        assert h.feed._sweep_gate is None  # no sweep budget is taken either
         assert h.feed.readiness(MARKET).sweep is None
         assert h.feed.is_ready(MARKET)
         await h.stop()
@@ -212,6 +219,8 @@ def test_sweep_policy_has_no_defaults() -> None:
         SweepPolicy()  # type: ignore[call-arg]
     with pytest.raises(TypeError):
         SweepPolicy(interval_s=60.0)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):  # the page budget is explicit too
+        SweepPolicy(interval_s=60.0, deadline_s=10.0, max_pages=3)  # type: ignore[call-arg]
 
 
 @pytest.mark.parametrize(
@@ -229,10 +238,15 @@ def test_sweep_policy_has_no_defaults() -> None:
         {"max_pages": 51},
         {"max_pages": 2.0},
         {"max_pages": True},
+        {"pages_per_window": 0},
+        {"pages_per_window": 1.5},
+        {"pages_per_window": True},
     ],
 )
 def test_sweep_policy_rejects_invalid_values(kwargs: dict[str, Any]) -> None:
-    values: dict[str, Any] = {"interval_s": 60.0, "deadline_s": 10.0, "max_pages": 3}
+    values: dict[str, Any] = {
+        "interval_s": 60.0, "deadline_s": 10.0, "max_pages": 3, "pages_per_window": 10
+    }
     with pytest.raises(ValueError):
         SweepPolicy(**{**values, **kwargs})
 
@@ -420,25 +434,135 @@ def test_open_listing_never_resolves_unknown_history() -> None:
 # --- a market absent from a complete list --------------------------------------------------
 
 
-def test_absent_market_is_recorded_and_changes_nothing(caplog: pytest.LogCaptureFixture) -> None:
-    """No documented rule says what absence means (decision D-7): neither open nor closed
-    is inferred. The observation records it; no instance, generation or event changes."""
+def test_absent_ready_market_gets_an_open_lifecycle_unknown_blocker(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """M2-B2-F1: no documented rule says what absence from a complete status=any list
+    means (Q16). Fail closed without inferring a status: an open LIFECYCLE_UNKNOWN blocks
+    the market, which is NOT_READY, not QUARANTINED (nothing says it closed)."""
     listing = Listing([row("101", "closed"), row("102")])
 
     async def scenario(h: Harness) -> None:
         await ready_market(h)
-        before = h.ledger.instances(MARKET), h.ledger.generation(MARKET)
-        events = len(h.events)
+        generation = h.ledger.generation(MARKET)
+        mark = len(h.observed)
         with caplog.at_level(logging.WARNING, logger=LOGGER):
             await h.clock.advance(INTERVAL)
-        assert (h.ledger.instances(MARKET), h.ledger.generation(MARKET)) == before
-        assert h.events[events:] == []
-        observation = h.feed.readiness(MARKET).sweep
-        assert observation is not None and not observation.listed
+        (blocker,) = found(h, StaleReason.LIFECYCLE_UNKNOWN)
+        assert blocker.state is InstanceState.OPEN
+        assert found(h, StaleReason.LIFECYCLE_NOT_OPEN) == []  # not read as closed
+        observation = blocker.evidence[-1].observation
+        assert isinstance(observation, SweepObservation) and not observation.listed
         assert observation.status is None and observation.settled_with is None
+        assert blocker.missing == ("Q16", "D-7")
+        assert h.ledger.generation(MARKET) == generation + 1
+        assert h.observed[mark] == ("MarketStale", False)
+        assert h.events[-1] == MarketStale(MARKET, StaleReason.LIFECYCLE_UNKNOWN)
+        result = h.feed.readiness(MARKET)
+        assert result.status is ReadinessStatus.NOT_READY and not h.feed.is_ready(MARKET)
+        assert any(line.startswith("lifecycle unknown: absent") for line in result.reasons)
         assert any("absent from the complete market list" in r.getMessage()
                    for r in caplog.records)
-        assert h.feed.is_ready(MARKET)  # unchanged: absence is not read as anything
+        await h.stop()
+
+    run(scenario, harness(listing))
+
+
+def test_lifecycle_unknown_is_never_cleared_by_a_later_open_row() -> None:
+    """A later walk listing the market `open`, more absences, book resyncs and an `open`
+    market-detail read leave the one instance open: no clearing, no MarketReady."""
+    listing = Listing([row("101")])
+
+    async def scenario(h: Harness) -> None:
+        await ready_market(h)
+        await h.clock.advance(INTERVAL)  # absent
+        (blocker,) = found(h, StaleReason.LIFECYCLE_UNKNOWN)
+        generation = h.ledger.generation(MARKET)
+        await h.clock.advance(INTERVAL)  # absent again: no second instance
+        assert len(found(h, StaleReason.LIFECYCLE_UNKNOWN)) == 1
+        assert h.ledger.generation(MARKET) == generation
+        listing.pages = [[row("101"), row(MARKET, "open")]]
+        await h.clock.advance(INTERVAL)  # listed open now
+        h.transport.subscribed(h.topic())  # a re-join, a resync, a detail read
+        await h.clock.advance(5.0)
+        assert walks(h) == 3
+        assert found(h, StaleReason.LIFECYCLE_UNKNOWN) == [blocker]
+        assert h.feed.readiness(MARKET).sweep.status == "open"
+        assert not h.feed.is_ready(MARKET) and readies(h) == 1
+        await h.stop()
+
+    run(scenario, harness(listing))
+
+
+def test_absent_and_closed_markets_are_withdrawn_after_every_ledger_change() -> None:
+    markets = (MARKET, "27")
+    listing = Listing([row("27", "closed")])
+    seen: list[dict[str, bool]] = []
+
+    async def scenario(h: Harness) -> None:
+        h.router.routes["/api/v1/markets/27/orderbook"] = json_response(
+            200, fixture("market_orderbook")
+        )
+        await h.start()
+        assert all(h.feed.is_ready(m) for m in markets)
+
+        def sink(event: Any) -> None:
+            if isinstance(event, MarketStale):
+                seen.append({m: h.feed.is_ready(m) for m in markets})
+
+        h.feed._sink = sink  # white-box: observe every market during each callback
+        await h.clock.advance(INTERVAL)
+        assert seen == [{MARKET: False, "27": False}] * 2
+        assert h.feed.readiness(MARKET).status is ReadinessStatus.NOT_READY
+        assert h.feed.readiness("27").status is ReadinessStatus.QUARANTINED
+        await h.stop()
+
+    run(scenario, harness(listing, market_ids=markets))
+
+
+def test_absence_in_a_superseded_walk_still_blocks() -> None:
+    listing = Listing([row("101")], held=frozenset({0}))
+
+    async def scenario(h: Harness) -> None:
+        await ready_market(h)
+        await h.clock.advance(INTERVAL)
+        assert listing.pending() == 1
+        h.transport.batch(h.topic(), batch(1, 0))
+        h.transport.batch(h.topic(), batch(5, 4))  # a gap raises the generation
+        await settle()
+        listing.release()
+        await settle()
+        assert found(h, StaleReason.LIFECYCLE_UNKNOWN)[0].state is InstanceState.OPEN
+        assert not h.feed.readiness(MARKET).sweep.current
+        await h.stop()
+
+    run(scenario, harness(listing))
+
+
+def test_control_partial_walk_omitting_the_market_applies_nothing() -> None:
+    """Absence counts only in a complete walk: page 1 omits the market, page 2 fails."""
+    listing = Listing([row("101")], [row(MARKET)], responses={1: _not_found()})
+
+    async def scenario(h: Harness) -> None:
+        await ready_market(h)
+        before = ledger_state(h)
+        await h.clock.advance(INTERVAL)
+        assert len(listing.requests) == 2
+        assert ledger_state(h) == before and h.feed.is_ready(MARKET)
+        await h.stop()
+
+    run(scenario, harness(listing))
+
+
+def test_control_listed_open_market_gets_no_absence_blocker() -> None:
+    listing = Listing([row("101")], [row(MARKET, "open")])
+
+    async def scenario(h: Harness) -> None:
+        await ready_market(h)
+        before = h.ledger.instances(MARKET), h.ledger.generation(MARKET)
+        await h.clock.advance(INTERVAL)
+        assert (h.ledger.instances(MARKET), h.ledger.generation(MARKET)) == before
+        assert h.feed.readiness(MARKET).sweep.listed and h.feed.is_ready(MARKET)
         await h.stop()
 
     run(scenario, harness(listing))
@@ -623,7 +747,9 @@ def test_complete_walk_reaching_the_step_after_closing_began_is_dropped() -> Non
 
 
 def test_repeated_schedule_is_a_fixed_delay_and_walks_never_overlap() -> None:
-    long_deadline = SweepPolicy(interval_s=INTERVAL, deadline_s=500.0, max_pages=3)
+    long_deadline = SweepPolicy(
+        interval_s=INTERVAL, deadline_s=500.0, max_pages=3, pages_per_window=10
+    )
     listing = Listing([row(MARKET)], held=frozenset({0}))
 
     async def scenario(h: Harness) -> None:
@@ -676,9 +802,9 @@ def test_retry_after_is_a_floor_on_the_next_walk() -> None:
     run(scenario, harness(listing))
 
 
-def test_pages_use_the_shared_limiter_and_not_the_recovery_or_resync_gates() -> None:
+def test_pages_use_the_sweep_gate_and_shared_limiter_not_recovery_or_resync() -> None:
     listing = Listing([row("101")], [row("102")], [row(MARKET)])
-    counts = {"shared": 0, "recovery": 0, "resync": 0}
+    counts = {"shared": 0, "sweep": 0, "recovery": 0, "resync": 0}
 
     async def scenario(h: Harness) -> None:
         await ready_market(h)
@@ -698,9 +824,13 @@ def test_pages_use_the_shared_limiter_and_not_the_recovery_or_resync_gates() -> 
         feed._resync_gate.acquire = counting(  # type: ignore[method-assign]
             "resync", feed._resync_gate.acquire
         )
+        assert feed._sweep_gate is not None
+        feed._sweep_gate.acquire = counting(  # type: ignore[method-assign]
+            "sweep", feed._sweep_gate.acquire
+        )
         await h.clock.advance(INTERVAL)
         assert len(listing.requests) == 3
-        assert counts == {"shared": 3, "recovery": 0, "resync": 0}
+        assert counts == {"shared": 3, "sweep": 3, "recovery": 0, "resync": 0}
         await h.stop()
 
     run(scenario, harness(listing))
@@ -721,3 +851,71 @@ def test_detail_route_is_untouched_by_the_sweep() -> None:
     h = harness(listing)
     h.router.routes[DETAIL_ROUTE] = json_response(200, market_detail(MARKET))
     run(scenario, h)
+
+
+# --- the sweep's own page budget (M2-B2-F1) ------------------------------------------------
+
+
+def test_page_budget_bounds_a_fast_sweep_and_leaves_shared_capacity() -> None:
+    """A short interval and many pages: the sweep starts at most `pages_per_window` page
+    reads in any rolling 60 s, so a recovery read is admitted at once (at 674091a the same
+    sweep took 77 of the 80 shared reads in 2 s and the recovery read waited 60 s)."""
+    fast = SweepPolicy(interval_s=1.0, deadline_s=600.0, max_pages=50, pages_per_window=10)
+    pages = [[row(str(1000 + i))] for i in range(49)] + [[row(MARKET)]]
+    listing = Listing(*pages)
+
+    async def scenario(h: Harness) -> None:
+        listing.clock = h.clock
+        await ready_market(h)
+        await h.clock.advance(2.0)
+        assert 0 < len(listing.requests) <= 10
+        t0 = h.clock()
+        details = h.count(f"/markets/{MARKET}")
+        h.transport.batch(h.topic(), batch(1, 0))
+        h.transport.batch(h.topic(), batch(5, 4))  # a gap: a recovery read is wanted now
+        await settle()
+        assert h.count(f"/markets/{MARKET}") == details + 1 and h.clock() == t0
+        for _ in range(6):
+            await h.clock.advance(60.0)
+        times = listing.times
+        assert len(times) > 20  # the sweep kept walking ...
+        assert max(sum(1 for t in times if start <= t < start + 60.0) for start in times) <= 10
+        assert h.task is not None and not h.task.done()
+        await h.stop()
+
+    run(scenario, harness(listing, sweep=fast))
+
+
+@pytest.mark.parametrize(("pages", "accepted"), [(29, True), (30, False), (500, False)])
+def test_feed_refuses_a_page_budget_that_leaves_no_shared_capacity(
+    pages: int, accepted: bool
+) -> None:
+    """With the default gates (40 resyncs and 10 recovery starts a minute) and the shared
+    80-read limit, the sweep may take at most 29: the gated starts stay below the limit."""
+    policy = SweepPolicy(interval_s=60.0, deadline_s=10.0, max_pages=3, pages_per_window=pages)
+    if accepted:
+        Harness(policy=QUIET, sweep=policy)
+    else:
+        with pytest.raises(ValueError, match="no shared read capacity"):
+            Harness(policy=QUIET, sweep=policy)
+
+
+def test_page_admission_past_the_walk_deadline_fails_the_walk() -> None:
+    """One page per window and a 10 s deadline: page 2 cannot be admitted in time, so the
+    walk fails at once (the gate knows the wait passes the deadline) and page 1's `closed`
+    row is never applied; the next walk starts one interval after that failure."""
+    tight = SweepPolicy(interval_s=INTERVAL, deadline_s=10.0, max_pages=3, pages_per_window=1)
+    listing = Listing([row(MARKET, "closed")], [row("102")])
+
+    async def scenario(h: Harness) -> None:
+        await ready_market(h)
+        before = ledger_state(h)
+        await h.clock.advance(INTERVAL)
+        assert len(listing.requests) == 1
+        assert ledger_state(h) == before and h.feed.is_ready(MARKET)
+        await h.clock.advance(INTERVAL)  # failed at once, so the next walk is due now
+        assert walks(h) == 2 and len(listing.requests) == 2
+        assert ledger_state(h) == before and h.feed.is_ready(MARKET)
+        await h.stop()
+
+    run(scenario, harness(listing, sweep=tight))

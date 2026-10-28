@@ -92,10 +92,12 @@ the recovery gate nor the resync gate. A walk that fails, hits its page cap or d
 is cancelled, or completes after closing began applies nothing. A complete walk is applied
 by one synchronous step: a market listed `settled` or `closed` is quarantined with
 LIFECYCLE_NOT_OPEN (current or superseded, as for a lifecycle read) and its readiness is
-withdrawn; a market listed `open` changes nothing; a market absent from the list changes
-nothing and is logged, because no documented rule says what absence means. The sweep
-never confirms or clears a blocker, never provides bootstrap evidence and never publishes
-MarketReady.
+withdrawn; a market listed `open` changes nothing; a market absent from the list gets an
+open LIFECYCLE_UNKNOWN blocker and its readiness is withdrawn, because no documented rule
+says what absence means (it is read as neither open nor closed). The sweep never confirms
+or clears a blocker, never provides bootstrap evidence and never publishes MarketReady.
+Its own page gate (SweepPolicy.pages_per_window) admits each page before the shared
+limiter, and the feed refuses a policy whose gated reads leave no shared capacity.
 
 Readiness: `readiness(market_id)` returns a MarketReadiness (readiness.py) explaining
 every failing condition; `is_ready(market_id)` is exactly `readiness(...).status is
@@ -528,6 +530,9 @@ class RealtimeMarketFeed:
             clock=clock,
             sleep=sleep,
         )
+        self._sweep_gate: RateLimiter | None = None
+        if sweep is not None:
+            self._sweep_gate = self._sweep_budget(sweep, rest.limiter)
         self._attempt_ids = 0
         self._endpoint: RealtimeEndpoint | None = None
         self._expires_mono: float | None = None
@@ -1214,6 +1219,37 @@ class RealtimeMarketFeed:
 
     # --- lifecycle sweep (M2-B2, design 9.3, AT-26; opt-in) ---------------------------
 
+    def _sweep_budget(self, sweep: SweepPolicy, shared: RateLimiter) -> RateLimiter:
+        """The sweep's page gate, after checking that the feed's gated read starts leave
+        capacity in the shared account limiter for every other reader.
+
+        Per window of the shared limiter, the resync gate, the recovery gate and the sweep
+        gate together may start at most `demand` reads; it must stay strictly below the
+        shared read limit. This bounds logical starts only (see SweepPolicy).
+        """
+        window = shared.window
+        demand = (
+            sweep.pages_per_window
+            + math.ceil(self._policy.resync_reads_per_minute * window / 60.0)
+            + math.ceil(
+                self._recovery.attempts_per_window * window / self._recovery.attempt_window_s
+            )
+        )
+        limit = shared.limit(RequestKind.READ)
+        if demand >= limit:
+            raise ValueError(
+                f"the sweep page budget leaves no shared read capacity: resyncs, recovery "
+                f"attempts and sweep pages may start {demand} reads per {window:g} s, and "
+                f"the shared limiter admits {limit}"
+            )
+        return RateLimiter(
+            read_limit=sweep.pages_per_window,
+            write_limit=1,
+            window=window,
+            clock=self._clock,
+            sleep=self._sleep,
+        )
+
     async def _sweep_loop(self, policy: SweepPolicy) -> None:
         """One walk at a time: each starts `interval_s` after the feed started or the
         previous walk ended (fixed delay), never earlier than SIG's Retry-After."""
@@ -1238,12 +1274,22 @@ class RealtimeMarketFeed:
         deadline = started + policy.deadline_s
         # Each market's generation at the start: a change during the walk supersedes it.
         generations = {market_id: self._ledger.generation(market_id) for market_id in self._markets}
+        gate = self._sweep_gate
+        assert gate is not None
+
+        async def admit_page() -> None:
+            # The sweep's own page budget, before the shared limiter (SweepPolicy).
+            await gate.acquire(RequestKind.READ, deadline=deadline)
+
         try:
             async with asyncio.timeout(policy.deadline_s) as scope:
                 timer = self._spawn(self._deadline(deadline, scope))
                 try:
                     rows = await self._rest.list_all_tournament_markets(
-                        status="any", page_limit=MARKETS_PAGE_MAX, max_pages=policy.max_pages
+                        status="any",
+                        page_limit=MARKETS_PAGE_MAX,
+                        max_pages=policy.max_pages,
+                        before_page=admit_page,
                     )
                 finally:
                     timer.cancel()
@@ -1290,36 +1336,37 @@ class RealtimeMarketFeed:
         by_id = {row.id: row for row in rows}
         # 2-5 for every market first, so that every withdrawal below is already in effect
         # when the first callback runs.
-        restricted = []
+        restricted: list[tuple[_Market, StaleReason]] = []
         absent = []
         for market_id, market in self._markets.items():
             row = by_id.get(market_id)
             if row is None:
                 absent.append(market_id)
-            if self._ledger.apply_listing(
+            added = self._ledger.apply_listing(
                 market_id,
                 sweep_id=sweep_id,
                 generation=generations[market_id],
                 row=row,
                 walk_started_mono=started,
                 walk_finished_mono=finished,
-            ):
-                restricted.append(market)
+            )
+            if added is not None:
+                restricted.append((market, added))
         if absent:
-            # [client policy] No documented rule says what absence from a complete list
-            # means (D-7), so it is recorded, not read as open or as closed.
+            # No documented rule says what absence from a complete status=any list means
+            # (Q16): the market is blocked with LIFECYCLE_UNKNOWN, not read as open or closed.
             logger.warning(
                 "realtime lifecycle sweep %s: %d market(s) absent from the complete market "
-                "list (%s); recorded, nothing changed",
+                "list (%s); lifecycle unknown, blocked",
                 sweep_id,
                 len(absent),
                 ", ".join(absent),
             )
-        logger.info("realtime lifecycle sweep %s applied: %d market(s) quarantined", sweep_id,
+        logger.info("realtime lifecycle sweep %s applied: %d market(s) restricted", sweep_id,
                     len(restricted))
         # 6. At most a withdrawal; MarketReady comes only from the orderbook-resync path.
-        for market in restricted:
-            self._set_stale(market, StaleReason.LIFECYCLE_NOT_OPEN)
+        for market, reason in restricted:
+            self._set_stale(market, reason)
 
     # --- token lifecycle ----------------------------------------------------------------
 
@@ -1448,6 +1495,11 @@ def _instance_reason(instance: BlockerInstance) -> str:
         return (
             f"history unknown: no retained blocker history ({instance.instance_id}); "
             f"missing {missing}"
+        )
+    if reason is StaleReason.LIFECYCLE_UNKNOWN:
+        return (
+            f"lifecycle unknown: absent from a complete market list ({instance.instance_id}); "
+            f"read as neither open nor closed, and nothing clears it; missing {missing}"
         )
     if instance.state is InstanceState.QUARANTINED:
         return (

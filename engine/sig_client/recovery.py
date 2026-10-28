@@ -54,8 +54,9 @@ the complete tournament market list and the ledger applies each market's row wit
 same quarantined LIFECYCLE_NOT_OPEN as a lifecycle read, whether the walk is current or
 superseded. A listing never confirms a settlement, never clears anything, never counts as
 bootstrap initial-state evidence and never touches the market-detail observation. A
-market absent from a complete walk changes nothing: no documented rule says what absence
-means, so it is only recorded (decision D-7 in the PR, not adopted here).
+market absent from a complete walk gets an open LIFECYCLE_UNKNOWN (at most one open at a
+time): its status is unknown, so it is neither quarantined as closed nor treated as open,
+and nothing in this slice clears it, including a later walk listing it `open` (Q16, D-7).
 
 Labels are kept exactly as sent and are never logged (they are response data).
 """
@@ -100,6 +101,9 @@ MISSING: dict[StaleReason, tuple[str, ...]] = {
     # the unseen trade's own time does not bound what else that range carried) and whether
     # batches are re-sent (Q14).
     StaleReason.REVISION_ANOMALY: ("Q3", "Q4", "Q6", "Q7", "Q8", "Q14"),
+    # What absence from a complete status=any list means (Q16) and whether anything may
+    # ever clear the blocker (D-7).
+    StaleReason.LIFECYCLE_UNKNOWN: ("Q16", "D-7"),
 }
 WINDOW_MISSING: tuple[str, ...] = ("D-1", "Q7", "Q10", "Q14")
 
@@ -353,22 +357,33 @@ class SweepPolicy:
     - `max_pages`: the walk's page cap, at most DEFAULT_MAX_PAGES (50). Pages are requested
       at the documented maximum of 100 markets, so 237 markets need 3 pages. A walk that
       would need more fails with no partial result.
+    - `pages_per_window`: the sweep's own page budget. A feed-wide sweep gate admits at
+      most this many page reads in any rolling window of the shared account limiter
+      (60 s), before each page asks the shared limiter itself. A page whose gate
+      admission cannot come before the walk's deadline fails the walk.
 
-    Cost: one walk is at most `max_pages` logical page reads, each of which may make
-    several HTTP attempts under the REST client's ReadRetryPolicy, every one admitted by
-    the shared account RateLimiter. The sweep uses neither the recovery gate nor the
-    resync gate, so their budgets are unchanged; like them, it reserves no account budget.
+    Cost and capacity: one walk is at most `max_pages` page reads, and the sweep starts
+    at most `pages_per_window` page reads per window, however short `interval_s` is.
+    The feed refuses a policy unless its gated starts per window (orderbook resyncs,
+    recovery attempts and sweep pages together) stay strictly below the shared limiter's
+    read limit, so at least that difference is left for every other reader, including
+    account reads. The gates count logical starts, not HTTP attempts: each page may still
+    make several attempts under the REST client's ReadRetryPolicy, every one admitted by
+    the shared limiter, which has no priorities and reserves nothing. How much of the
+    budget the sweep should get is Arnav's allocation; no value is chosen here.
     """
 
     interval_s: float
     deadline_s: float
     max_pages: int
+    pages_per_window: int
 
     def __post_init__(self) -> None:
         check_positive_seconds("interval_s", self.interval_s)
         check_positive_seconds("deadline_s", self.deadline_s)
         if check_positive_int("max_pages", self.max_pages) > DEFAULT_MAX_PAGES:
             raise ValueError(f"max_pages must be at most {DEFAULT_MAX_PAGES}")
+        check_positive_int("pages_per_window", self.pages_per_window)
 
 
 def bounded_jitter(delay: float, jittered: object) -> float:
@@ -772,16 +787,21 @@ class RecoveryLedger:
         row: TournamentMarket | None,
         walk_started_mono: float,
         walk_finished_mono: float,
-    ) -> bool:
+    ) -> StaleReason | None:
         """Apply one market's row from a complete sweep walk that passed the feed's guard.
 
-        Restriction only (design 4.6, steps 2-5, without confirmation): a row showing
-        `settled` or `closed` adds a quarantined LIFECYCLE_NOT_OPEN unless the market
-        already has one, whether the walk is current or superseded, and then raises the
-        generation once. A row showing `open`, or no row (`row` None: absent from the
-        complete list), changes no instance. Nothing confirms or clears an instance, and the
+        Restriction only (design 4.6, steps 2-5, without confirmation), whether the walk
+        is current or superseded:
+        - a row showing `settled` or `closed` adds a quarantined LIFECYCLE_NOT_OPEN unless
+          the market already has one;
+        - no row (`row` None: absent from the complete list) adds an *open*
+          LIFECYCLE_UNKNOWN unless one is already open. Absence is read as neither open nor
+          closed, so the market is blocked but not quarantined;
+        - a row showing `open` changes no instance.
+        The generation is raised once if an instance was added. Nothing confirms or clears
+        an instance (a later `open` row leaves LIFECYCLE_UNKNOWN open), and the
         market-detail observation and bootstrap initial-state evidence are untouched.
-        Returns True if an instance was added.
+        Returns the reason of the instance added, or None.
         """
         record = self._record(market_id)
         observation = SweepObservation(
@@ -795,18 +815,42 @@ class RecoveryLedger:
             walk_started_mono=walk_started_mono,
             walk_finished_mono=walk_finished_mono,
         )
-        restrict = observation.status in ("settled", "closed") and not any(
+        added: StaleReason | None = None
+        if observation.status in ("settled", "closed") and not any(
             i.reason is StaleReason.LIFECYCLE_NOT_OPEN and i.state is InstanceState.QUARANTINED
             for i in record.instances
-        )
-        if restrict:
+        ):
             self._add_quarantined_not_open(
                 record, observation, walk_finished_mono, f"market list shows {observation.status}"
             )
+            added = StaleReason.LIFECYCLE_NOT_OPEN
+        elif not observation.listed and not any(
+            i.reason is StaleReason.LIFECYCLE_UNKNOWN and i.state is InstanceState.OPEN
+            for i in record.instances
+        ):
+            instance = _Instance(
+                instance_id=self._next_id("B"),
+                reason=StaleReason.LIFECYCLE_UNKNOWN,
+                state=InstanceState.OPEN,
+                raised_mono=walk_finished_mono,
+                raised_seq=self.next_seq(),
+                generation=record.generation,
+                revisions=None,
+                item=None,
+            )
+            instance.evidence.append(
+                Evidence(
+                    observation,
+                    "absent from a complete market list (status=any); read as neither open "
+                    "nor closed, and nothing clears it (Q16, D-7)",
+                )
+            )
+            record.instances.append(instance)
+            added = StaleReason.LIFECYCLE_UNKNOWN
         record.sweep = observation
-        if restrict:
+        if added is not None:
             record.generation += 1
-        return restrict
+        return added
 
     def _add_quarantined_not_open(
         self,

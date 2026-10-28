@@ -886,19 +886,25 @@ class SigRestClient:
         search: str | None = None,
         page_limit: int = MARKETS_PAGE_MAX,
         max_pages: int = DEFAULT_MAX_PAGES,
+        before_page: Callable[[], Awaitable[None]] | None = None,
     ) -> list[TournamentMarket]:
         """Every market in the tournament, or an error. Never a partial list.
 
         Each page has its own read deadline; there is no deadline for the whole list.
+        `before_page`, if given, is awaited before each page is requested (a caller's own
+        admission gate); an exception from it ends the walk with no partial result.
         """
         path = f"/tournaments/{_segment(self._config.tournament.slug)}/markets"
-        return await self._collect(
-            path,
-            lambda cursor: self.list_tournament_markets_page(
+
+        async def fetch(cursor: str | None) -> TournamentMarketsPage:
+            if before_page is not None:
+                await before_page()
+            return await self.list_tournament_markets_page(
                 limit=page_limit, cursor=cursor, status=status, search=search
-            ),
-            max_pages=max_pages,
-            key=lambda market: market.id,
+            )
+
+        return await self._collect(
+            path, fetch, max_pages=max_pages, key=lambda market: market.id
         )
 
     async def get_market(self, market_id: str) -> Market:

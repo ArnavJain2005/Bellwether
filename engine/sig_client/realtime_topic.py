@@ -138,13 +138,16 @@ class StaleReason(StrEnum):
     # (step 4): its original was discarded, revisions went backwards, the id was evicted,
     # or a replacement feed's topic, whose memory starts empty, never saw it.
     REVISION_ANOMALY = "duplicate batch carried an unseen trade id"
+    # M2-B2: a complete lifecycle-sweep walk (status=any) did not list the market, so its
+    # lifecycle status is unknown. Neither open nor closed is inferred from the absence.
+    LIFECYCLE_UNKNOWN = "market absent from a complete market list"
 
 
 # Recovery that an orderbook read cannot provide: settlement needs the market state, a
 # null-sequence trade needs the trade tape (steps 7 and 8), and a message whose arrays were
 # discarded or never seen may have hidden either, as may a duplicate carrying an unseen
-# trade id. HISTORY_UNKNOWN and LIFECYCLE_NOT_OPEN are raised by the recovery ledger, not
-# by a message.
+# trade id. HISTORY_UNKNOWN, LIFECYCLE_NOT_OPEN and LIFECYCLE_UNKNOWN are raised by the
+# recovery ledger, not by a message.
 BLOCKING_REASONS = frozenset(
     {
         StaleReason.NULL_TRADE_SEQUENCE,
@@ -156,6 +159,7 @@ BLOCKING_REASONS = frozenset(
         StaleReason.HISTORY_UNKNOWN,
         StaleReason.LIFECYCLE_NOT_OPEN,
         StaleReason.REVISION_ANOMALY,
+        StaleReason.LIFECYCLE_UNKNOWN,
     }
 )
 
