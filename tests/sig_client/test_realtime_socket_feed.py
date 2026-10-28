@@ -161,6 +161,56 @@ def test_socket_loss_invalidates_first_then_rejoin_and_resync() -> None:
     feed_run(scenario)
 
 
+@pytest.mark.parametrize("cleanup", ["released", "timed_out", "ignores_cancellation"])
+def test_socket_loss_withdraws_readiness_while_cleanup_is_held(cleanup: str) -> None:
+    """Review of 67aac28: the loss must reach the feed before raw cleanup finishes."""
+
+    async def scenario(rig: FeedRig) -> None:
+        h = rig.h
+        await rig.start()
+        conn = rig.server.conn
+        conn.ack()
+        await until(lambda: h.feed.is_ready(MARKET))
+        conn.broadcast(TOPIC, "market_batch", market_batch(1, 0, "0.55"))  # the fence
+        await until(lambda: h.feed.last_revision(MARKET) == 1)
+        assert h.feed.is_ready(MARKET)
+        conn.close_gate = asyncio.Event()  # the old connection's cleanup is held
+        conn.close_ignores_cancel = cleanup == "ignores_cancellation"
+        conn.lose()
+        await until(lambda: not h.feed.is_ready(MARKET))
+        # Readiness is withdrawn while cleanup is still held, at the same instant.
+        assert not conn.closed and h.clock.now == 1000.0
+        assert rig.stale() == [StaleReason.SOCKET_ERROR]
+        assert not h.feed.readiness(MARKET).transport.subscribed
+        await h.clock.advance(1.0)  # the reconnect backoff has passed; cleanup has not
+        assert len(rig.server.connections) == 1 and not h.feed.is_ready(MARKET)
+        if cleanup == "released":
+            conn.close_gate.set()
+            await settle()
+            assert conn.closed and not conn.aborted
+        else:
+            await h.clock.advance(4.0)  # close_timeout_s: the connection is aborted
+            assert conn.aborted
+            if cleanup == "ignores_cancellation":
+                assert len(rig.server.connections) == 1
+                await h.clock.advance(1.0)  # cancel_grace_s, then no longer waited for
+        await until(lambda: len(rig.server.connections) == 2)
+        fresh = rig.server.conn
+        assert len(fresh.joins()) == 1
+        reads = h.count(ORDERBOOK)
+        await h.clock.advance(3.0)
+        assert h.count(ORDERBOOK) == reads and not h.feed.is_ready(MARKET)  # needs the ack
+        fresh.ack()
+        await until(lambda: h.count(ORDERBOOK) == reads + 1)  # the required resync
+        assert not h.feed.is_ready(MARKET)  # the window still needs a clean batch
+        fresh.broadcast(TOPIC, "market_batch", market_batch(2, 1, "0.56"))
+        await h.clock.advance(2.0)
+        await until(lambda: h.feed.is_ready(MARKET))
+        conn.close_gate.set()  # lets an abandoned cleanup end before the task check
+
+    feed_run(scenario)
+
+
 def test_repeated_joins_each_trigger_a_resync_through_the_feed() -> None:
     async def scenario(rig: FeedRig) -> None:
         h = rig.h

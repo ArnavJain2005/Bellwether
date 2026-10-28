@@ -733,7 +733,8 @@ def test_cancelled_connect_leaves_nothing_open() -> None:
         connecting.cancel()
         with pytest.raises(asyncio.CancelledError):
             await connecting
-        assert [c.closed for c in opened] == [True]
+        await settle()  # the abandoned attempt ends on its own; its connection is aborted
+        assert [(c.closed, c.aborted) for c in opened] == [(True, True)]
         await rig.transport.close()
         await settle()
         assert own_tasks(baseline) == set()
@@ -797,6 +798,140 @@ def test_cancelled_close_still_finishes_the_shutdown() -> None:
         assert own_tasks(baseline) == set()
 
     asyncio.run(asyncio.wait_for(main(), 20.0))
+
+
+def test_loss_is_reported_before_cleanup_and_before_any_rejoin() -> None:
+    async def scenario(rig: Rig) -> None:
+        await rig.start()
+        conn = rig.server.conn
+        conn.ack()
+        await settle()
+        rig.take()
+        conn.close_gate = asyncio.Event()
+        conn.lose()
+        await settle()
+        assert rig.take() == [SocketEvent(SocketState.ERROR)]  # cleanup still held
+        assert not conn.closed and len(rig.server.connections) == 1
+        conn.close_gate.set()
+        await rig.clock.advance(1.0)
+        rig.server.conn.ack()
+        await settle()
+        assert rig.take() == [SUBSCRIBED]
+
+    run(scenario)
+
+
+def test_close_is_bounded_even_when_cleanup_ignores_cancellation() -> None:
+    async def main() -> None:
+        rig = Rig(QUIET)
+        baseline = set(asyncio.all_tasks())
+        await rig.transport.connect(ENDPOINT, TOKEN)
+        conn = rig.server.conn
+        conn.close_gate = asyncio.Event()
+        conn.close_ignores_cancel = True
+        closing = asyncio.create_task(rig.transport.close())
+        await settle()
+        assert await rig.transport.receive() is None  # readiness of the stream ends at once
+        await rig.clock.advance(4.9)
+        assert not closing.done()
+        await rig.clock.advance(0.1)  # close_timeout_s: aborted, then cancel_grace_s
+        assert conn.aborted and not closing.done()
+        await rig.clock.advance(1.0)
+        await settle()
+        assert closing.done() and closing.exception() is None  # 5 s + 1 s grace
+        # The close coroutine that ignored cancellation is still referenced, not lost ...
+        assert len(rig.transport._stragglers) == 1
+        conn.close_gate.set()
+        await settle()
+        # ... and once it ends, nothing is left.
+        assert rig.transport._stragglers == set() and own_tasks(baseline) == set()
+
+    asyncio.run(asyncio.wait_for(main(), 20.0))
+
+
+# --- refused joins: fail closed per market, escalate (owner decision) --------------------------
+
+ESCALATE = RealtimeSocketPolicy(
+    heartbeat_interval_s=1e6, refusal_escalate_after=3, escalation_interval_s=60.0
+)
+
+
+def escalations(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if "ESCALATION" in r.getMessage()]
+
+
+def test_repeated_refusals_escalate_at_the_threshold_rate_limited_and_reset(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    server_text = f"server-secret-reason {PROFILE_ID}"
+
+    async def refuse(rig: Rig, conn: FakeConnection) -> None:
+        joins = len(conn.joins())
+        conn.ack(status="error", response={"reason": server_text})
+        await settle()
+        while len(conn.joins()) == joins:
+            await rig.clock.advance(0.5)
+
+    async def scenario(rig: Rig) -> None:
+        await rig.start(topics=(TOPIC, OTHER))
+        conn = rig.server.conn
+        conn.ack(OTHER)  # another market stays subscribed throughout
+        for _ in range(2):
+            await refuse(rig, conn)
+        assert escalations(caplog) == [] and rig.transport.refused_joins() == {}
+        await refuse(rig, conn)  # the third in a row
+        (first,) = escalations(caplog)
+        first_at = rig.clock.now
+        assert first.levelno == logging.ERROR
+        assert rig.transport.refused_joins() == {TOPIC: 3}
+        # Rate limited: no second line until escalation_interval_s has passed.
+        while len(escalations(caplog)) == 1:
+            last_quiet = rig.clock.now
+            await refuse(rig, conn)
+        assert last_quiet - first_at < 60.0 <= rig.clock.now - first_at
+        refusals = rig.transport.refused_joins()[TOPIC]
+        assert refusals > 3
+        # A timeout is not an explicit refusal.
+        joins = len(conn.joins())
+        await rig.clock.advance(10.0)  # join_timeout_s for the join now in flight
+        assert rig.events[-1] == ChannelStatusEvent(TOPIC, ChannelStatus.TIMED_OUT)
+        assert rig.transport.refused_joins() == {TOPIC: refusals}
+        # An acknowledged join resets the count.
+        while len(conn.joins()) == joins:
+            await rig.clock.advance(0.5)
+        conn.ack()
+        await settle()
+        assert rig.events[-1] == SUBSCRIBED
+        assert rig.transport.refused_joins() == {}
+        events = rig.take()
+        # Fail closed per market only: no socket event, the other market untouched.
+        assert all(isinstance(e, ChannelStatusEvent) for e in events)
+        assert {e.topic for e in events} == {TOPIC, OTHER}
+        assert [e for e in events if e.topic == OTHER] == [
+            ChannelStatusEvent(OTHER, ChannelStatus.SUBSCRIBED)
+        ]
+        assert len(rig.server.connections) == 1
+        await rig.clock.advance(100.0)  # past the rate limit
+        conn.ack(status="error")
+        await settle()
+        assert len(escalations(caplog)) == 2  # one refusal after a reset: no escalation
+
+    with caplog.at_level(logging.DEBUG):
+        run(scenario, policy=ESCALATE)
+    for secret in (server_text, PROFILE_ID, TOKEN_VALUE, ANON_VALUE, "apikey", "reason"):
+        assert secret not in caplog.text, secret
+    for record in escalations(caplog):
+        assert TOPIC in record.getMessage() and "not treated as permanent" in record.getMessage()
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [{"refusal_escalate_after": 0}, {"refusal_escalate_after": 2.5},
+     {"escalation_interval_s": 0}, {"cancel_grace_s": float("nan")}],
+)
+def test_policy_rejects_invalid_escalation_and_grace_settings(fields: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        RealtimeSocketPolicy(**fields)
 
 
 def test_a_failed_socket_task_makes_receive_raise() -> None:

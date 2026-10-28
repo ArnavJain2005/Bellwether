@@ -68,9 +68,12 @@ Failing closed
 - A frame that cannot be decoded exactly or does not have the frame shape above, a binary
   frame, a frame for a topic outside `realtime:` or `phoenix`, an unexpected `phoenix`
   event, a send or receive failure, a socket close and an overdue heartbeat all end the
-  socket: SocketEvent (ERROR, or CLOSED for a clean close) is emitted first, then the
-  socket reconnects after a bounded backoff and every topic is joined again. A frame
-  that cannot be attributed to a topic always takes this path.
+  socket: SocketEvent (ERROR, or CLOSED for a clean close) is queued at once, before the
+  old connection is cleaned up, so the feed withdraws readiness without waiting for that
+  cleanup. Then the old connection is closed (bounded, below), and the socket
+  reconnects after a bounded backoff and every topic is joined again. A frame that
+  cannot be attributed to a topic always takes this path. A SocketEvent only reports
+  the loss: it clears no recovery blocker and confirms nothing.
 - On a joined topic, a broadcast without the documented envelope, a refused, timed-out
   or ended join and any event this channel does not carry end that channel:
   ChannelStatusEvent (CHANNEL_ERROR, TIMED_OUT or CLOSED) is emitted, then the topic is
@@ -82,6 +85,11 @@ Failing closed
   previous join or socket can report a topic subscribed during an outage.
 - [client policy] A channel the server ends (`phx_close`) is joined again: the feed asked
   for it and nothing here leaves a topic.
+- [owner decision] An explicitly refused join stays fail closed for its market only. The
+  topic keeps being retried, the feed keeps running, and no refusal is treated as
+  permanent. After `refusal_escalate_after` refusals in a row (reset by an acknowledged
+  join) a sanitized ERROR line escalates it, at most once per `escalation_interval_s`.
+  Engine health/alert wiring does not exist yet; it will read `refused_joins()`.
 - Broadcast event names are passed through; the feed decides which it carries.
 
 Token rotation: `set_auth` stores the new token before anything else, and every join is
@@ -103,6 +111,17 @@ and exception class names are logged. Topics are market topics and carry no prof
 Shutdown: after `close()` begins, `receive()` returns None, the socket task is cancelled
 (with every timer, backoff and reconnect attempt), the connection is closed, and
 `connect`, `subscribe` and `set_auth` start nothing. `close()` is idempotent.
+
+Cleanup bounds: closing a connection waits at most `close_timeout_s` for a graceful
+close, then aborts it; cancelled work (a send, a receive, a close) then gets at most
+`cancel_grace_s` to stop. Work that suppresses cancellation is no longer waited for: it
+stays referenced, with a done callback that retrieves its result, until it ends (and a
+connection an abandoned open attempt yields is aborted). So `close()` returns within
+`close_timeout_s + 2 * cancel_grace_s` on the injected clock, and losing a socket
+delays the reconnect by no more than that.
+
+Proxy: [owner decision] environment proxies are disabled, as in the REST clients
+(`trust_env=False`). Hosting can ask for an explicit, reviewed configuration later.
 """
 
 from __future__ import annotations
@@ -181,6 +200,10 @@ class RawConnection(Protocol):
     async def recv(self) -> str | bytes: ...
 
     async def close(self) -> None: ...
+
+    def abort(self) -> None:
+        """Tear the connection down at once, without a closing handshake."""
+        ...
 
 
 Connector = Callable[[str], Awaitable[RawConnection]]
@@ -327,22 +350,36 @@ class _WebSocketsConnection:
     async def close(self) -> None:
         await self._ws.close()
 
+    def abort(self) -> None:
+        transport = self._ws.transport
+        if transport is not None:
+            transport.abort()
+
 
 async def connect_websocket(
-    url: str, *, open_timeout_s: float, max_frame_bytes: int, **options: Any
+    url: str,
+    *,
+    open_timeout_s: float,
+    max_frame_bytes: int,
+    close_timeout_s: float = 5.0,
+    **options: Any,
 ) -> RawConnection:
     """Open `url` with websockets 15.0.1 (asyncio implementation).
 
-    [client policy] No proxy from the environment (the REST clients use
-    `trust_env=False`), a silenced library logger, `max_frame_bytes` as the message size
-    limit (a larger message closes the socket). Other settings are the library defaults
-    realtime-py also uses (permessage-deflate offered, keepalive pings every 20 s).
+    [owner decision] No proxy from the environment, by default and with no option to
+    change it here, consistent with the REST clients' `trust_env=False`. If hosting
+    needs a proxy, an explicit, reviewed configuration can be added later (H1 evidence).
+    [client policy] A silenced library logger, `max_frame_bytes` as the message size
+    limit (a larger message closes the socket), and `close_timeout_s` for the library's
+    own closing handshake. Other settings are the library defaults realtime-py also uses
+    (permessage-deflate offered, keepalive pings every 20 s).
     `options` go to `websockets.asyncio.client.connect` (tests pass a local `sock`).
     """
     ws = await websockets_connect(
         url,
         proxy=None,
         open_timeout=open_timeout_s,
+        close_timeout=close_timeout_s,
         max_size=max_frame_bytes,
         logger=_silent_logger(),
         **options,
@@ -361,13 +398,18 @@ class RealtimeSocketPolicy:
     join_timeout_s: float = 10.0  # realtime 2.33.0 DEFAULT_TIMEOUT
     heartbeat_interval_s: float = 25.0  # realtime 2.33.0 DEFAULT_HEARTBEAT_INTERVAL
     send_timeout_s: float = 10.0  # [client policy]
-    close_timeout_s: float = 5.0  # [client policy]
+    close_timeout_s: float = 5.0  # [client policy] graceful close, then abort
+    cancel_grace_s: float = 1.0  # [client policy] for cancelled work to stop
     reconnect_initial_s: float = 1.0  # realtime-js 2.11.2 reconnectAfterMs starts at 1 s
     reconnect_max_s: float = 10.0  # ... and is capped at 10 s
     rejoin_initial_s: float = 1.0  # [client policy] same bounds per topic
     rejoin_max_s: float = 10.0
     max_frame_bytes: int = 8 * 2**20  # [client policy]
     max_pending_events: int = 4096  # [client policy] receive() queue bound
+    # [owner decision] Explicit join refusals in a row before an escalation, and the
+    # minimum time between escalation log lines.
+    refusal_escalate_after: int = 5
+    escalation_interval_s: float = 300.0
 
     def __post_init__(self) -> None:
         for name in (
@@ -376,6 +418,8 @@ class RealtimeSocketPolicy:
             "heartbeat_interval_s",
             "send_timeout_s",
             "close_timeout_s",
+            "cancel_grace_s",
+            "escalation_interval_s",
             "reconnect_initial_s",
             "reconnect_max_s",
             "rejoin_initial_s",
@@ -384,6 +428,7 @@ class RealtimeSocketPolicy:
             check_positive_seconds(name, getattr(self, name))
         check_positive_int("max_frame_bytes", self.max_frame_bytes)
         check_positive_int("max_pending_events", self.max_pending_events)
+        check_positive_int("refusal_escalate_after", self.refusal_escalate_after)
         if self.reconnect_max_s < self.reconnect_initial_s:
             raise ValueError("reconnect_max_s must be at least reconnect_initial_s")
         if self.rejoin_max_s < self.rejoin_initial_s:
@@ -410,6 +455,7 @@ class _Channel:
     deadline: float | None = None  # join timeout while JOINING
     retry_at: float | None = None  # next join while WAITING
     failures: int = 0
+    refusals: int = 0  # explicit join refusals in a row; reset only by an acknowledged join
     token: RealtimeSecret | None = field(default=None, repr=False)  # the server's copy
 
 
@@ -463,6 +509,8 @@ class RealtimeSocketTransport:
         self._readable = asyncio.Event()
         self._writable = asyncio.Event()
         self._failure: str | None = None  # the socket task died unexpectedly
+        self._stragglers: set[asyncio.Future[Any]] = set()  # cancelled, not yet ended
+        self._escalated_at: float | None = None  # last refused-join escalation
 
     def __repr__(self) -> str:
         if self._closing:
@@ -478,6 +526,7 @@ class RealtimeSocketTransport:
             url,
             open_timeout_s=self._policy.connect_timeout_s,
             max_frame_bytes=self._policy.max_frame_bytes,
+            close_timeout_s=self._policy.close_timeout_s,
         )
 
     # --- RealtimeTransport ------------------------------------------------------------------
@@ -588,6 +637,13 @@ class RealtimeSocketTransport:
         self._appliers = []
 
     # --- events -------------------------------------------------------------------------
+
+    def _emit_now(self, event: TransportEvent) -> None:
+        """Queue past the bound: only a SocketEvent, at most one per lost socket."""
+        if self._closing:
+            return
+        self._events.append(event)
+        self._readable.set()
 
     async def _emit(self, event: TransportEvent) -> None:
         while len(self._events) >= self._policy.max_pending_events and not self._closing:
@@ -784,7 +840,9 @@ class RealtimeSocketTransport:
             if message.payload.get("status") == "ok":
                 await self._joined(channel)
             else:
+                channel.refusals += 1
                 await self._channel_ended(channel, ChannelStatus.CHANNEL_ERROR, "join refused")
+                self._escalate_refusals()
         elif event in ("phx_error", "phx_close"):
             if live and self._current(channel, message):
                 status = ChannelStatus.CHANNEL_ERROR if event == "phx_error" else ChannelStatus.CLOSED
@@ -810,6 +868,7 @@ class RealtimeSocketTransport:
         channel.state = _Join.JOINED
         channel.deadline = channel.retry_at = None
         channel.failures = 0
+        channel.refusals = 0
         self._reconnect_failures = 0
         logger.info("realtime socket: %s joined", channel.topic)
         await self._emit(ChannelStatusEvent(channel.topic, ChannelStatus.SUBSCRIBED))
@@ -824,6 +883,44 @@ class RealtimeSocketTransport:
             "realtime socket: %s %s (%s); joining again in %.1fs", channel.topic, status, why, delay
         )
         await self._emit(ChannelStatusEvent(channel.topic, status))
+
+    def refused_joins(self) -> dict[str, int]:
+        """Topics whose explicit join refusals in a row reached the escalation threshold.
+
+        For the engine health signal that does not exist yet (see `_escalate_refusals`).
+        """
+        threshold = self._policy.refusal_escalate_after
+        return {c.topic: c.refusals for c in self._channels.values() if c.refusals >= threshold}
+
+    def _escalate_refusals(self) -> None:
+        """A bounded, rate-limited operational escalation of repeated join refusals.
+
+        [owner decision] A refused join stays fail closed for its market only: the topic
+        keeps being retried with backoff, the feed keeps running, and no refusal is taken
+        as permanent. Once a topic reaches `refusal_escalate_after` refusals in a row, one
+        ERROR line is logged, at most once per `escalation_interval_s` for the whole
+        socket, naming counts and one market topic only (never server text, tokens or
+        the URL). Handoff: when engine health/alert wiring exists, it reads
+        `refused_joins()` (or replaces this log line) instead.
+        """
+        escalated = self.refused_joins()
+        if not escalated:
+            return
+        now = self._clock()
+        interval = self._policy.escalation_interval_s
+        if self._escalated_at is not None and now - self._escalated_at < interval:
+            return
+        self._escalated_at = now
+        topic, worst = max(escalated.items(), key=lambda item: item[1])
+        logger.error(
+            "realtime socket ESCALATION: %d topic(s) had at least %d joins refused in a row "
+            "(most: %d, %s); those markets stay not ready and are still retried; a refusal "
+            "is not treated as permanent",
+            len(escalated),
+            self._policy.refusal_escalate_after,
+            worst,
+            topic,
+        )
 
     # --- sending --------------------------------------------------------------------------
 
@@ -873,30 +970,82 @@ class RealtimeSocketTransport:
                 "socket closed" if clean else "send failed",
             )
 
-    async def _bounded(self, step: Awaitable[Any], seconds: float) -> BaseException | None:
-        """Run `step` for at most `seconds` on the injected clock.
+    # --- bounded waits ----------------------------------------------------------------------
+    # Every wait on raw-connection work is bounded on the injected clock. Work that does not
+    # finish in time is cancelled and given `cancel_grace_s`; work that ignores even that is
+    # tracked (a strong reference and a done callback) and no longer waited for, so neither
+    # a stuck connection nor a coroutine that suppresses cancellation can hold up the socket
+    # task or close().
 
-        Returns None on success, else the step's exception (TimeoutError on timeout).
-        External cancellation propagates after the step is cancelled.
-        """
+    async def _bounded(self, step: Awaitable[Any], seconds: float) -> BaseException | None:
+        """Run `step` for at most `seconds`. None on success, else its exception
+        (TimeoutError on timeout). External cancellation propagates at once."""
         work = asyncio.ensure_future(step)
         timer = asyncio.ensure_future(self._sleep(seconds))
         try:
             await asyncio.wait({work, timer}, return_when=asyncio.FIRST_COMPLETED)
-        finally:
+        except BaseException:
             timer.cancel()
-            if not work.done():
-                work.cancel()
-            await asyncio.gather(work, timer, return_exceptions=True)
+            self._track(work)
+            raise
+        timer.cancel()
+        if not work.done():
+            await self._reap(work)
+            return TimeoutError()
         if work.cancelled():
             return TimeoutError()
         return work.exception()
 
+    async def _reap(self, work: asyncio.Future[Any]) -> None:
+        """Cancel `work` and wait at most `cancel_grace_s` for it to stop."""
+        work.cancel()
+        if work.done():
+            return
+        grace = asyncio.ensure_future(self._sleep(self._policy.cancel_grace_s))
+        try:
+            await asyncio.wait({work, grace}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            elapsed = grace.done() and not grace.cancelled()
+            grace.cancel()
+            if not work.done():
+                if elapsed:
+                    logger.warning(
+                        "realtime socket cleanup ignored cancellation; no longer waited for"
+                    )
+                self._track(work)
+
+    def _track(self, work: asyncio.Future[Any]) -> None:
+        """Cancel `work` without waiting; keep it referenced until it ends."""
+        work.cancel()
+        if work.done():
+            self._settled(work)
+            return
+        self._stragglers.add(work)
+        work.add_done_callback(self._settled)
+
+    def _settled(self, work: asyncio.Future[Any]) -> None:
+        self._stragglers.discard(work)
+        if not work.cancelled():
+            work.exception()  # retrieved, never re-raised or logged (it may hold text)
+
+    @staticmethod
+    def _abort(conn: RawConnection) -> None:
+        try:
+            conn.abort()
+        except Exception:  # noqa: BLE001 - tearing down must not raise; text dropped
+            logger.info("realtime socket abort failed")
+
     # --- losing and opening sockets ------------------------------------------------------------
 
     async def _lose(self, lost: _SocketLost) -> None:
-        """End the socket: every topic waits for the next one, then SocketEvent."""
-        await self._drop_connection()
+        """End the socket: report SocketEvent first, then clean up the old connection.
+
+        The event is queued before any cleanup is awaited, so the feed withdraws
+        readiness while the old connection is still closing. It also precedes every
+        rejoin: rejoins need a new socket, which this task opens only after cleanup.
+        """
+        conn, self._conn = self._conn, None
+        recv, self._recv_task = self._recv_task, None
         for channel in self._channels.values():
             channel.state = _Join.PENDING
             channel.join_ref = channel.deadline = channel.retry_at = None
@@ -905,21 +1054,45 @@ class RealtimeSocketTransport:
         delay = self._reconnect_delay()
         self._reconnect_at = self._clock() + delay
         logger.warning("realtime socket lost (%s); reconnecting in %.1fs", lost.why, delay)
-        await self._emit(SocketEvent(lost.state))
+        self._emit_now(SocketEvent(lost.state))
+        await self._discard_connection(conn, recv)
 
     async def _drop_connection(self) -> None:
-        recv, self._recv_task = self._recv_task, None
-        if recv is not None:
-            recv.cancel()
-            await asyncio.gather(recv, return_exceptions=True)
         conn, self._conn = self._conn, None
-        if conn is not None:
-            await self._close_raw(conn)
+        recv, self._recv_task = self._recv_task, None
+        await self._discard_connection(conn, recv)
+
+    async def _discard_connection(
+        self, conn: RawConnection | None, recv: asyncio.Future[Any] | None
+    ) -> None:
+        """Close `conn` (which ends its receive), then stop `recv`. At most
+        close_timeout_s + 2 * cancel_grace_s on the injected clock."""
+        try:
+            if conn is not None:
+                await self._close_raw(conn)
+        finally:
+            if recv is not None:
+                await self._reap(recv)
 
     async def _close_raw(self, conn: RawConnection) -> None:
-        failure = await self._bounded(conn.close(), self._policy.close_timeout_s)
-        if failure is not None:
-            logger.info("realtime socket close did not finish cleanly (%s)", type(failure).__name__)
+        """Close gracefully within close_timeout_s, else abort the connection."""
+        work = asyncio.ensure_future(conn.close())
+        timer = asyncio.ensure_future(self._sleep(self._policy.close_timeout_s))
+        try:
+            await asyncio.wait({work, timer}, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            timer.cancel()
+            self._abort(conn)
+            self._track(work)
+            raise
+        timer.cancel()
+        if not work.done():
+            self._abort(conn)
+            logger.info("realtime socket close timed out; connection aborted")
+            await self._reap(work)
+        elif work.cancelled() or work.exception() is not None:
+            self._abort(conn)
+            logger.info("realtime socket close did not finish cleanly; connection aborted")
 
     async def _open(self) -> RawConnection | None:
         """One connection attempt, bounded by the connect timeout and by close()."""
@@ -930,14 +1103,13 @@ class RealtimeSocketTransport:
         try:
             await asyncio.wait({work, timer, closer}, return_when=asyncio.FIRST_COMPLETED)
         except BaseException:
-            await self._discard(work)
+            self._abandon_open(work)
             raise
         finally:
             timer.cancel()
             closer.cancel()
-            await asyncio.gather(timer, closer, return_exceptions=True)
         if not work.done() or self._closing:
-            await self._discard(work)
+            self._abandon_open(work)
             if not self._closing:
                 logger.warning("realtime socket open timed out")
             return None
@@ -949,10 +1121,12 @@ class RealtimeSocketTransport:
             return None
         return work.result()
 
-    async def _discard(self, work: asyncio.Future[RawConnection]) -> None:
-        """Cancel an open attempt; close the connection if it opened anyway."""
-        if not work.done():
-            work.cancel()
-        await asyncio.gather(work, return_exceptions=True)
-        if not work.cancelled() and work.exception() is None:
-            await self._close_raw(work.result())
+    def _abandon_open(self, work: asyncio.Future[RawConnection]) -> None:
+        """Cancel an open attempt without waiting; abort a connection it yields anyway."""
+
+        def opened_anyway(done: asyncio.Future[RawConnection]) -> None:
+            if not done.cancelled() and done.exception() is None:
+                self._abort(done.result())
+
+        work.add_done_callback(opened_anyway)
+        self._track(work)

@@ -44,7 +44,9 @@ class FakeConnection:
         self.inbox: asyncio.Queue[str | bytes | BaseException] = asyncio.Queue()
         self.closed = False
         self.send_gate: asyncio.Event | None = None  # set: sends wait for it
-        self.close_gate: asyncio.Event | None = None
+        self.close_gate: asyncio.Event | None = None  # set: close waits for it
+        self.close_ignores_cancel = False  # close keeps waiting even when cancelled
+        self.aborted = False
 
     async def send(self, text: str) -> None:
         if self.send_gate is not None:
@@ -60,9 +62,16 @@ class FakeConnection:
         return item
 
     async def close(self) -> None:
-        if self.close_gate is not None:
-            await self.close_gate.wait()
+        while self.close_gate is not None and not self.close_gate.is_set():
+            try:
+                await self.close_gate.wait()
+            except asyncio.CancelledError:
+                if not self.close_ignores_cancel:
+                    raise
         self.closed = True
+
+    def abort(self) -> None:
+        self.aborted = self.closed = True
 
     # --- what the client sent ---------------------------------------------------------------
 
