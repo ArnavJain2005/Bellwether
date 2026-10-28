@@ -83,6 +83,20 @@ whose label matches is quarantined). It never clears anything and never publishe
 MarketReady; that comes only from the orderbook-resync path, which re-checks every
 condition synchronously first.
 
+Lifecycle sweep (M2-B2, design 9.3, AT-26): opt-in, and off unless the feed is given a
+SweepPolicy, whose interval, walk deadline and page cap have no defaults (Arnav sets them;
+no module in engine/ creates one). One walk at a time reads the complete tournament market
+list with `status=any` through `list_all_tournament_markets`, which returns every page or
+raises; its pages go through the shared account RateLimiter, and the sweep uses neither
+the recovery gate nor the resync gate. A walk that fails, hits its page cap or deadline,
+is cancelled, or completes after closing began applies nothing. A complete walk is applied
+by one synchronous step: a market listed `settled` or `closed` is quarantined with
+LIFECYCLE_NOT_OPEN (current or superseded, as for a lifecycle read) and its readiness is
+withdrawn; a market listed `open` changes nothing; a market absent from the list changes
+nothing and is logged, because no documented rule says what absence means. The sweep
+never confirms or clears a blocker, never provides bootstrap evidence and never publishes
+MarketReady.
+
 Readiness: `readiness(market_id)` returns a MarketReadiness (readiness.py) explaining
 every failing condition; `is_ready(market_id)` is exactly `readiness(...).status is
 READY`. Publication uses the same predicate, so MarketReady is never published while
@@ -191,12 +205,19 @@ from engine.sig_client.recovery import (
     RecoveryAttempt,
     RecoveryLedger,
     RecoveryPolicy,
+    SweepPolicy,
     UnobservedWindow,
     WindowCause,
     bounded_jitter,
 )
-from engine.sig_client.rest import ORDERBOOK_DEPTH_MAX, Jitter, SigRestClient, equal_jitter
-from engine.sig_client.wire import MarketPricingContext
+from engine.sig_client.rest import (
+    MARKETS_PAGE_MAX,
+    ORDERBOOK_DEPTH_MAX,
+    Jitter,
+    SigRestClient,
+    equal_jitter,
+)
+from engine.sig_client.wire import MarketPricingContext, TournamentMarket
 
 logger = logging.getLogger(__name__)
 
@@ -426,7 +447,8 @@ class RealtimeMarketFeed:
     that it inherits every blocker; it is refused while an earlier feed using it has not
     begun closing. Without one, the feed creates a ledger with unknown history, and no
     market is ever ready (module docstring). `recovery` sets the recovery bounds and
-    `recovery_jitter` the bounded jitter of their backoff.
+    `recovery_jitter` the bounded jitter of their backoff. `sweep` enables the periodic
+    lifecycle sweep with its bounds; without one (the default) no sweep runs.
     """
 
     def __init__(
@@ -444,7 +466,10 @@ class RealtimeMarketFeed:
         ledger: RecoveryLedger | None = None,
         recovery: RecoveryPolicy | None = None,
         recovery_jitter: Jitter = equal_jitter,
+        sweep: SweepPolicy | None = None,
     ) -> None:
+        if sweep is not None and not isinstance(sweep, SweepPolicy):
+            raise TypeError("sweep must be a SweepPolicy or None")
         if tokens.limiter is not rest.limiter:
             raise ValueError("the REST and token clients must share the account RateLimiter")
         if isinstance(market_ids, str) or not market_ids:
@@ -465,6 +490,8 @@ class RealtimeMarketFeed:
         self._ledger = ledger if ledger is not None else RecoveryLedger()
         self._recovery = recovery if recovery is not None else RecoveryPolicy()
         self._recovery_jitter = recovery_jitter
+        self._sweep = sweep
+        self._sweep_ids = 0
         self._closing = asyncio.Event()
         # Registering inherits the ledger's state: a replacement feed opens a window on
         # every market an earlier feed registered (fence = the retained revision).
@@ -604,6 +631,7 @@ class RealtimeMarketFeed:
             blockers=self._ledger.instances(market_id),
             escalated=market.escalated,
             consecutive_failures=market.failures,
+            sweep=self._ledger.sweep(market_id),
         )
 
     def books(self, market_id: str) -> dict[str, HeldBook]:
@@ -632,6 +660,8 @@ class RealtimeMarketFeed:
                 async with asyncio.TaskGroup() as group:
                     self._group = group
                     self._spawn(self._timer_loop())
+                    if self._sweep is not None:
+                        self._spawn(self._sweep_loop(self._sweep))
                     for market in self._markets.values():
                         self._start_recovery(market)  # e.g. HISTORY_UNKNOWN from the start
                     await self._receive_loop()
@@ -1052,7 +1082,7 @@ class RealtimeMarketFeed:
         try:
             try:
                 async with asyncio.timeout(self._recovery.attempt_deadline_s) as scope:
-                    timer = self._spawn(self._deadline(attempt, scope))
+                    timer = self._spawn(self._deadline(attempt.deadline_mono, scope))
                     try:
                         await self._recovery_gate.acquire(
                             RequestKind.READ, deadline=attempt.deadline_mono
@@ -1092,9 +1122,9 @@ class RealtimeMarketFeed:
         finally:
             market.attempt = None
 
-    async def _deadline(self, attempt: RecoveryAttempt, scope: asyncio.Timeout) -> None:
-        """Expire the attempt's scope when the injected clock reaches its deadline."""
-        wait = attempt.deadline_mono - self._clock()
+    async def _deadline(self, deadline_mono: float, scope: asyncio.Timeout) -> None:
+        """Expire an attempt's or a walk's scope when the injected clock reaches its deadline."""
+        wait = deadline_mono - self._clock()
         if wait > 0:
             await self._sleep(wait)
         if not scope.expired():  # still admitting or reading (cancelled once it ends)
@@ -1181,6 +1211,115 @@ class RealtimeMarketFeed:
             why,
             wait,
         )
+
+    # --- lifecycle sweep (M2-B2, design 9.3, AT-26; opt-in) ---------------------------
+
+    async def _sweep_loop(self, policy: SweepPolicy) -> None:
+        """One walk at a time: each starts `interval_s` after the feed started or the
+        previous walk ended (fixed delay), never earlier than SIG's Retry-After."""
+        wait = policy.interval_s
+        while not self._closing.is_set():
+            await self._sleep(wait)
+            if self._closing.is_set():
+                return
+            floor = await self._sweep_once(policy)
+            wait = max(policy.interval_s, floor or 0.0)
+
+    async def _sweep_once(self, policy: SweepPolicy) -> float | None:
+        """One complete walk of the market list, then the synchronous commit step.
+
+        Returns SIG's Retry-After floor after a failed walk. A failed, capped or timed-out
+        walk applies nothing; an external cancellation propagates even if a reader
+        swallowed it, and nothing is then applied.
+        """
+        self._sweep_ids += 1
+        sweep_id = f"S{self._sweep_ids}"
+        started = self._clock()
+        deadline = started + policy.deadline_s
+        # Each market's generation at the start: a change during the walk supersedes it.
+        generations = {market_id: self._ledger.generation(market_id) for market_id in self._markets}
+        try:
+            async with asyncio.timeout(policy.deadline_s) as scope:
+                timer = self._spawn(self._deadline(deadline, scope))
+                try:
+                    rows = await self._rest.list_all_tournament_markets(
+                        status="any", page_limit=MARKETS_PAGE_MAX, max_pages=policy.max_pages
+                    )
+                finally:
+                    timer.cancel()
+        except TimeoutError:
+            self._raise_if_cancel_requested()
+            if not scope.expired():
+                raise
+            logger.warning("realtime lifecycle sweep %s failed (deadline passed); nothing applied",
+                           sweep_id)
+            return None
+        except SigClientError as exc:
+            self._raise_if_cancel_requested()
+            floor = _server_wait(exc)  # an oversized Retry-After stops the feed
+            logger.warning("realtime lifecycle sweep %s failed (%s); nothing applied", sweep_id,
+                           type(exc).__name__)
+            return floor
+        self._raise_if_cancel_requested()
+        if scope.expired():
+            logger.warning("realtime lifecycle sweep %s failed (deadline passed); nothing applied",
+                           sweep_id)
+            return None
+        # No await between the complete list and the step.
+        self._commit_sweep(sweep_id, generations, rows, started, self._clock(), deadline)
+        return None
+
+    def _commit_sweep(
+        self,
+        sweep_id: str,
+        generations: dict[str, int],
+        rows: Sequence[TournamentMarket],
+        started: float,
+        finished: float,
+        deadline: float,
+    ) -> None:
+        """Design 4.6 applied to a complete walk, restriction only. Synchronous."""
+        # 1. Guard: a walk is applied only while the feed is live and before its deadline.
+        if self._closing.is_set() or self._cancel_requested():
+            logger.info("realtime lifecycle sweep %s dropped: feed closing or cancelled",
+                        sweep_id)
+            return
+        if self._clock() >= deadline:
+            logger.info("realtime lifecycle sweep %s dropped: past its deadline", sweep_id)
+            return
+        by_id = {row.id: row for row in rows}
+        # 2-5 for every market first, so that every withdrawal below is already in effect
+        # when the first callback runs.
+        restricted = []
+        absent = []
+        for market_id, market in self._markets.items():
+            row = by_id.get(market_id)
+            if row is None:
+                absent.append(market_id)
+            if self._ledger.apply_listing(
+                market_id,
+                sweep_id=sweep_id,
+                generation=generations[market_id],
+                row=row,
+                walk_started_mono=started,
+                walk_finished_mono=finished,
+            ):
+                restricted.append(market)
+        if absent:
+            # [client policy] No documented rule says what absence from a complete list
+            # means (D-7), so it is recorded, not read as open or as closed.
+            logger.warning(
+                "realtime lifecycle sweep %s: %d market(s) absent from the complete market "
+                "list (%s); recorded, nothing changed",
+                sweep_id,
+                len(absent),
+                ", ".join(absent),
+            )
+        logger.info("realtime lifecycle sweep %s applied: %d market(s) quarantined", sweep_id,
+                    len(restricted))
+        # 6. At most a withdrawal; MarketReady comes only from the orderbook-resync path.
+        for market in restricted:
+            self._set_stale(market, StaleReason.LIFECYCLE_NOT_OPEN)
 
     # --- token lifecycle ----------------------------------------------------------------
 

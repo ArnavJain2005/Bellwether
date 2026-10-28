@@ -29,7 +29,12 @@ from engine.sig_client.realtime import (
     TransportEvent,
 )
 from engine.sig_client.realtime_token import RealtimeEndpoint, RealtimeSecret, RealtimeTokenClient
-from engine.sig_client.recovery import BootstrapDeclaration, RecoveryLedger, RecoveryPolicy
+from engine.sig_client.recovery import (
+    BootstrapDeclaration,
+    RecoveryLedger,
+    RecoveryPolicy,
+    SweepPolicy,
+)
 from engine.sig_client.rest import SigRestClient
 
 T0 = datetime(2026, 10, 10, 12, 0, 0, tzinfo=UTC)
@@ -317,7 +322,8 @@ class Harness:
     Unless `ledger` is given, the feed gets a TEST-ONLY bootstrap ledger declaring its
     markets, so that tests of the ready path can reach it. Pass `ledger=RecoveryLedger()`
     for production's default (unknown history). Every market gets a market-detail route
-    (open) unless the router already has one.
+    (open) unless the router already has one. `sweep` enables the (opt-in) lifecycle
+    sweep with test-only bounds.
     """
 
     def __init__(
@@ -332,6 +338,7 @@ class Harness:
         ledger: RecoveryLedger | None = None,
         recovery: RecoveryPolicy | None = None,
         clock: ManualClock | None = None,
+        sweep: SweepPolicy | None = None,
     ) -> None:
         self.clock = clock or ManualClock()
         self.market_ids = market_ids
@@ -380,6 +387,7 @@ class Harness:
             ledger=self.ledger,
             recovery=recovery,
             recovery_jitter=lambda delay: delay,
+            sweep=sweep,
         )
         self.task: asyncio.Task[None] | None = None
         self.baseline_tasks: set[asyncio.Task[Any]] = set()

@@ -26,6 +26,7 @@ from engine.sig_client.recovery import (
     BlockerInstance,
     LedgerOrigin,
     LifecycleObservation,
+    SweepObservation,
     UnobservedWindow,
 )
 from engine.sig_client.wire import BookVersion
@@ -88,7 +89,9 @@ class MarketReadiness:
     its initial-state evidence). QUARANTINED when any instance is quarantined and the feed
     is not closing. NOT_READY otherwise, and always once closing has begun. `reasons`
     holds one human-readable line per failing condition, with the question or decision
-    ids it is missing.
+    ids it is missing. `sweep` is the last lifecycle-sweep row applied (None when the
+    sweep is disabled or has not completed); it is observability only and never makes a
+    market more ready.
     """
 
     market_id: str
@@ -107,3 +110,4 @@ class MarketReadiness:
     escalated: bool
     consecutive_failures: int
     does_not_cover: str = DOES_NOT_COVER
+    sweep: SweepObservation | None = None
