@@ -186,10 +186,11 @@ def classify_race(venue: str, market: dict[str, Any], event_title: str | None = 
     if venue == "polymarket":
         q = (market.get("question") or "").lower()
         slug = (market.get("slug") or market.get("market_slug") or "").lower()
-        text = f"{q} {slug} {ev_t}"
+        prop = f"{q} {slug}".strip()
+        text = f"{prop} {ev_t}".strip()
         if _LT_GOV_RE.search(text):
             return "other"
-        if _is_state_legislative_contest(text):
+        if _is_state_legislative_contest(text, proposition=prop):
             return "other"
         states = extract_states_from_text(text)
         if len(states) >= 2 or "closer" in text:
@@ -211,6 +212,7 @@ def classify_race(venue: str, market: dict[str, Any], event_title: str | None = 
     series = (market.get("series_ticker") or "").upper()
     title = (market.get("title") or "").lower()
     subtitle = (market.get("subtitle") or market.get("yes_sub_title") or "").lower()
+    prop = f"{ticker} {series} {title}".strip()
     text = f"{ticker} {series} {title} {ev_t}"
 
     # Valid structured state contest evidence takes precedence over broad wording
@@ -220,7 +222,13 @@ def classify_race(venue: str, market: dict[str, Any], event_title: str | None = 
 
     if _LT_GOV_RE.search(f"{text} {subtitle}") or "LTGOV" in ticker or "LTGOV" in series or "LIEUTENANTGOV" in series:
         return "other"
-    if "STATESUPERMAJ" in series or "STATESUPERMAJ" in ticker or _is_state_legislative_contest(text, structured=structured):
+    if (
+        "STATESUPERMAJ" in series
+        or "STATESUPERMAJ" in ticker
+        or _is_kalshi_state_chamber_symbol(series)
+        or _is_kalshi_state_chamber_symbol(ticker)
+        or _is_state_legislative_contest(text, structured=structured, proposition=prop)
+    ):
         return "other"
 
     if structured == "control" or any(k in series for k in ["CONTROLS", "CONTROLH"]):
@@ -303,19 +311,97 @@ _STATE_SEATS_RE = re.compile(
     r"\b(?:" + "|".join(US_STATES) + r")\s+(?:senate|house(?:\s+of\s+representatives)?)\s+seats\b",
     re.IGNORECASE,
 )
+_STATE_HOUSE_CHAMBER_RE = re.compile(
+    r"\b(?:" + "|".join(US_STATES) + r")\s+house\s+of\s+representatives\b",
+    re.IGNORECASE,
+)
+_STATE_CHAMBER_WINNER_RE = re.compile(
+    r"\b(?:who\s+will\s+win|winner|winners|control|controls|majority|flip|flips|lead|speaker)\b"
+    r".*\b(?:" + "|".join(US_STATES) + r")\s+house\s+of\s+representatives\b"
+    r"|\b(?:win|wins|take|takes|hold|holds)\s+(?:the\s+)?(?:" + "|".join(US_STATES) + r")\s+house\s+of\s+representatives\b"
+    r"|\b(?:" + "|".join(US_STATES) + r")\s+house\s+of\s+representatives\b.*\b(?:winner|winners|control|controls|majority|flip|flips|lead|speaker)\b"
+    r"|\b(?:who\s+will\s+win|winner|winners|control|controls|majority)\b.*\bstate\s+house\b"
+    r"|\bstate\s+house\b.*\b(?:winner|winners|control|controls|majority|election|race)\b",
+    re.IGNORECASE,
+)
+_DISTRICT_CONTEST_TARGET_RE = re.compile(
+    r"\b(?:(?:house\s+)?race\s+(?:for|in)|winner\s+(?:for|of|in)|(?:house\s+)?seat\s+(?:in|for))\s+(?:[a-z]{2}-(?:al|\d{1,2}))\b"
+    r"|\b(?:[a-z]{2}-(?:al|\d{1,2}))\s+(?:house\s+race|house\s+seat|house\s+winner|winner|race|seat)\b"
+    r"|\b(?:win|wins|take|takes)\s+(?:the\s+)?(?:[a-z]{2}-(?:al|\d{1,2}))\b",
+    re.IGNORECASE,
+)
+_SEAT_COUNT_SPEC_RE = re.compile(
+    r"\b(?:(?:how\s+many|below|above|under|over|exactly|at\s+least|at\s+most|\d+)\s+seats"
+    r"|seat\s+count|total\s+seats|house\s+seats)\b",
+    re.IGNORECASE,
+)
 _EXPLICIT_FEDERAL_BODY_RE = re.compile(
     r"\b(?:(?:u\.s\.?|us|united\s+states|federal)\s+(?:senate|house(?:\s+of\s+representatives)?|congress(?:ional)?)"
     r"|congressional\s+elections?|in\s+congress)\b",
     re.IGNORECASE,
 )
+_KALSHI_FEDERAL_SEATS_SERIES_RE = re.compile(
+    r"^(?:KX)?(?P<st>[A-Z]{2})HOUSE(?:DEM|REP|GOP)(?:SEATS)?(?:[-_]|$)",
+    re.IGNORECASE,
+)
 
 
-def _is_state_legislative_contest(text: str, structured: str | None = None) -> bool:
+def _is_kalshi_federal_seats_symbol(symbol: str) -> bool:
+    """Return True if symbol is a Kalshi federal House seat count series/ticker (e.g. KXVAHOUSEDEM)."""
+    match = _KALSHI_FEDERAL_SEATS_SERIES_RE.match((symbol or "").upper())
+    return bool(match and match.group("st") in STATE_ABBRS)
+
+
+def _is_state_legislative_contest(
+    text: str,
+    structured: str | None = None,
+    proposition: str | None = None,
+) -> bool:
     """Return True if contest text refers to a state legislature contest rather than a federal one."""
     if _EXPLICIT_STATE_LEGISLATURE_RE.search(text):
         return True
-    if _STATE_SEATS_RE.search(text):
-        return not (structured in ("senate", "house") or bool(_EXPLICIT_FEDERAL_BODY_RE.search(text)))
+
+    prop = (proposition if proposition is not None else text).lower()
+    full_text = text.lower()
+
+    prop_has_state_chamber = bool(_STATE_HOUSE_CHAMBER_RE.search(prop))
+    text_has_state_chamber = prop_has_state_chamber or bool(_STATE_HOUSE_CHAMBER_RE.search(full_text))
+
+    if text_has_state_chamber:
+        # 1. Explicit state-chamber winner/control propositions fail closed.
+        if _STATE_CHAMBER_WINNER_RE.search(prop):
+            return True
+
+        has_prop_seat_count = bool(_STATE_SEATS_RE.search(prop)) or bool(_SEAT_COUNT_SPEC_RE.search(prop))
+        has_prop_federal = bool(_EXPLICIT_FEDERAL_BODY_RE.search(prop))
+
+        # Check for recognized Kalshi federal seat-count series (e.g. KXVAHOUSEDEM, KXTXHOUSEDEMSEATS)
+        is_kalshi_federal_seats = any(
+            _is_kalshi_federal_seats_symbol(sym)
+            for sym in (structured or "", prop.split()[0] if prop else "")
+        ) or (
+            has_prop_seat_count and any(
+                "housedem" in word or "houserep" in word or "housegop" in word
+                for word in prop.split()
+            )
+        )
+
+        # 2. Genuine federal seat counts must be established by the contest proposition itself
+        # (e.g. "Texas House of Representatives seats in the 2026 U.S. House elections") or
+        # by a recognized Kalshi federal seat-count series. Parent-event federal wording and
+        # incidental district targets cannot convert a question about the state chamber's seats
+        # into a federal contest.
+        if has_prop_seat_count:
+            return not (has_prop_federal or is_kalshi_federal_seats)
+
+        # 3. If the state chamber was only mentioned in parent context (not the proposition),
+        # a genuine district contest target in the proposition preserves the district race.
+        return not (not prop_has_state_chamber and bool(_DISTRICT_CONTEST_TARGET_RE.search(prop)))
+
+    if _STATE_SEATS_RE.search(prop) or _STATE_SEATS_RE.search(full_text):
+        if bool(_EXPLICIT_FEDERAL_BODY_RE.search(prop)):
+            return False
+        return not (structured in ("senate", "house"))
     return False
 
 
@@ -336,9 +422,15 @@ _KALSHI_STATE_CONTEST_RES = (
     ("governor", re.compile(r"^(?:KX)?GOV(?:PARTY)?[-_]?(?P<st>[A-Z]{2})(?:[-_](?P<yr>20[23]\d|[23]\d))?(?:[-_].*)?$")),
     ("governor", re.compile(r"^(?:KX)?(?P<st>[A-Z]{2})GOV(?:PARTY)?(?:[-_](?P<yr>20[23]\d|[23]\d))?(?:[-_].*)?$")),
     ("house", re.compile(r"^(?:KX)?HOUSE(?:PARTY)?[-_]?(?P<st>[A-Z]{2})[-_]?(?:\d+|AL)(?:[-_](?P<yr>20[23]\d|[23]\d))?(?:[-_].*)?$")),
-    ("house", re.compile(r"^(?:KX)?(?P<st>[A-Z]{2})HOUSE(?:PARTY)?[-_]?(?:\d+|AL)?(?:[-_](?P<yr>20[23]\d|[23]\d))?(?:[-_].*)?$")),
     ("house", re.compile(r"^(?:KX)?HOUSERACE[-_]?(?P<st>[A-Z]{2})(?:\d{2}|AL)(?:[-_](?P<yr>20[23]\d|[23]\d))?(?:[-_].*)?$")),
 )
+_KALSHI_STATE_HOUSE_SERIES_RE = re.compile(r"^(?:KX)?(?P<st>[A-Z]{2})HOUSE(?:[-_]|$)")
+
+
+def _is_kalshi_state_chamber_symbol(symbol: str) -> bool:
+    """Return True if symbol is a state legislative chamber series/ticker (e.g. KXTXHOUSE)."""
+    match = _KALSHI_STATE_HOUSE_SERIES_RE.match((symbol or "").upper())
+    return bool(match and match.group("st") in STATE_ABBRS)
 _KALSHI_SUFFIX_STATE_SERIES_RE = re.compile(
     r"^(?:KX)?(?:SENATEWITHIN\d*|CLOSEST(?:SENATE|GOVERNOR))$"
 )
@@ -404,6 +496,7 @@ def _evaluate_election_contest(
     symbol_years: set[int] | None = None,
     structured: str | None = None,
     is_tag_102289: bool = False,
+    proposition: str | None = None,
 ) -> tuple[bool, str]:
     """Decide from primary contest identity whether a market is a 2026 U.S. election contest.
 
@@ -439,7 +532,7 @@ def _evaluate_election_contest(
         has_us_context = explicit_us or bool(firm_states) or structured is not None
         return False, "conflicting_jurisdiction" if has_us_context else "foreign_election"
 
-    if _is_state_legislative_contest(text, structured=structured):
+    if _is_state_legislative_contest(text, structured=structured, proposition=proposition):
         return False, "state_legislative_contest"
     if len(states) >= 2:
         return False, "conflicting_state_context"
@@ -1127,8 +1220,13 @@ def is_2026_polymarket_market(
     ev_slug = ev.get("slug") or item.get("event_slug") or ""
     q = item.get("question") or ""
     slug = item.get("slug") or item.get("market_slug") or ""
-    identity = f"{q} {slug} {ev_title} {ev_slug}".strip()
-    eligible, reason = _evaluate_election_contest(identity, is_tag_102289=is_tag_102289)
+    prop = f"{q} {slug}".strip()
+    identity = f"{prop} {ev_title} {ev_slug}".strip()
+    eligible, reason = _evaluate_election_contest(
+        identity,
+        is_tag_102289=is_tag_102289,
+        proposition=prop,
+    )
     if eligible:
         return True, reason
 
@@ -1161,7 +1259,12 @@ def is_2026_kalshi_market(
     ev_subtitle = ev.get("sub_title") or ""
     cand_subtitle = m.get("yes_sub_title") or m.get("subtitle") or ""
 
-    if "STATESUPERMAJ" in m_series or "STATESUPERMAJ" in m_ticker:
+    if (
+        "STATESUPERMAJ" in m_series
+        or "STATESUPERMAJ" in m_ticker
+        or _is_kalshi_state_chamber_symbol(m_series)
+        or _is_kalshi_state_chamber_symbol(m_ticker)
+    ):
         return False, "state_legislative_contest"
 
     # Targeted exclusion for Lieutenant Governor across all subtitle sources
@@ -1195,6 +1298,7 @@ def is_2026_kalshi_market(
 
     # Candidate/outcome labels never establish jurisdiction or the cycle year.
     # Event subtitles describe the contest and remain part of its identity.
+    prop = f"{m_ticker} {m_series} {m_title}".strip()
     contest_identity = f"{m_title} {ev_subtitle} {ev_title}".strip()
 
     eligible, reason = _evaluate_election_contest(
@@ -1202,6 +1306,7 @@ def is_2026_kalshi_market(
         symbol_years=symbol_years,
         structured=structured,
         is_tag_102289=False,
+        proposition=prop,
     )
     return (True, None) if eligible else (False, reason)
 
@@ -1805,9 +1910,12 @@ def validate_dataset(data: dict[str, Any]) -> list[str]:
     bad_kalshi_stateleg = [
         m.get("market_ticker") for m in kalshi_markets
         if "STATESUPERMAJ" in (m.get("series_ticker") or "") or "STATESUPERMAJ" in (m.get("market_ticker") or "")
+        or _is_kalshi_state_chamber_symbol(m.get("series_ticker") or "")
+        or _is_kalshi_state_chamber_symbol(m.get("market_ticker") or "")
         or _is_state_legislative_contest(
             f"{m.get('title', '')} {m.get('subtitle', '')} {m.get('event_title', '')}",
             structured=_kalshi_structured_contest(m.get("series_ticker") or "", m.get("market_ticker") or ""),
+            proposition=f"{m.get('market_ticker', '')} {m.get('series_ticker', '')} {m.get('title', '')}".strip(),
         )
     ]
     if bad_kalshi_stateleg:

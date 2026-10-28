@@ -754,3 +754,321 @@ class TestCandidateLabelRolesAndFederalWording:
             "question": question,
         })
         assert eligible, reason
+
+# =====================================================================
+# Defect 9: State legislative House chamber contracts leak into federal House universe (S1-T5-F7)
+# =====================================================================
+
+class TestStateLegislativeHouseChamberAdmission:
+    """State legislative House chamber contracts (e.g. KXTXHOUSE 'Texas House of
+    Representatives winner') must not be admitted as federal House references,
+    while federal district races (HOUSETX15, KXHOUSERACE), genuine federal House
+    seat count markets (KXTXHOUSEDEMSEATS, KXCAHOUSEDEM), and federal wording
+    must be preserved.
+    """
+
+    @pytest.mark.parametrize("suffix,party", [
+        ("R", "Republican"),
+        ("D", "Democratic"),
+    ])
+    def test_recorded_kxtxhouse_markets_excluded(self, suffix: str, party: str) -> None:
+        """RECORDED: KXTXHOUSE-26-R and KXTXHOUSE-26-D from 0035_kalshi_standard.json
+        must be excluded as state legislative contests, not admitted as federal House.
+        """
+        market = {
+            "ticker": f"KXTXHOUSE-26-{suffix}",
+            "title": "Who will win the Texas House of Representatives?",
+            "status": "active",
+            "rules_primary": f"If the {party} Party wins the Texas House of Representatives in 2026, then the market resolves to Yes.",
+            "rules_secondary": "If both parties are tied, then the market resolves to No.",
+            "yes_sub_title": f"{party} Party",
+        }
+        event = {
+            "event_ticker": "KXTXHOUSE-26",
+            "series_ticker": "KXTXHOUSE",
+            "title": "Texas House of Representatives winner",
+            "sub_title": "In 2026",
+        }
+        eligible, reason = is_2026_kalshi_market(market, event)
+        assert not eligible, f"KXTXHOUSE {suffix} was improperly admitted"
+        assert reason == "state_legislative_contest"
+
+        # Classification must not be federal 'house'
+        race_type = classify_race("kalshi", market, event_title=event["title"])
+        assert race_type == "other", f"KXTXHOUSE classified as '{race_type}' instead of 'other'"
+        # Without event_title fallback
+        assert classify_race("kalshi", market) == "other"
+
+    @pytest.mark.parametrize("ticker,series,title,event_title", [
+        # SYNTHETIC CONTROL: Unprefixed TXHOUSE series
+        ("TXHOUSE-26-R", "TXHOUSE", "Who will win the Texas House of Representatives?", "Texas House of Representatives winner"),
+        # RECORDED / SYNTHETIC: KXPAHOUSE state legislative lower chamber
+        ("KXPAHOUSE-262-GOP", "KXPAHOUSE", "Who will win the Pennsylvania State House election?", "Pennsylvania State House winner?"),
+        # SYNTHETIC CONTROL: Florida House of Representatives state chamber
+        ("KXFLHOUSE-26-R", "KXFLHOUSE", "Who will win the Florida House of Representatives?", "Florida House of Representatives winner"),
+        # SYNTHETIC CONTROL: Ohio House of Representatives state chamber
+        ("KXOHHOUSE-26-R", "KXOHHOUSE", "Who will win the Ohio House of Representatives?", "Ohio House of Representatives winner"),
+    ])
+    def test_kalshi_state_chamber_series_and_titles_excluded(
+        self, ticker: str, series: str, title: str, event_title: str
+    ) -> None:
+        market = {
+            "ticker": ticker,
+            "title": title,
+            "status": "active",
+        }
+        event = {
+            "event_ticker": series,
+            "series_ticker": series,
+            "title": event_title,
+            "sub_title": "In 2026",
+        }
+        eligible, reason = is_2026_kalshi_market(market, event)
+        assert not eligible, f"State chamber market {ticker} was improperly admitted"
+        assert reason == "state_legislative_contest"
+        assert classify_race("kalshi", market, event_title=event_title) == "other"
+
+    @pytest.mark.parametrize("question,slug", [
+        # SYNTHETIC CONTROL: Polymarket state House of Representatives contests
+        ("Who will win the Texas House of Representatives in 2026?", "who-will-win-the-texas-house-of-representatives-in-2026"),
+        ("Who will win the Florida House of Representatives in 2026?", "who-will-win-the-florida-house-of-representatives-in-2026"),
+        ("Who will win the Ohio House of Representatives in 2026?", "who-will-win-the-ohio-house-of-representatives-in-2026"),
+    ])
+    def test_polymarket_state_house_of_reps_excluded(self, question: str, slug: str) -> None:
+        item = {
+            "active": True,
+            "closed": False,
+            "question": question,
+            "slug": slug,
+        }
+        eligible, reason = is_2026_polymarket_market(item, is_tag_102289=True)
+        assert not eligible, f"Polymarket state chamber was improperly admitted: {question}"
+        assert reason == "state_legislative_contest"
+        assert classify_race("polymarket", item) == "other"
+
+    def test_federal_seat_count_and_district_boundaries_preserved(self) -> None:
+        """Boundary preservation: federal district contracts, KXHOUSERACE, and
+        genuine federal House seat count series must remain admitted.
+        """
+        # RECORDED: KXTXHOUSEDEMSEATS genuine federal seat count
+        demseats_m = {
+            "ticker": "KXTXHOUSEDEMSEATS-26NOV03-B8",
+            "title": "Will Democrats win below 8 seats in 2026 U.S. House of Representatives elections in Texas?",
+            "status": "active",
+            "rules_primary": "If Democrats win below 8 seats in the 2026 U.S. House of Representatives elections in Texas, then the market resolves to Yes.",
+        }
+        demseats_ev = {
+            "event_ticker": "KXTXHOUSEDEMSEATS",
+            "series_ticker": "KXTXHOUSEDEMSEATS",
+            "title": "How many House seats will Democrats win in Texas?",
+        }
+        eligible, reason = is_2026_kalshi_market(demseats_m, demseats_ev)
+        assert eligible, f"Federal seat count was improperly excluded: {reason}"
+        assert classify_race("kalshi", demseats_m, event_title=demseats_ev["title"]) == "house"
+
+        # RECORDED: KXCAHOUSEDEM genuine federal seat count
+        ca_m = {
+            "ticker": "KXCAHOUSEDEM-26NOV03-B44",
+            "title": "Will Democrats win below 44 seats in California?",
+            "status": "active",
+        }
+        ca_ev = {
+            "event_ticker": "KXCAHOUSEDEM",
+            "series_ticker": "KXCAHOUSEDEM",
+            "title": "How many House seats will Democrats win in California?",
+            "sub_title": "In 2026",
+        }
+        eligible, reason = is_2026_kalshi_market(ca_m, ca_ev)
+        assert eligible, f"KXCAHOUSEDEM was improperly excluded: {reason}"
+        assert classify_race("kalshi", ca_m, event_title=ca_ev["title"]) == "house"
+
+        # RECORDED: Federal district race mentioning Texas House
+        # (must not be excluded by a broad 'Texas House' substring check)
+        dist_m = {
+            "ticker": "HOUSETX15-26-D",
+            "event_ticker": "HOUSETX15-26",
+            "title": "Will Democrats win the House race for TX-15?",
+            "status": "active",
+            "rules_primary": "If the House member sworn in for TX-15 for the term beginning in 2027 is a member of the Democratic Party, then the market resolves to Yes.",
+            "rules_secondary": "This market is eligible for accelerated determination after a consensus of media organizations project the winner. See full rules for details.",
+        }
+        dist_ev = {
+            "event_ticker": "HOUSETX15-26",
+            "series_ticker": "HOUSETX15",
+            "title": "TX-15 House winner?",
+            "sub_title": "TX-15",
+        }
+        eligible, reason = is_2026_kalshi_market(dist_m, dist_ev)
+        assert eligible, f"Federal district TX-15 was improperly excluded: {reason}"
+        assert classify_race("kalshi", dist_m, event_title=dist_ev["title"]) == "house"
+
+        # SYNTHETIC CONTROL: Question wording with 'Texas House race for TX-15'
+        # Broad substring check for 'Texas House' would break this.
+        poly_dist = {
+            "active": True,
+            "closed": False,
+            "question": "Will Democrats win the Texas House race for TX-15 in 2026?",
+            "slug": "texas-house-race-tx-15-2026",
+        }
+        eligible, reason = is_2026_polymarket_market(poly_dist, is_tag_102289=True)
+        assert eligible, f"District question was improperly excluded: {reason}"
+        assert classify_race("polymarket", poly_dist) == "house"
+
+    @pytest.mark.parametrize("parent_title", [
+        # Polymarket state chamber with unrelated federal House parent event title
+        "2026 U.S. House elections",
+        # Polymarket state chamber with unrelated seat-count parent event title
+        "How many seats in the 2026 election?",
+    ])
+    def test_polymarket_state_house_of_reps_parent_event_wording_excluded(self, parent_title: str) -> None:
+        """Unrelated parent event wording ('2026 U.S. House elections' or
+        'How many seats in the 2026 election?') must not cancel a state-chamber
+        exclusion on the actual contest proposition.
+        """
+        item = {
+            "active": True,
+            "closed": False,
+            "question": "Who will win the Texas House of Representatives in 2026?",
+            "slug": "who-will-win-the-texas-house-of-representatives-in-2026",
+        }
+        parent_event = {"title": parent_title}
+        eligible, reason = is_2026_polymarket_market(item, parent_event=parent_event, is_tag_102289=True)
+        assert not eligible, f"State chamber market was improperly admitted with parent '{parent_title}': {reason}"
+        assert reason == "state_legislative_contest"
+        assert classify_race("polymarket", item, event_title=parent_title) == "other"
+
+    @pytest.mark.parametrize("question,slug", [
+        # Ambiguous questions combining state chamber proposition with incidental federal wording
+        (
+            "Who will win the Texas House of Representatives in the 2026 congressional elections?",
+            "who-will-win-the-texas-house-of-representatives-in-the-2026-congressional-elections",
+        ),
+        (
+            "Who will win the Texas House of Representatives in the 2026 U.S. House elections?",
+            "who-will-win-the-texas-house-of-representatives-in-the-2026-u-s-house-elections",
+        ),
+        (
+            "Who will win the Texas House of Representatives in the 2026 federal midterms?",
+            "who-will-win-the-texas-house-of-representatives-in-the-2026-federal-midterms",
+        ),
+    ])
+    def test_polymarket_state_chamber_incidental_federal_wording_fails_closed(
+        self, question: str, slug: str
+    ) -> None:
+        """Ambiguous identity combining a state chamber proposition with incidental
+        federal wording must fail closed as state_legislative_contest and 'other'.
+        """
+        item = {
+            "active": True,
+            "closed": False,
+            "question": question,
+            "slug": slug,
+        }
+        eligible, reason = is_2026_polymarket_market(item, is_tag_102289=True)
+        assert not eligible, f"Ambiguous state chamber market was improperly admitted: {question}"
+        assert reason == "state_legislative_contest"
+        assert classify_race("polymarket", item) == "other"
+
+    def test_polymarket_texas_house_seats_in_us_house_elections_preserved(self) -> None:
+        """A genuine federal seat-count question specifying 'Texas House of Representatives
+        seats in the 2026 U.S. House elections' must remain admitted as a federal reference.
+        """
+        item = {
+            "active": True,
+            "closed": False,
+            "question": "Texas House of Representatives seats in the 2026 U.S. House elections",
+            "slug": "texas-house-of-representatives-seats-in-the-2026-u-s-house-elections",
+        }
+        eligible, reason = is_2026_polymarket_market(item, is_tag_102289=True)
+        assert eligible, f"Federal seat-count market was improperly excluded: {reason}"
+        assert classify_race("polymarket", item) == "house"
+
+    def test_polymarket_state_chamber_slug_containing_district_excluded(self) -> None:
+        """State-chamber question 'Who will win the Texas House of Representatives in 2026?'
+        with a slug containing 'tx-15' must not be admitted.
+        A district code in the slug must not override an explicit state-chamber winner proposition.
+        Must be excluded as state_legislative_contest and classified other.
+        """
+        item = {
+            "active": True,
+            "closed": False,
+            "question": "Who will win the Texas House of Representatives in 2026?",
+            "slug": "who-will-win-the-texas-house-of-representatives-in-2026-tx-15",
+        }
+        eligible, reason = is_2026_polymarket_market(item, is_tag_102289=True)
+        assert not eligible, f"State-chamber market with district slug was improperly admitted: {reason}"
+        assert reason == "state_legislative_contest"
+        assert classify_race("polymarket", item) == "other"
+
+    def test_polymarket_state_chamber_incidental_district_appended_excluded(self) -> None:
+        """State-chamber question with 'TX-15 is also on the ballot' appended must
+        not be admitted. A district code mentioned elsewhere must not override
+        an explicit state-chamber winner proposition.
+        Must be excluded as state_legislative_contest and classified other.
+        """
+        item = {
+            "active": True,
+            "closed": False,
+            "question": "Who will win the Texas House of Representatives in 2026? TX-15 is also on the ballot",
+            "slug": "who-will-win-the-texas-house-of-representatives-in-2026",
+        }
+        eligible, reason = is_2026_polymarket_market(item, is_tag_102289=True)
+        assert not eligible, f"State-chamber market with incidental district text was improperly admitted: {reason}"
+        assert reason == "state_legislative_contest"
+        assert classify_race("polymarket", item) == "other"
+
+    def test_polymarket_state_chamber_how_many_seats_parent_event_excluded(self) -> None:
+        """Question 'How many seats will Democrats win in the Texas House of Representatives in 2026?'
+        with parent event title '2026 U.S. House elections' must not be admitted.
+        Parent event federal wording cannot convert a question about the state chamber's seats
+        into a federal House contest.
+        Must be excluded as state_legislative_contest and classified other.
+        """
+        item = {
+            "active": True,
+            "closed": False,
+            "question": "How many seats will Democrats win in the Texas House of Representatives in 2026?",
+            "slug": "how-many-seats-will-democrats-win-in-the-texas-house-of-representatives-in-2026",
+        }
+        parent_event = {"title": "2026 U.S. House elections"}
+        eligible, reason = is_2026_polymarket_market(item, parent_event=parent_event, is_tag_102289=True)
+        assert not eligible, f"State-chamber seats market was improperly admitted: {reason}"
+        assert reason == "state_legislative_contest"
+        assert classify_race("polymarket", item, event_title=parent_event["title"]) == "other"
+
+    def test_polymarket_state_chamber_specific_seats_parent_event_excluded(self) -> None:
+        """Question 'Will Democrats win 51 seats in the Texas House of Representatives in 2026?'
+        with parent event title '2026 U.S. House elections' must not be admitted.
+        Parent event federal wording cannot convert a question about the state chamber's seats
+        into a federal House contest.
+        Must be excluded as state_legislative_contest and classified other.
+        """
+        item = {
+            "active": True,
+            "closed": False,
+            "question": "Will Democrats win 51 seats in the Texas House of Representatives in 2026?",
+            "slug": "will-democrats-win-51-seats-in-the-texas-house-of-representatives-in-2026",
+        }
+        parent_event = {"title": "2026 U.S. House elections"}
+        eligible, reason = is_2026_polymarket_market(item, parent_event=parent_event, is_tag_102289=True)
+        assert not eligible, f"State-chamber specific seats market was improperly admitted: {reason}"
+        assert reason == "state_legislative_contest"
+        assert classify_race("polymarket", item, event_title=parent_event["title"]) == "other"
+
+    def test_polymarket_state_chamber_seats_incidental_district_target_excluded(self) -> None:
+        """Question 'How many seats will Democrats win in the Texas House of Representatives in 2026? TX-15 House race also on ballot'
+        with matching state-chamber slug must not be admitted.
+        An incidental district target cannot convert a question about the state chamber's seats
+        into a federal House contest.
+        Must be excluded as state_legislative_contest and classified other.
+        """
+        item = {
+            "active": True,
+            "closed": False,
+            "question": "How many seats will Democrats win in the Texas House of Representatives in 2026? TX-15 House race also on ballot",
+            "slug": "how-many-seats-will-democrats-win-in-the-texas-house-of-representatives-in-2026",
+        }
+        eligible, reason = is_2026_polymarket_market(item, is_tag_102289=True)
+        assert not eligible, f"State-chamber seats with incidental district target was improperly admitted: {reason}"
+        assert reason == "state_legislative_contest"
+        assert classify_race("polymarket", item) == "other"
