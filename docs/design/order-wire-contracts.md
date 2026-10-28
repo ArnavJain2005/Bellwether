@@ -369,8 +369,8 @@ every pause (hard rule 3).
 | W10-g | Batch 207 and completion | documented | "If any item returns 429 or 5xx, the outer batch remains incomplete; retry with the same key ... After a completed 207, resubmit failed items under a new batch key" ([BATCH]) | A 207 is complete only when no item has status 429 or 5xx | A failed item gets a new key only after a complete 207 shows it failed terminally |
 | W10-h | Batch 429 (every item engine-rate-limited) | documented | "In the second case nothing was placed ... Retry the identical ordered batch with the same idempotency key after that wait" (`#/paths/~1orders~1batch/post/responses/429/description`); per item, "nothing was placed for it" ([BATCH]) | None | As documented |
 | W10-i | Multi-leg 503 and response loss | documented (cases); unknown (outcome) | Four 503 causes, including "engine persistence backpressure while confirming" (`#/paths/~1orders~1multi-leg/post/responses/503/description`); "an incomplete claim after response loss resumes with the same engine key so the engine rehydrates the accepted command" ([ML]) | As W10-e | Same-key identical retry; unknown meanwhile |
-| W10-j | Timeout, reset connection or no response | unknown | No statement found | Q-S12 | Unknown outcome: same-key identical retry within retention (unknown, W9-d), never a new key, engine paused until resolved (hard rule 6) |
-| W10-k | 500 and 429 on placement | documented (codes); unknown (outcome) | `DATABASE_ERROR`, `INTERNAL_ERROR` (500), `RATE_LIMITED` (429, `Retry-After: 60`) ([INFO]). The spec does not say whether a placement answered 500 or 429 was executed | Q-S12 | Unknown outcome; same-key retry only |
+| W10-j | Timeout, reset connection or no response | unknown | No statement found that a retry after no response deduplicates, especially after a restart or unknown retention interval (W9-d) | Q-S12 | Outcome stays unknown and the engine paused; do not automatically retry or submit under a new key. Reconcile and seek Arnav/SIG guidance before any retry |
+| W10-k | 500 and 429 on placement | documented (codes); unknown (outcome) | `DATABASE_ERROR`, `INTERNAL_ERROR` (500), `RATE_LIMITED` (429, `Retry-After: 60`) ([INFO]). [INFO] tells callers to back off and retry a 429; it gives no placement-outcome guarantee for a 500 or a generic 429 | Q-S12 | A 500 stays unknown and paused, with no automatic retry. On a 429 `RATE_LIMITED`, wait at least `Retry-After` and use the identical request and key if retrying under the documented rate-limit rule; do not infer from the 429 alone that no order was placed. Never use a new key for an unknown outcome |
 | W10-l | Cancel one order: 503 and 409 | documented | 503: "Cancellation was not confirmed ... Retry — a retry of a completed cancel returns 409" (`#/paths/~1orders~1{id}/delete/responses/503/description`); 409: "already closed because it was filled or cancelled by a concurrent request" (`#/paths/~1orders~1{id}/delete/responses/409/description`); 200 echoes `tournamentId` (`#/paths/~1orders~1{id}/delete/responses/200/content/application~1json/schema/properties/tournamentId/description`) | A 409 does not say whether the order filled or was cancelled; read it | Retry until 200 or 409, then read the order and its fills |
 | W10-m | Cancel-all: 200 and 503 | documented | 200: "Every targeted order is cancelled; none remains open" (`#/paths/~1orders~1cancel-all/post/responses/200/description`). 503: "`error.details.cancelled` reports how many orders this request confirmed cancelled; some targeted orders may still be open. Retry the same request until it returns 200 ... A 503 without `error.details.cancelled` was refused before anything was cancelled" (`#/paths/~1orders~1cancel-all/post/responses/503/description`); "The request may have cancelled at least this many" ([CXLP]) | Observed behaviour on the tournament (G-4, X3) | Retry the identical scoped request until 200; then verify with an all-pages `status=open` walk |
 
@@ -408,7 +408,7 @@ passed by this note.** A documented behaviour or a proposed check is not gate ev
 | G-1 Commitment and classification | `myBalance` is the only scoped candidate (W11-b); no reservation statement (W11-f); netting and canonicalisation rules (W8-c, W8-d); cost and price denominations unknown (W4, W5, W6) | OQ-C1 to OQ-C5; the cash source (D-5); whether bounded evidence suffices | R1, X1 (reservation), R3/R4 if holdings exist | Commitment counts filled, resting and unresolved orders as defined; the classification file is committed and reviewed; ceilings use confirmed values only |
 | G-2 Equity and loss trigger | `currentPrice` meaning; the 409 (W5-d, W5-i); `totalAccountValue` has no description (A1 2.5) | OQ-D1 to OQ-D5 | R3 (P&L and positions shapes); PRD B leaderboard valuation | The trigger latches, attempts cancellation, holds until reset; stale and missing marks follow the policy |
 | G-3 Restart and readiness | Scope binding of each read (A1 1.2); no key in order reads (W9-f); ambiguous outcomes (W10); `projectedThroughSequence` is provenance only | OQ-E1 to OQ-E4; retention bound once known (W9-d) | R1 to R5 (shapes, coverage, pagination); Q-S3, Q-S11, Q-S12 | No order before tournament cash, positions, all open-order pages and fills are reconciled; every unknown key resolved or paused; no atomicity claimed |
-| G-4 Outage protection and cancellation | Cancel-all and expiry semantics (W10-m, W6-e, section 2.4) | OQ-G1 lifetime, OQ-G2 allowed resting styles, the maximum resting commitment | X3 (cancel-all), X4 (expiry); Q-S13 | Bounds recorded with that evidence; until then resting orders are assumed live and fillable during an outage |
+| G-4 Outage protection and cancellation | Cancel-all and expiry semantics (W10-m, W6-e, section 2.4) | OQ-G1 lifetime, OQ-G2 allowed resting styles, the maximum resting commitment | X3 (cancel-all); X4 tests expiry acceptance and reporting only. A separate, reviewed real-platform check of post-expiry matching prevention is still needed; Q-S13 alone is insufficient | Bounds recorded only after that evidence; until then resting orders are assumed live and fillable during an outage |
 | G-5 Configuration changes | Nothing: G-5 has no wire dependency | OQ-F1 to OQ-F3 | None | Validation, versioning, audit log, impact assessment and the over-limit policy |
 | G-6 Order path safety | Tick and market-order rules (W2-a, W2-b); retry rules (W10) | D-1 (NO price), D-6 (rounding), retry handling outside the documented cases | X2 if D-1 asks for it | Bypass test; limit-only on-tick; sell never above held; key saved before send; same-key retries; dry-run default; second-model review |
 | G-7 API wire contract | Every OQ-W row's status (section 1) | Which citations count as answers (D-1, D-3) | Section 3, where a row names a check | Boundary conversion tests for every settled rule; every open row shown unused or fail-closed (section 2.7) |
@@ -467,8 +467,9 @@ them in configuration or code (hard rule 9).
 
   What stays open:
   - retention (W9-d, W9-e) and the outcomes behind W10-d, W10-e, W10-j and W10-k;
-  - what happens when neither retry nor reads settle an outcome. The engine stays paused
-    and Arnav resolves it by hand (proposed).
+  - what happens when neither a documented retry nor reads settle an outcome. In particular,
+    a timeout, 500 or non-`REQUEST_IN_FLIGHT` 409 is not an automatic-retry instruction.
+    The engine stays paused and Arnav resolves it by hand (proposed).
 - **OQ-E2, fills during downtime.** [TFILLS] is newest first with no time window, so a
   walk must reach fills older than the last reconciled one. Whether such fills are
   normal or pause for review is policy.
@@ -520,10 +521,14 @@ Not documented:
 
 Consequences for G-4:
 
-- Until X3, X4 and Q-S13 give evidence and Arnav decides, the PRD's assumption stands:
-  resting orders stay live and can fill during an outage.
-- A maximum resting lifetime is measurable only as the expiry Bellwether sets, and only
-  if expired orders are shown not to fill.
+- X3 can observe cancel-all; X4 can observe expiry acceptance and reporting. X4
+  cannot test whether an expired order stops matching. A separate, reviewed
+  real-platform check is needed for that G-4 requirement; Q-S13 alone does not
+  complete the check. Until then, the PRD's assumption stands: resting orders
+  stay live and can fill during an outage.
+- Do not record a protected maximum resting lifetime until real-platform evidence
+  shows expired orders stop filling; an expiration timestamp or an empty fill list
+  from a far-from-market order does not show this.
 - A maximum resting commitment needs W6-a or W3 to price resting orders.
 - OQ-G2 (which order styles may rest at all) is Arnav's choice. "No resting orders" is
   one option, and so is "only with an expiry". Marketable orders whose remainder is
@@ -570,7 +575,8 @@ are shown unused or fail-closed.
 - YES-side request price `ticks/200`;
 - the NO-side price, only after D-1;
 - exact `Decimal` formatting of the request, and byte-identical resend;
-- the documented retry state machine (W10-a to W10-c, W10-f to W10-i);
+- the documented retry state machine (W10-a to W10-c, W10-e to W10-i, and the
+  `RATE_LIMITED` backoff in W10-k);
 - cancel-all always sent with `tournamentId`.
 
 ## 3. Arnav-only evidence runbook
@@ -698,7 +704,7 @@ answered on its own.
 - *Requests:* `GET /orders` with `tournamentId`, `limit=200`, for:
   - `status=open`, walked until `hasMore: false` (cap 10 pages);
   - `status=all`, walked the same way;
-  - `status=expired`, one page.
+  - `status=expired`, walked the same way.
 
   At least 3 reads.
 - *Inspect, per page:* `pagination`, `coverage` presence and values. Per item: field
@@ -796,21 +802,35 @@ its own. They are not prerequisites of each other except where stated. X5 is a r
 and a distinct decision.
 
 **Common design.**
-- *Prerequisites:* R1 and R2 done; no open test order; Arnav present for the whole
-  session; the trade key used from his own machine.
-- *Size:* every order is `quantity: 1`. The most a buy of one share can cost is its
-  price, which is below 1 SUSQie.
-- *Price:* every price is on the 0.005 grid and far from the market. "Far" here means
-  that the price would need a large move before it could match, not that it cannot
-  match. **A far-from-market order can still fill,** including while the session is
-  interrupted. A fill of one share bounds the money at risk, not the behaviour.
-- *Keys:* each request's `idempotencyKey` is generated fresh, written down before
-  sending, and reused only for an identical retry (practising hard rule 6).
-- *Never:* an empty cancel-all body; a request without `tournamentId`; a market order; a
-  sell (except optional X6).
-- *Record:* the full response of every placement, including whether the canonical fields
-  (`action`, `side`, `price`, `quantity`, `remainingQuantity`, `terminalReasonCode`) are
-  present (W8-a).
+- *Prerequisites:* R1 and R2 complete, with an all-pages `status=open` inventory;
+  Arnav present for the whole session; the trade key used from his own machine.
+  Before each placement, repeat the open-order inventory and record all existing IDs.
+  A test order is identified by its confirmed ID, not just by a price or a time.
+- *Exclusive context for X3:* tournament-wide cancel-all is an intentional sweep of
+  **all** open, unexpired orders in the tournament. Run X3 only if the complete
+  inventory shows no unrelated orders, no other actor or automation can submit during
+  the check, and Arnav accepts the residual race between the last read and cancel-all.
+  If exclusivity cannot be established, do not run X3. X1, X2 and X4 use targeted
+  per-order cancellation for their normal cleanup.
+- *Size:* every test order requests `quantity: 1` at a limit below 1. The
+  total debit, any fee and fill-price bound are not established (W2-d, W4-h);
+  do not present the limit as a proved maximum cash cost. Arnav reviews
+  this exposure before any write.
+- *Price:* every price is on the 0.005 grid and far from the market. "Far" means
+  that a large move would be needed before matching, not that matching is impossible.
+  **A far-from-market order can fill during an interruption.**
+- *Keys:* each placement's `idempotencyKey` is generated fresh and written down before
+  sending; documented retries reuse only the identical request and key.
+- *Scope:* every placement includes the configured `tournamentId`. Every book or
+  quote read that accepts `tournamentId` sends it explicitly; tournament portfolio
+  paths use the configured slug. An order-ID read or targeted cancel derives its
+  context from that ID and must be checked against the recorded test order.
+- *Never:* an empty cancel-all body; an unscoped request; a market order; or a sell
+  unless the holding and its units are established (hard rule 5).
+- *Record:* the full placement response, including whether the canonical fields
+  (`action`, `side`, `price`, `quantity`, `remainingQuantity`,
+  `terminalReasonCode`) are present (W8-a). Keep request and response secrets out
+  of committed evidence.
 
 **Choosing a price for a NO order (X2).** For a NO buy at request price `x` on an
 exchange with YES best bid `b`:
@@ -825,19 +845,27 @@ does not send if either margin is small.
 
 **X1. Reservation and cash around one resting YES buy (priority 1 of 3.4).**
 - *Informs:* OQ-C3 and W11, plus W8-a and W6.
-- *Setup:* an exchange with a high YES price (best bid well above 0.5). A YES buy at an
-  on-tick `x` far below the best bid, with no expiry.
+- *Setup:* an exchange with a high YES price (best bid well above 0.5),
+  checked with a fresh `GET /exchanges/{id}/orderbook?tournamentId=...&depth=200`.
+  A YES buy at an on-tick `x` far below that bid, with no expiry. Arnav separately
+  accepts the risk that it can remain live if cleanup becomes unreachable.
 - *Sequence:*
-  1. R1 (balance A); R2 `status=open` walk (no test order).
-  2. `POST /orders` (1 write).
-  3. R1 (B); `GET /orders/{id}`; `GET /orders/{id}/fills` (expect the `tournamentId`
-     echo and `totalQuantityFilled` 0); `GET /exchanges/{id}/orderbook?depth=200` (one
-     more share at `x`).
+  1. R1 (balance A); complete R2 `status=open` walk; record any pre-existing
+     order IDs. If any are unexplained, stop before placement.
+  2. `POST /orders` with explicit `tournamentId` (1 write). Record its order ID.
+  3. R1 (B); `GET /orders/{id}`; `GET /orders/{id}/fills` (inspect the
+     `tournamentId` echo and `totalQuantityFilled`);
+     `GET /exchanges/{id}/orderbook?tournamentId=...&depth=200` (inspect
+     the YES level at `x`).
   4. After about 60 s, R1 (C).
-  5. `DELETE /orders/{id}` (1 write; record the `tournamentId` echo).
-  6. R1 (D); `status=open` walk (no test order); `GET /orders/{id}` (`open: false`).
+  5. `DELETE /orders/{id}` for **this test order only** (1 write). Record
+     the `tournamentId` echo on 200; a 409 may mean filled or cancelled,
+     so inspect the order and its fills before drawing a conclusion.
+  6. R1 (D); complete `status=open` walk; `GET /orders/{id}` and its fills.
+     Do not call cleanup complete until this test order is confirmed closed or
+     the unresolved status has been escalated. Never cancel unrelated orders.
 
-  About 12 reads and 2 writes.
+  About 12 reads and 2 writes, plus any pages or reconciliation needed.
 - *Results:*
   - B = A − x, and D = A: one observation consistent with this resting order being
     deducted at its limit (OQ-C3);
@@ -846,88 +874,140 @@ does not send if either margin is small.
   - anything else: unexplained, reported.
 - *Limits:* it cannot show that admission uses `myBalance` (W11-e), and it says nothing
   about many orders or other times.
-- *Abort:* the response is not `open: true` with `quantityTraded` 0, or any 5xx or
-  timeout (see the abort plan).
+- *Abort:* a response not `open: true` with `quantityTraded` 0, any fill, 5xx,
+  409, timeout, or unexpected order: stop placement and follow the response-specific
+  abort plan. A known test ID is cancelled individually if reachable.
 
 **X2. NO request price and `priceLimit` (priority 2; only if D-1 asks for it).**
 - *Informs:* OQ-W3 and OQ-W6.
-- *Setup:* a long-shot exchange and an `x` chosen as above. A NO buy, quantity 1, no
-  expiry.
-- *Sequence:* R2 walk; `POST /orders`; `GET /orders/{id}`; book read at depth 200;
-  `DELETE /orders/{id}`; R2 walk. About 5 reads and 2 writes.
+- *Setup:* a long-shot exchange and an `x` chosen as above from a fresh
+  `GET /exchanges/{id}/orderbook?tournamentId=...&depth=200`. A NO buy,
+  quantity 1, no expiry. Arnav accepts that it can fill despite both margins.
+- *Sequence:* complete R2 `status=open` walk, recording existing IDs;
+  `POST /orders` with explicit `tournamentId`; `GET /orders/{id}`;
+  `GET /exchanges/{id}/orderbook?tournamentId=...&depth=200`;
+  `DELETE /orders/{id}` for this test order only; complete R2 `status=open`
+  walk, order detail and per-order fills. About 7 reads and 2 writes,
+  plus any extra pages.
 - *Results:*
   - canonical `price` = `x`: the request was read side-relative; `1 − x`: read as a YES
     price;
   - `priceLimit` = `x` or `1 − x` gives its denomination (W6-a);
   - a YES-normalised book level at `1 − x` (if read side-relative) or `x` (if YES)
     corroborates;
-  - canonical fields absent: placement not engine-routed in this response (W8-a); rely on
-    `priceLimit` and the book.
-- *Limits:* one order. Nothing about fills (W4) or positions (W5).
-- *Abort:* any `quantityTraded` above 0 means a NO share is now held. Record it, do not
-  sell, and Arnav decides whether to hold it to settlement.
+  - canonical fields absent: placement not engine-routed in this response
+    (W8-a); the order row and scoped book are only bounded observations.
+- *Limits:* one order. Nothing about fills (W4) or positions (W5), unless
+  the order unexpectedly fills.
+- *Abort:* any `quantityTraded` above 0 means a NO share may now be held.
+  Record fills and positions; do not sell while held units remain unresolved.
+  Follow the response-specific abort plan and do not declare cleanup complete
+  solely because the order stopped resting.
 
 **X3. Tournament-scoped cancel-all (priority 1 of 3.4; G-4).**
 - *Informs:* PRD B (cancel-all in one write) and G-4.
-- *Setup:* three far-from-market resting buys of quantity 1 on at least two exchanges,
-  placed as three single orders (3 writes) or one batch (1 write, which also yields a
-  batch response).
+- *Exclusive setup:* complete fresh `GET /orders?status=open&tournamentId=...&limit=200`
+  walk to `hasMore: false`, with `coverage.complete: true` on every page;
+  otherwise stop. Require no unrelated open orders. Coverage still does
+  not prove projection freshness or make the walk atomic (A1-N1).
+  Confirm no other actor or automation will submit during this bounded session.
+  Otherwise **do not run X3**. Choose prices from fresh scoped
+  `GET /exchanges/{id}/orderbook?tournamentId=...&depth=200` reads.
+  Place three far-from-market buys of quantity 1 with no expiry
+  on at least two exchanges, as three single orders (3 writes) or one batch
+  (1 write), each with explicit `tournamentId`. Record the IDs and fills.
 - *Sequence:*
-  1. `status=open` walk (the three test orders listed; record their IDs).
-  2. `POST /orders/cancel-all` with the body `{"tournamentId": "bda92870-621e-47b0-bc3c-3602c5c26f55"}`
+  1. Immediately before cancel-all, repeat the complete scoped `status=open`
+     walk. It must show **exactly** the three test orders, all unexpired.
+     If an unexpected order appears, stop: cancel only the known test IDs
+     with `DELETE /orders/{id}` and do not run cancel-all.
+  2. `POST /orders/cancel-all` with the body
+     `{"tournamentId": "bda92870-621e-47b0-bc3c-3602c5c26f55"}`
      only (1 write).
-  3. On 503: record `details.cancelled` (or its absence), wait for `Retry-After` or back
-     off, and resend the identical request until 200. Stop after 5 attempts and escalate.
-  4. `status=open` walk to `hasMore: false` (expect none of the three); `GET /orders/{id}`
-     for each (`open: false`); `GET /orders/{id}/fills` for each (no fills); a book read.
+  3. On 503, record `details.cancelled` (or absence). Re-check the complete
+     scoped open-order inventory before each retry. Only if every remaining
+     open order belongs to the test set and exclusivity still holds, wait for
+     `Retry-After` or back off and repeat the identical scoped request until
+     200 (at most 5 attempts). If not exclusive, stop broad cancellation
+     and use targeted cleanup; the G-4 cancel-all result stays inconclusive.
+  4. Complete scoped `status=open` walk (no test order); `GET /orders/{id}`
+     and `GET /orders/{id}/fills` for each; scoped
+     `GET /exchanges/{id}/orderbook?tournamentId=...&depth=200` if
+     checking book removal.
 
-  About 8 reads and 4 to 8 writes.
+  Read count depends on page walks and 503 retries. The planned writes are
+  2 (batch plus cancel) or 4 (three single orders plus cancel), with up to
+  four additional cancel-all retries.
 - *Results:*
   - 200 with `cancelled` 3 and an empty walk: one observation consistent with [CXL];
   - `cancelled` below 3 with 200: check fills and order states;
-  - any test order still open after a 200: a contradiction. Cancel each with
-    `DELETE /orders/{id}`, stop and report to SIG.
+  - any test order still reported open after 200: possible reporting lag
+    or a contradiction. Re-read the scoped listing with coverage and
+    the order by ID; cancel that known ID individually if it remains
+    open, stop and report the discrepancy to SIG.
 - *Limits:*
-  - three orders, not hundreds;
-  - a partial 503 cannot be produced on purpose;
-  - nothing about an outage, or about orders in other contexts (do not create any to
-    test this).
-- *Abort:* the abort plan.
+  - only three orders, not hundreds; a partial 503 cannot be produced on purpose;
+  - a read cannot make the subsequent cancel-all atomic: another actor's
+    order appearing after the last walk could also be cancelled. If that
+    possibility cannot be accepted, do not perform X3;
+  - nothing about outages or other contexts.
+- *Abort:* the response-specific abort plan. Never use this check to
+  cancel unrelated orders.
 
 **X4. Expiry (priority 2 of 3.4; G-4, OQ-G1).**
-- *Informs:* OQ-G1 (whether expiry is accepted and closes the order).
-- *Setup:* one far-from-market buy of quantity 1 with `expirationDate` about 10 minutes
-  ahead (UTC, ISO 8601 with milliseconds and `Z`).
+- *Informs:* whether this tournament accepts `expirationDate`, records it,
+  and reports an order expired. **It cannot by itself show that the order
+  is excluded from matching after expiry.** That part of G-4 remains blocked.
+- *Setup:* one far-from-market buy of quantity 1, priced from a fresh
+  `GET /exchanges/{id}/orderbook?tournamentId=...&depth=200`, with explicit
+  `tournamentId` and an `expirationDate` about 10 minutes ahead (UTC,
+  ISO 8601 with milliseconds and `Z`). Arnav accepts that the order can
+  fill or remain live if the API becomes unreachable.
 - *Sequence:*
-  1. Before expiry: the `POST /orders` response; `GET /orders/{id}` (the
-     `expirationDate` echo, exact); `GET /markets/{id}/orderbook?tournamentId=...`
-     (`nextExpiryAt`); `status=open` walk (listed).
-  2. Two minutes after expiry: `status=open` walk (absent?); `status=expired` page
-     (present?); `GET /orders/{id}` (`open`); a book read (depth gone?).
-  3. Five minutes after expiry, if it is still listed open: cancel it (see the abort
-     plan).
+  1. Complete scoped `status=open` inventory before placement; record
+     pre-existing IDs. `POST /orders` with explicit `tournamentId`;
+     `GET /orders/{id}` (expiration echo); scoped
+     `GET /markets/{id}/orderbook?tournamentId=...` (`nextExpiryAt`);
+     complete scoped `status=open` walk.
+  2. Two minutes after expiry: complete scoped `status=open` and
+     `status=expired` walks, `GET /orders/{id}`, its fills, and a scoped
+     market-book read. Repeat order detail and fills after another few
+     minutes if the state is ambiguous.
+  3. If the test order is still `open: true` after expiry, **do not**
+     treat its absence from `status=open` as cancellation. A legacy order
+     may still be stored open in `status=expired`; cancel-all is documented
+     to target only open, unexpired orders. Attempt targeted
+     `DELETE /orders/{id}` if the API permits it, then re-read detail and
+     fills. If cancellation is refused or cannot be confirmed, stop the
+     session as unresolved and escalate to SIG; do not claim cleanup.
 
-  About 8 reads and 1 or 2 writes.
+  At least 9 reads and 1 or 2 writes, plus all pages and any follow-up.
 - *Results:*
-  - a 400 on placement: expiry rejected on this tournament (record the `code`);
-  - listed as expired and closed after expiry: one observation that expiry closed this
-    order within the observed delay;
-  - still open past expiry: expiry is not a protection here.
+  - a 400 on placement: expiry rejected for this request (record the code);
+  - an exact expiration echo and a closed or expired report: a bounded
+    observation of acceptance and reporting at the observed times;
+  - still `open: true` after expiry: matching protection is unknown,
+    regardless of whether `status=open` excludes the order.
 - *Limits:*
-  - **a far-from-market order not filling after expiry proves nothing about fill
-    prevention**, because it would not have filled anyway;
-  - the delay is bounded only by the read times;
-  - nothing about load, scale or orders resting through our outage.
-
-  The lifetime bound in G-4 needs Q-S13 as well.
+  - **The absence of a fill after expiry is not evidence that SIG
+    prevented matching**: no counterparty was expected
+    to cross it. A reported expiry or closed flag alone proves no
+    matching rule. Neither a written SIG answer nor this observation
+    substitutes for the PRD's logged real-platform G-4 check of whether
+    expired orders stop filling. Arnav must separately review a safe
+    matching-prevention evidence plan; none is authorized or specified
+    by O1-F1. Until then, record no maximum protected resting lifetime
+    and assume the order can fill during an outage.
 
 **X5. One deliberate fill (separate real-trade decision; not a prerequisite).**
 - *Informs:* W4, W5, W7, PRD B (fees) and W11 (balance change against cost).
 - *Setup:* a marketable on-tick limit buy of quantity 1 at the current best ask of the
-  side bought (never price 1), one side at a time. Arnav decides whether YES, NO or both,
-  and on which exchange.
-- *Sequence:* R1; R3; `POST /orders`; `GET /orders/{id}/fills`; the first page of R4;
-  R3; R1; R5's transactions read with `type=trade,fee`.
+  side bought (never price 1), one side at a time. The quote must come from a fresh
+  `GET /exchanges/{id}/orderbook?tournamentId=...&depth=...`. Arnav decides whether
+  YES, NO or both, and on which exchange.
+- *Sequence:* R1; R3; scoped book read; `POST /orders` with explicit
+  `tournamentId`; `GET /orders/{id}/fills` (order-ID context); the first page
+  of R4; R3; R1; R5's tournament transactions read with `type=trade,fee`.
 - *Changes:* one real fill's `price`, `quantity` sign, `fillPrice`, `totalCost`, the
   position row and lots, the balance change, and any fee.
 - *Limits:* one fill per side; no partial fills and nothing about fractional quantities.
@@ -935,33 +1015,78 @@ does not send if either margin is small.
 
 **X6. Close the X5 holding with a fully backed sell (optional, low priority).**
 - *Informs:* W4-a (how a reducing fill is signed) and W8-d (a conventional close).
-- *Do:* send it only if R3 shows the holding exactly. It is a sell, and is sized to the
-  held quantity (hard rule 5).
+- *Do:* **do not run while OQ-W5 leaves the held quantity or its unit unresolved.**
+  If later established and separately approved by Arnav, verify the current
+  tournament holding immediately before a sell, keep the sell at or below that
+  quantity (hard rule 5), send `tournamentId` explicitly, and reconcile its
+  order and fills. A position row alone is not proof that its unit matches
+  the order input.
 
 **Abort and cleanup plan (every write check).**
-1. *Triggers:*
-   - any placement response other than the one expected;
-   - any fill on an order meant to rest;
-   - a 5xx, 409 or timeout on a placement;
-   - a book move that brings a test order within a small margin;
-   - loss of network or of the API.
-2. *Unknown placement outcome:* resend the identical request with the same key once to
-   learn the outcome (W10). Never send a new key.
-3. *Cancel:* `POST /orders/cancel-all` with `{"tournamentId": "bda92870-621e-47b0-bc3c-3602c5c26f55"}`,
-   repeated until 200 as documented. Then `DELETE /orders/{id}` for any test order still
-   listed.
-4. *Confirm:* a `status=open` walk to `hasMore: false` that lists no test order; each
-   test order shows `open: false`; each test order's fills are recorded.
-5. *If the API or network cannot be reached:*
-   - nothing on our side protects the resting orders: they stay live and can fill;
-   - retrying locally does nothing while SIG is unreachable;
-   - try the same cancel-all from another network path;
-   - if the SIG website offers cancellation of tournament orders (not verified), use it;
-   - otherwise email SIG support with the order IDs and times;
-   - record the time each order was last seen open. Exposure is bounded only by the
-     orders' size (one share each).
-6. *Close the session:* only after step 4 passes. Record the final balance relationship
-   (R1).
+
+1. *Stop placements* on an unexpected response, any fill on an order meant
+   to rest, an unexpected open order, a book move toward the test price,
+   5xx, 409, timeout, lost connectivity or loss of the API. Record the
+   exact status and `error.code`; do not create a new key or a replacement
+   order.
+2. *Resolve only the documented placement-retry cases, while reachable:*
+   - 502 `ORDER_STATUS_UNKNOWN`: check scoped account/order state and,
+     if retrying, resend the identical request with the **same** key
+     (W10-a). Stop and keep it unknown if the result is still ambiguous.
+   - 503: observe `Retry-After` or backoff; if retrying, resend the
+     identical request with the **same** key as `CLAUDE.md` hard rule 6
+     requires. Do not infer that a 503 proves no placement.
+   - 409 `REQUEST_IN_FLIGHT`: wait the documented 90 seconds, then
+     retry identically with the same key. Other 409s are **not**
+     automatic-retry instructions.
+   - 429 `RATE_LIMITED`: wait at least `Retry-After` (documented as
+     60 seconds) and use only the identical request and key if retrying.
+     Do not assume the 429 proves no placement.
+   - A 500, another 409, a timeout or a connection reset with no
+     response: outcome unknown. **No automatic retry**; reconcile
+     using tournament-scoped reads and escalate to Arnav/SIG before
+     deciding whether any same-key retry is supported. Unknown key
+     retention (W9) prevents a general restart or long-outage rule.
+3. *Cancel only identified test orders.* For X1, X2 and X4, use
+   `DELETE /orders/{id}` for each confirmed test ID; the ID determines
+   the context. A 409 or 503 on cancel is not confirmation: read
+   `GET /orders/{id}` and `GET /orders/{id}/fills` and follow the
+   documented targeted-cancel retry rule when applicable. Do not
+   cancel an unrelated order. If a placement has no confirmed ID,
+   inventory all scoped open and expired orders and reconcile; matching
+   by price and time alone does not prove identity (W9-f). Keep the
+   outcome unresolved if it cannot be identified.
+4. *Broad cancellation is exclusive to X3.* Use
+   `POST /orders/cancel-all` with the explicit
+   `{"tournamentId": "bda92870-621e-47b0-bc3c-3602c5c26f55"}`
+   only after a complete, fresh scoped inventory (`hasMore: false`,
+   `coverage.complete: true` on every page) shows that **every**
+   open, unexpired order belongs to the approved test set and Arnav
+   accepts the residual race. If an unrelated order appears or another
+   writer cannot be excluded, cancel only identified test IDs and do
+   not claim the X3 cancel-all check succeeded. A partial 503 still
+   needs a new inventory before any broad retry.
+5. *Confirm rather than assume:* complete scoped `status=open` and
+   `status=expired` walks to `hasMore: false` within the page cap,
+   inspect each test order by ID and its fills, and record whether it
+   is closed, filled, or unresolved. An expired legacy order can
+   remain `open: true` while absent from `status=open`; cancel-all
+   targets only unexpired orders. Try targeted cancellation when
+   reachable, then read back. If still open or ambiguous, escalate;
+   **do not declare cleanup complete**. A filled order may leave a
+   holding requiring a separate decision, never an automatic sell
+   while W5 is unresolved.
+6. *If the API or network cannot be reached:* no local action cancels
+   resting orders; they can fill during the outage. Arnav may try
+   another network path or a verified tournament-scoped website
+   control, or contact SIG support with the IDs and times. Record
+   the last confirmed state and keep the session unresolved.
+7. *Close the session* only when every test order has a confirmed
+   terminal state, all fills and any resulting holdings are recorded,
+   and no unknown placement remains. Record the final balance
+   relationship (R1). Otherwise leave an explicit unresolved
+   exposure and escalation record; a paused or abandoned session
+   is not evidence for a gate.
 
 ## 4. Decisions for Arnav, in dependency order
 
