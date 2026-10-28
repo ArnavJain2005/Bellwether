@@ -514,7 +514,7 @@ an acceptable outcome, unsafe trading is not.
 | R1 | Reference data | S1-T6 race mapping (Antigravity) | S1-T5 output (merged) only | Input to G-1 classification |
 | R2 | Reference data | Polymarket and Kalshi collectors; SQLite storage | R1, S1-T1 | none |
 | R3 | Reference data | Fair value v1 | R1, R2; quote precision (OQ-W1) | none |
-| O1 | Order path | Wire-contract answers: spec citations and real-platform checks Arnav runs himself | none | G-7 |
+| O1 | Order path | Wire-contract answers: spec citations and real-platform checks Arnav runs himself. Evidence note (draft, under review): [`design/order-wire-contracts.md`](design/order-wire-contracts.md) | none | G-7 |
 | O2 | Order path | Write-side client, idempotency journal saved before send, `risk.check` with commitment accounting, dry-run default, bypass test; mock exchange or fake transport | O1; G-1 definitions | G-6 |
 | S1 | Protections | Pause states; valuation and loss trigger; restart reconciliation; readiness check; cancellation and outage protections | A3, M2, O2 | G-2, G-3, G-4 |
 | C1 | Controls | Terminal controls and configuration change control | S1 | G-5 |
