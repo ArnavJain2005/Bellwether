@@ -1319,8 +1319,9 @@ def _instance_reason(instance: BlockerInstance) -> str:
     finding = f"; {instance.evidence[-1].finding}" if instance.evidence else ""
     if reason is StaleReason.REVISION_ANOMALY:
         finding += (
-            "; the id may only have left the topic's bounded trade-id memory, a possible "
-            "false positive that still blocks"
+            "; the trade may have been accepted already, its id evicted from the topic's "
+            "bounded trade-id memory or never seen by this feed's topic (a replacement "
+            "feed's memory starts empty): a possible false positive that still blocks"
         )
     return (
         f"blocker: {reason.value} ({instance.instance_id}, {where}) open{finding}; "

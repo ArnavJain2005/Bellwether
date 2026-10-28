@@ -85,8 +85,11 @@ MISSING: dict[StaleReason, tuple[str, ...]] = {
     StaleReason.HISTORY_UNKNOWN: ("D-3", "D-4"),
     StaleReason.LIFECYCLE_NOT_OPEN: ("Q9", "D-5"),
     # [client policy] not tabulated by the design (2.4): the trade questions of a
-    # MISSING_BOOK, plus whether revisions reset (Q7) and whether batches are re-sent (Q14).
-    StaleReason.REVISION_ANOMALY: ("Q3", "Q4", "Q6", "Q7", "Q14"),
+    # MISSING_BOOK, whether revisions reset (Q7), the span of the lost revisions (Q8: an
+    # anomaly means the original batch was discarded or the revisions went backwards, and
+    # the unseen trade's own time does not bound what else that range carried) and whether
+    # batches are re-sent (Q14).
+    StaleReason.REVISION_ANOMALY: ("Q3", "Q4", "Q6", "Q7", "Q8", "Q14"),
 }
 WINDOW_MISSING: tuple[str, ...] = ("D-1", "Q7", "Q10", "Q14")
 

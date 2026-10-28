@@ -8,13 +8,16 @@ detectors open blockers from them:
 - a `marketSettled` item opens MARKET_SETTLED (AT-20);
 - a trade with a null `sequence` opens NULL_TRADE_SEQUENCE (AT-21);
 - a sequenced trade `id` the topic does not hold in its trade-id memory (4,096 ids by
-  default) opens REVISION_ANOMALY (AT-22), including an id that was accepted earlier and
-  then evicted from that memory: a possible false positive, which blocks and never clears.
+  default) opens REVISION_ANOMALY (AT-22). Two possible false positives are accepted:
+  both block and neither is ever cleared. (1) An id accepted earlier and then evicted from
+  that memory. (2) A genuine retry reaching a replacement feed that shares the ledger:
+  its topic is seeded with the ledger's revision but its trade-id memory starts empty,
+  because the memory is not in the ledger.
 
 Controls: a genuinely retried duplicate of an accepted batch with sequenced trades opens
-nothing, costs no REST read and re-emits nothing; a retried settlement opens a second,
-redundant MARKET_SETTLED instance and emits no second signal; an id still in memory opens
-nothing. Realtime payloads are synthetic (realtime_kit.py); REST goes through
+nothing, costs no REST read and re-emits nothing **on the feed whose topic accepted it**
+(not on a replacement feed, case 2 above); a retried settlement opens a second, redundant
+MARKET_SETTLED instance and emits no second signal; an id still in memory opens nothing. Realtime payloads are synthetic (realtime_kit.py); REST goes through
 httpx.MockTransport and time through ManualClock. Unless a test says otherwise the feed
 has a TEST-ONLY bootstrap ledger (realtime_kit.test_bootstrap).
 
@@ -299,9 +302,58 @@ def test_at22_reason_names_its_missing_guarantees_and_the_false_positive() -> No
         assert blocker.missing == MISSING[reason] and "Q7" in blocker.missing
         (line,) = [r for r in h.feed.readiness(MARKET).reasons if r.startswith("blocker:")]
         assert "Q7" in line and "false positive" in line
+        assert "evicted" in line and "replacement feed" in line  # both false positives
         await h.stop()
 
     run(scenario, policy=QUIET)
+
+
+def test_at22_missing_guarantees_include_the_unknown_lost_span() -> None:
+    """Q8 (the time or sequence span of a missed revision range) is missing: an anomaly
+    means the original batch was discarded or the revisions went backwards, so which tape
+    window holds the lost content is unknown, as for a revision gap."""
+    reason = anomaly()
+    assert "Q8" in MISSING[reason] and "Q8" in MISSING[StaleReason.REVISION_GAP]
+    assert MISSING[reason] == ("Q3", "Q4", "Q6", "Q7", "Q8", "Q14")
+
+
+def test_at22_genuine_retry_reaching_a_replacement_feed_is_a_false_positive() -> None:
+    """Feed A accepts a sequenced trade and the ledger retains its revision. Feed B shares
+    the ledger but builds a fresh topic: seeded with that revision, with an empty trade-id
+    memory (the memory is not in the ledger and is not persisted). A genuine retry of A's
+    batch is therefore a duplicate to B whose id B never saw: REVISION_ANOMALY opens.
+    Accepted fail-closed for this slice: it blocks, nothing re-emits the trade, and
+    nothing clears it."""
+
+    async def main() -> None:
+        a = Harness(policy=QUIET)
+        await accept_original(a)
+        assert [e.trade.id for e in emitted(a, TradeReceived)] == ["t1"]
+        assert a.feed.blockers(MARKET) == frozenset()
+        await a.stop()
+        b = Harness(policy=QUIET, ledger=a.ledger, clock=a.clock)
+        try:
+            await b.start()
+            assert b.feed.last_revision(MARKET) == 1  # seeded from the ledger
+            before = {i.instance_id for i in b.ledger.instances(MARKET)}
+            generation = b.ledger.generation(MARKET)
+            b.transport.batch(b.topic(), ORIGINAL)  # the same send, retried
+            await settle()
+            new = [i for i in b.ledger.instances(MARKET) if i.instance_id not in before]
+            assert [(i.reason, i.revisions, i.state) for i in new] == [
+                (anomaly(), (0, 1), InstanceState.OPEN)
+            ]
+            assert b.ledger.generation(MARKET) == generation + 1
+            assert emitted(b, TradeReceived) == []  # nothing re-emitted
+            assert b.feed.last_revision(MARKET) == 1
+            for _ in range(2):
+                await book_trigger(b)
+            assert anomaly() in b.feed.blockers(MARKET) and not b.feed.is_ready(MARKET)
+            assert readies(b) == 0
+        finally:
+            await b.stop()
+
+    asyncio.run(main())
 
 
 def test_at22_evicted_id_opens_revision_anomaly_with_the_default_memory() -> None:
@@ -336,7 +388,7 @@ def test_at22_evicted_id_opens_revision_anomaly_with_the_default_memory() -> Non
 # --- controls: a genuinely retried duplicate -------------------------------------------------
 
 
-def test_control_genuine_retry_of_sequenced_trades_opens_nothing() -> None:
+def test_control_genuine_retry_on_the_same_feed_opens_nothing() -> None:
     async def scenario(h: Harness) -> None:
         await h.start()
         accepted = batch(2, 0, trades=[trade("a", 1), trade("b", 2)], books=[book(2)])

@@ -22,11 +22,15 @@ this order:
    reset of the topic's revisions (Q7) would make every later batch look like one: a
    `marketSettled` item raises MARKET_SETTLED, a null-sequence trade raises
    NULL_TRADE_SEQUENCE, and a sequenced trade `id` not held in the trade-id memory raises
-   REVISION_ANOMALY. A genuine retried send repeats trades already accepted, so it raises
-   only the first two again (redundant, harmless). An unseen id appears when the original
-   batch's trades were discarded (the market is then already blocked), when revisions
-   went backwards, or when the id has left the bounded memory: a false positive, which
-   blocks and never clears.
+   REVISION_ANOMALY. A genuine retried send repeats a settlement or a null-sequence trade
+   again (redundant, harmless). Its sequenced trades open nothing only while this topic
+   still remembers their ids. An unremembered id appears when the original batch's trades
+   were discarded (the market is then already blocked), when revisions went backwards,
+   or when the memory no longer or never held it although the trade was accepted: the
+   id was evicted from the bounded memory, or this topic belongs to a replacement feed
+   (the memory is per topic object, not in the ledger, so it starts empty while the
+   revision is seeded from the ledger). Both are false positives, which block and never
+   clear.
 5. [documented] A batch was missed only when `previousRevision` is greater than the last
    accepted revision: accept this revision, emit nothing from its arrays, and resync.
    A batch that overlaps revisions already accepted (previousRevision below the last
@@ -131,7 +135,8 @@ class StaleReason(StrEnum):
     HISTORY_UNKNOWN = "history unknown"
     LIFECYCLE_NOT_OPEN = "market not open"
     # M2-B: a duplicate batch carried a sequenced trade id the topic does not remember
-    # (step 4): its original was discarded, revisions went backwards, or the id was evicted.
+    # (step 4): its original was discarded, revisions went backwards, the id was evicted,
+    # or a replacement feed's topic, whose memory starts empty, never saw it.
     REVISION_ANOMALY = "duplicate batch carried an unseen trade id"
 
 

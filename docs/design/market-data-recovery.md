@@ -176,12 +176,15 @@ None is changed by this note.
    `delivery` (`realtime_wire.py:166`, `realtime_wire.py:175`). [Unknown] whether the same
    settlement is also carried in a revisioned `market_batch`. If it is not, a missed
    standalone `market_settled` cannot be detected by any revision check.
-4. **A duplicate batch's arrays are ignored**, including `marketSettled`
+4. **A duplicate batch's arrays were ignored** at `3e0fe27`, including `marketSettled`
    (`realtime_topic.py:309`). That is the documented rule ([RT]). [Unknown] whether a topic's
    revision can ever go backwards (for example across a SIG deploy). If it did, every later
-   batch would look like a duplicate, and its trades and settlements would be dropped with
-   no blocker. Books would still apply, because they apply by version
-   (`realtime_topic.py:298`).
+   batch would look like a duplicate, and at `3e0fe27` its trades and settlements were
+   dropped with no blocker. Books still apply, because they apply by version
+   (`realtime_topic.py:298`). *Historical observation; superseded by M2-B1:* the code now
+   still emits nothing from a duplicate's arrays, but its detectors (4.7) open
+   `MARKET_SETTLED`, `NULL_TRADE_SEQUENCE` or `REVISION_ANOMALY` from them. A reset during
+   a period with no trades and no settlement remains undetectable (F-8).
 5. **A gap batch's own arrays are discarded**, settlements included
    (`realtime_topic.py:314`-`316`). This is safe today, because `REVISION_GAP` blocks
    anyway.
@@ -666,9 +669,13 @@ implemented until section 10's questions are answered or Arnav decides otherwise
   blocker (redundant but harmless after a genuine retried send, which repeats content
   already seen); a sequenced trade `id` in a duplicate that the topic has never seen
   raises a new reason, `REVISION_ANOMALY`. A genuine retried send repeats trades
-  already accepted, so an unseen id appears only when the original batch was discarded
-  (the market is then already blocked) or the id has left the 4,096-id memory (a false
-  positive that blocks, never one that clears).
+  already accepted, so an unseen id appears when the original batch was discarded
+  (the market is then already blocked), when revisions went backwards, or when the topic
+  no longer or never held an id it accepted. Two such false positives block and are never
+  cleared: the id has left the 4,096-id memory, or the retry reaches a replacement feed
+  sharing the ledger, whose new topic is seeded with the ledger's revision but starts
+  with an empty trade-id memory (the memory is not in the ledger). [M2-B1: implemented;
+  the replacement-feed case was found in review.]
 - **Closing.** Two meanings:
   - *Feed closing* (`aclose()`): readiness ends at once; attempts are cancelled and their
     responses dropped (4.5).
@@ -923,7 +930,7 @@ an answer from SIG.
 | AT-19 | Readiness result content for every state | Every failing condition has a human-readable reason and its question ids; `closing`, `history`, `continuity` and `does_not_cover` present | A |
 | AT-20 | Duplicate batch carrying `marketSettled` | `MARKET_SETTLED` opens | later (M2-B) |
 | AT-21 | Duplicate batch carrying a null-sequence trade | `NULL_TRADE_SEQUENCE` opens | later (M2-B) |
-| AT-22 | Duplicate batch carrying an unseen trade id | `REVISION_ANOMALY` opens; an id evicted from memory also opens it (false positive accepted) | later (M2-B) |
+| AT-22 | Duplicate batch carrying an unseen trade id | `REVISION_ANOMALY` opens; an id evicted from memory, or a genuine retry reaching a replacement feed whose trade-id memory starts empty, also opens it (false positives accepted) | later (M2-B) |
 | AT-23 | Tape walk hits the page cap, repeats a cursor or an item, or reports `complete: false` | Attempt fails; blocker open | later (Q3, Q4) |
 | AT-24 | Tape walk complete over a past window, then a later read returns an extra row (late projection) | First walk never cleared anything | later (Q3, Q4) |
 | AT-25 | `NULL_TRADE_SEQUENCE` with any combination of tape and price reads | Never cleared while Q3 to Q6 and Q11 are open | A |
