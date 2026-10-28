@@ -80,6 +80,14 @@ def _json_true(value: object) -> bool:
 JsonTrue = Annotated[bool, BeforeValidator(_json_true)]
 
 
+def _json_array(value: object) -> tuple[object, ...]:
+    # Only a JSON array (a Python list from json.loads), kept in order as an immutable
+    # tuple so a frozen model cannot be changed through a nested list.
+    if not isinstance(value, list):
+        raise PydanticCustomError("json_array", "expected a JSON array")
+    return tuple(value)
+
+
 class WireModel(BaseModel):
     model_config = ConfigDict(strict=True, frozen=True, extra="ignore")
 
@@ -339,7 +347,9 @@ class TournamentPosition(WireModel):
     unrealizedPnl: WireNumber
     unrealizedPnlPct: WireNumber
     moneyEarned: WireNumber
-    lots: list[PositionLot]
+    # A tuple, not a list: the row is retained by the account snapshot (A3), whose
+    # findings are computed from the lots, so the row must be immutable all the way down.
+    lots: Annotated[tuple[PositionLot, ...], BeforeValidator(_json_array)]
 
 
 class PositionsSummary(WireModel):
