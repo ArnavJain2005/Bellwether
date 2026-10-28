@@ -1,0 +1,103 @@
+{
+  "format": "bellwether.r1-sources/1",
+  "note": "Declared R1 inputs. Hashes pin the exact files a review was made from. Editing a policy here is Arnav's decision only.",
+  "sig_inventory": {
+    "id": "sig-fb88c9",
+    "kind": "recorded_fixture_pages",
+    "run_dir": "tests/fixtures/sig/recorded/20261009T190027Z-fb88c9",
+    "fixture_manifest_sha256": "fbbef46d798e6a0ed07abe92cf513e16f9960b465c1e699c8e198457991b63f0",
+    "tournament_slug": "midterm-elections",
+    "captured_at": "2026-10-09T19:00:27.272Z",
+    "capture_code_commit": "36aebfe71c18e9985ef847ec12f505a96c989b61",
+    "pages": [
+      {
+        "name": "tournament-markets-p1",
+        "file": "bodies/02-tournament-markets-p1-a1.json",
+        "sha256": "66520bfece41498e90319cb9c01e60deb96b0dc65e59dec2a484614d1285bd12"
+      },
+      {
+        "name": "tournament-markets-p2",
+        "file": "bodies/03-tournament-markets-p2-a1.json",
+        "sha256": "aff28ff4d2c4c329a57abc3c42eb6c387b8f5aba2b6d4763e537bef539d94119"
+      },
+      {
+        "name": "tournament-markets-p3",
+        "file": "bodies/04-tournament-markets-p3-a1.json",
+        "sha256": "919bc980f8b891420375c79067d92a954541e5c3f2835eb115a20b3a7eab8ad1"
+      }
+    ],
+    "declared_complete": true,
+    "completeness_basis": "Complete cursor walk at capture time with status=any and limit=100: the first page was requested without a cursor, each later request cursor equals the previous page's nextCursor, the last page has hasMore false and nextCursor null, and 100+100+37 items give 237 unique market ids equal to the reported total. The validator re-checks all of this.",
+    "limitations": [
+      "Complete only as of 2026-10-09T19:00:55Z; it does not prove the in-scope inventory today.",
+      "Market rows carry no race ID, stage ID, group ID or Info-tab resolution text; the OpenAPI Market and TournamentMarket schemas list no such fields.",
+      "Titles do not state the election cycle or whether an election is regular or special.",
+      "creator fields and the thumbnailUrl UUID segment are redacted placeholders in the committed bodies."
+    ]
+  },
+  "venue_snapshots": [
+    {
+      "id": "venue-20261011T183701Z",
+      "file": "data/venue_markets/output/venue_markets_2026-10-11.json",
+      "same_bytes_as": [
+        "data/venue_markets/output/venue_markets_latest.json (as of 2026-10-28)"
+      ],
+      "committed": false,
+      "sha256": "54ca0fc5db51da6a2cf7e130716830f5f49a6ab4aab8ffdcb72013981336f9d8",
+      "bytes": 23628743,
+      "fetched_at": "2026-10-11T18:37:01.663927+00:00",
+      "kalshi_host": "external-api.kalshi.com",
+      "polymarket_count": 5363,
+      "kalshi_count": 2757,
+      "s1t5_validation": {
+        "command": "python data/venue_markets/fetch_venue_markets.py --validate",
+        "code_sha": "efdb5a57cf22ec99c4fe69f228e341fe6dde52bc",
+        "run_on": "2026-10-28",
+        "result": "fail",
+        "failures": [
+          "Polymarket contains 6 Lieutenant Governor contracts",
+          "Kalshi contains 6 Lieutenant Governor contracts",
+          "Kalshi contains 32 state-legislature contracts",
+          "Kalshi contains 222 state-specific contests misclassified as control"
+        ]
+      },
+      "coverage": {
+        "polymarket": {
+          "complete": false,
+          "basis": "Gamma events/keyset traversal of tag_id=102289 only; tag traversal does not prove venue-wide coverage (S1-T5 README; California Governor event 57096 is a documented tag omission). The snapshot predates S1-T5-F6, so most Polymarket House party contracts are absent."
+        },
+        "kalshi": {
+          "complete": false,
+          "basis": "Selected election series only. The snapshot predates S1-T5-F6/C2: it has no KXHOUSERACE rows, per-district HOUSE series were admitted on ticker symbol without rules checks, there are no SENATEFL or SENATEKY rows, and the SENATELA-26 rows describe Kentucky."
+        }
+      },
+      "limitations": [
+        "Produced by an earlier fetcher revision than main; it fails the current S1-T5 validator, so its race_type labels are not used by R1.",
+        "snapshot_prices are historical observations, never live quotes; R1 ignores them.",
+        "S1-T5 admission is a reference-data identity check, not settlement equivalence with SIG."
+      ]
+    }
+  ],
+  "policies": {
+    "authorized_reviewers": [
+      "Arnav"
+    ],
+    "oq_c4_related_market_groups": {
+      "status": "open",
+      "decided_by": null,
+      "decided_at": null,
+      "note": "PRD OQ-C4. Group proposals in r1_mapping.json are candidates only; one contract may appear in several."
+    },
+    "fair_value_confidence_rule": {
+      "status": "not_approved",
+      "approved_by": null,
+      "approved_at": null,
+      "eligible_confidence": [],
+      "proposal_for_arnav": "Proposal only, not policy: a venue outcome becomes fair-value eligible only for a verified_match with confidence high, every strict criterion same, no open discrepancy, reviewed SIG Info-tab text and a verified race identity. No numeric threshold is proposed."
+    },
+    "race_identity_source": {
+      "status": "missing",
+      "needed": "A reviewed, authorized source that gives each SIG market's race ID (and stage ID), for example an export Arnav captures and reviews. The PRD's Oct 2 dump is not in the repository."
+    }
+  }
+}
