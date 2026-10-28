@@ -84,6 +84,9 @@ MISSING: dict[StaleReason, tuple[str, ...]] = {
     StaleReason.MISSING_BOOK: ("Q3", "Q4", "Q6", "Q7"),
     StaleReason.HISTORY_UNKNOWN: ("D-3", "D-4"),
     StaleReason.LIFECYCLE_NOT_OPEN: ("Q9", "D-5"),
+    # [client policy] not tabulated by the design (2.4): the trade questions of a
+    # MISSING_BOOK, plus whether revisions reset (Q7) and whether batches are re-sent (Q14).
+    StaleReason.REVISION_ANOMALY: ("Q3", "Q4", "Q6", "Q7", "Q14"),
 }
 WINDOW_MISSING: tuple[str, ...] = ("D-1", "Q7", "Q10", "Q14")
 

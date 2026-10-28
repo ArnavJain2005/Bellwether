@@ -44,7 +44,9 @@ Blockers and recovery (M2-A, docs/design/market-data-recovery.md sections 4-9): 
 settlement requires the authoritative market state, and a trade without a sequence
 requires the exchange's price and trade tape over REST. A revision gap, a batch flagged
 `resyncRequired`, a malformed message or a batch missing a named book may have hidden
-either. Each such event is a blocker instance in the RecoveryLedger (recovery.py), which
+either. A duplicate batch's arrays are never emitted, but a settlement, a null-sequence
+trade or an unremembered trade id in one raises its blocker too (M2-B, realtime_topic.py
+step 4). Each such event is a blocker instance in the RecoveryLedger (recovery.py), which
 the engine owns and which outlives this feed object: a replacement feed given the same
 ledger inherits every instance, its last accepted revisions and its windows. Nothing
 clears an instance: `blockers(market_id)` lists every open and every quarantined one,
@@ -758,13 +760,16 @@ class RealtimeMarketFeed:
         window = outcome.window
         specs: list[InstanceSpec] = []
         if StaleReason.MARKET_SETTLED in outcome.blockers:
-            # Two settlements are two instances, each with its own signal.
+            # Two settlements are two instances, each with its own signal. A duplicate's
+            # settlements raise instances too, but are never emitted (design 4.7).
             specs += [
                 InstanceSpec(StaleReason.MARKET_SETTLED, window, item)
-                for item in outcome.settlements
+                for item in [*outcome.settlements, *outcome.duplicate_settlements]
             ]
         if StaleReason.NULL_TRADE_SEQUENCE in outcome.blockers:
             specs.append(InstanceSpec(StaleReason.NULL_TRADE_SEQUENCE, window))
+        if StaleReason.REVISION_ANOMALY in outcome.blockers:
+            specs.append(InstanceSpec(StaleReason.REVISION_ANOMALY, window))
         resync = outcome.resync
         if resync in BLOCKING_REASONS and resync not in outcome.blockers:
             revisions = window
@@ -774,8 +779,9 @@ class RealtimeMarketFeed:
         if specs:
             self._ledger.raise_instances(market_id, specs, now)
             logger.warning(
-                "realtime market %s blocked: %s",
+                "realtime market %s blocked%s: %s",
                 market_id,
+                " by a duplicate batch" if outcome.duplicate else "",
                 ", ".join(sorted({spec.reason.value for spec in specs})),
             )
         confirmed = self._ledger.note_revision(
@@ -1311,6 +1317,11 @@ def _instance_reason(instance: BlockerInstance) -> str:
         )
     where = _revisions_text(instance.revisions)
     finding = f"; {instance.evidence[-1].finding}" if instance.evidence else ""
+    if reason is StaleReason.REVISION_ANOMALY:
+        finding += (
+            "; the id may only have left the topic's bounded trade-id memory, a possible "
+            "false positive that still blocks"
+        )
     return (
         f"blocker: {reason.value} ({instance.instance_id}, {where}) open{finding}; "
         f"missing {missing}"

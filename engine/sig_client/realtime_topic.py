@@ -17,6 +17,16 @@ this order:
    is newer, then resync. Its partial `trades` are not emitted.
 4. [documented] A batch whose `revision` is at or below the last accepted one is a
    duplicate: its arrays are ignored (its books were already applied in step 2).
+   [client policy, recovery design 4.7] Its arrays are still inspected, never emitted
+   and never added to the trade-id memory, by three fail-closed detectors, because a
+   reset of the topic's revisions (Q7) would make every later batch look like one: a
+   `marketSettled` item raises MARKET_SETTLED, a null-sequence trade raises
+   NULL_TRADE_SEQUENCE, and a sequenced trade `id` not held in the trade-id memory raises
+   REVISION_ANOMALY. A genuine retried send repeats trades already accepted, so it raises
+   only the first two again (redundant, harmless). An unseen id appears when the original
+   batch's trades were discarded (the market is then already blocked), when revisions
+   went backwards, or when the id has left the bounded memory: a false positive, which
+   blocks and never clears.
 5. [documented] A batch was missed only when `previousRevision` is greater than the last
    accepted revision: accept this revision, emit nothing from its arrays, and resync.
    A batch that overlaps revisions already accepted (previousRevision below the last
@@ -120,12 +130,16 @@ class StaleReason(StrEnum):
     # show, and LIFECYCLE_NOT_OPEN a market that a lifecycle read showed settled or closed.
     HISTORY_UNKNOWN = "history unknown"
     LIFECYCLE_NOT_OPEN = "market not open"
+    # M2-B: a duplicate batch carried a sequenced trade id the topic does not remember
+    # (step 4): its original was discarded, revisions went backwards, or the id was evicted.
+    REVISION_ANOMALY = "duplicate batch carried an unseen trade id"
 
 
 # Recovery that an orderbook read cannot provide: settlement needs the market state, a
 # null-sequence trade needs the trade tape (steps 7 and 8), and a message whose arrays were
-# discarded or never seen may have hidden either. The last two are raised by the recovery
-# ledger, not by a message.
+# discarded or never seen may have hidden either, as may a duplicate carrying an unseen
+# trade id. HISTORY_UNKNOWN and LIFECYCLE_NOT_OPEN are raised by the recovery ledger, not
+# by a message.
 BLOCKING_REASONS = frozenset(
     {
         StaleReason.NULL_TRADE_SEQUENCE,
@@ -136,6 +150,7 @@ BLOCKING_REASONS = frozenset(
         StaleReason.MISSING_BOOK,
         StaleReason.HISTORY_UNKNOWN,
         StaleReason.LIFECYCLE_NOT_OPEN,
+        StaleReason.REVISION_ANOMALY,
     }
 )
 
@@ -182,11 +197,15 @@ class TopicOutcome:
     parsed. `clean` is True only for a batch that was well-formed, not flagged
     `resyncRequired`, not a duplicate, accepted without a gap and named no exchange
     without its book: the "clean advancing batch" of the recovery design (section 4.3).
+
+    `duplicate_settlements` holds the `marketSettled` items of a duplicate batch: each
+    raises a MARKET_SETTLED blocker but is never emitted (`settlements` stays empty).
     """
 
     books: list[HeldBook] = field(default_factory=list)
     trades: list[BatchTrade] = field(default_factory=list)
     settlements: list[MarketSettled] = field(default_factory=list)
+    duplicate_settlements: list[MarketSettled] = field(default_factory=list)
     resync: StaleReason | None = None
     blockers: set[StaleReason] = field(default_factory=set)
     duplicate: bool = False
@@ -333,6 +352,7 @@ class MarketTopic:
             return outcome
         if last is not None and revision <= last:
             outcome.duplicate = True
+            self._detect_in_duplicate(batch, outcome)
             return outcome
         missed = last is not None and previous > last
         self._last_revision = revision
@@ -361,6 +381,23 @@ class MarketTopic:
         if StaleReason.NULL_TRADE_SEQUENCE not in outcome.blockers:
             outcome.trades = self._new_trades(trades)
         return outcome
+
+    def _detect_in_duplicate(self, batch: MarketBatch, outcome: TopicOutcome) -> None:
+        """Step 4's fail-closed detectors. Reports blockers only: nothing in the
+        duplicate's arrays is emitted or remembered."""
+        trades = batch.trades or []
+        if batch.marketSettled:
+            outcome.duplicate_settlements = list(batch.marketSettled)
+            outcome.blockers.add(StaleReason.MARKET_SETTLED)
+            outcome.resync = StaleReason.MARKET_SETTLED
+        if any(trade.sequence is None for trade in trades):
+            outcome.blockers.add(StaleReason.NULL_TRADE_SEQUENCE)
+            outcome.resync = StaleReason.NULL_TRADE_SEQUENCE
+        if any(
+            trade.id is not None and trade.id not in self._seen_trade_ids for trade in trades
+        ):
+            outcome.blockers.add(StaleReason.REVISION_ANOMALY)
+            outcome.resync = StaleReason.REVISION_ANOMALY
 
     def _accept_if_newer(self, revision: int) -> None:
         if self._last_revision is None or revision > self._last_revision:
