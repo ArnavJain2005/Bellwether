@@ -721,14 +721,15 @@ them.
 - **Shared rate budget.** All reads share the account limiter (80 of 100 reads a minute).
   [Code] The feed already gates orderbook resyncs at 40 starts a minute
   (`realtime.py:291`). Recovery reads get their own gate (*configurable*, like the resync
-  gate) so that they cannot starve account reconciliation or resyncs, and the shared
-  limiter still has no priorities. Note the scale: after a reconnect the existing resync
+  gate) to bound their logical starts. This cannot reserve reads for account reconciliation
+  or resyncs: retries and other same-account clients share a limiter with no priorities.
+  Note the scale: after a reconnect the existing resync
   alone needs one read per market (237 for every market). Where a lifecycle check covers
   many markets, it uses the market list [TMKTS] (three pages for 237 markets) rather than
   one market-detail read per market.
 - **Lifecycle sweep [Implemented in M2-B2, opt-in].** A feed runs the sweep only when given
   a `SweepPolicy`. It has no defaults: the interval, the walk deadline, the page cap and
-  the page budget are Arnav's, and no module in `engine/` creates one. One complete
+  the HTTP-attempt budget are Arnav's, and no module in `engine/` creates one. One complete
   `status=any` walk at a time, with a fixed delay between walks and SIG's `Retry-After` as
   a floor. Only a complete walk is applied, and only to restrict:
   - a row showing `settled` or `closed` quarantines the market (`LIFECYCLE_NOT_OPEN`);
@@ -739,15 +740,17 @@ them.
   - a row showing `open` changes nothing. A listing never confirms a settlement, clears a
     blocker, provides bootstrap evidence or publishes `MarketReady`.
 
-  **Budget.** The sweep has its own page gate (`pages_per_window` page starts per rolling
-  window of the shared limiter), and each page passes it before the shared limiter. The
-  feed refuses a policy unless the starts its gates allow per window (resyncs, recovery
-  attempts and sweep pages) stay strictly below the shared read limit; with today's gates
-  (40 and 10 a minute) that leaves the sweep at most 29 of 80. **Limitation:** the gates
-  count logical starts, not HTTP attempts. Each page, like each resync or recovery read,
-  may make several attempts under the REST client's retry policy, and the shared limiter
-  has no priorities, so this bounds the sweep's demand but reserves no capacity for
-  account reads. The allocation itself is Arnav's.
+  **Budget.** The sweep's own gate (`attempts_per_window`) admits every market-list HTTP
+  attempt, including retries, before the shared limiter. A walk whose next attempt cannot
+  fit the gate and walk deadline fails without applying partial results. The feed rejects
+  policies whose sweep-attempt cap plus the resync and recovery gates' maximum *logical*
+  starts reach the shared read limit. The calculation handles shared windows shorter than
+  the other gates' windows by counting their full bursts. With the default 60-second
+  window and gates of 40 and 10 starts, at most 29 sweep attempts are allowed per window.
+  This caps sweep traffic under retries, but **does not reserve** reads: resync and
+  recovery reads may retry, and other same-account clients may consume the shared budget.
+  It therefore does not guarantee prompt recovery or account reads. The allocation is
+  Arnav's, and no operational value is chosen here.
 - **Retry scheduling.** One attempt per market at a time; triggers during an attempt
   coalesce into one follow-up, which starts after the current attempt ends (as for
   resyncs). Failed attempts back off exponentially with jitter and a floor from any
@@ -958,7 +961,9 @@ an answer from SIG.
 | AT-25 | `NULL_TRADE_SEQUENCE` with any combination of tape and price reads | Never cleared while Q3 to Q6 and Q11 are open | A |
 | AT-26 | Periodic lifecycle sweep finds a market `closed` | Quarantined `LIFECYCLE_NOT_OPEN`; result `QUARANTINED` | later (M2-B) |
 | AT-40 | A complete sweep walk omits a covered market that was ready; later walks list it `open` | `LIFECYCLE_UNKNOWN` opens (not quarantined); readiness withdrawn; never cleared, no `MarketReady`; a partial walk that omits it changes nothing | M2-B2 |
-| AT-41 | Sweep with a short interval and many pages, while a recovery read is wanted | At most `pages_per_window` page starts per window; the recovery read is not starved by the sweep; a budget leaving no shared capacity is refused | M2-B2 |
+| AT-41 | Sweep with a short interval and many pages, while a recovery read is wanted | At most `attempts_per_window` sweep HTTP attempts per shared window; with no other consumers, recovery starts without sweep-induced saturation; a policy whose nominal gate limits reach the shared cap is refused | M2-B2 |
+| AT-42 | Market-list pages succeed after retryable 503 responses, with recovery wanted during the walk | Every retry spends a sweep token before the shared limiter; the sweep alone cannot exhaust the shared read window; if the next attempt cannot fit its deadline, no partial list is applied | M2-B2 |
+| AT-43 | Shared limiter window is shorter than the resync and recovery gates' windows | Constructor counts the full bursts those gates can make inside the shorter window and refuses an excessive sweep policy | M2-B2 |
 | AT-27 | Recovery gate saturated | Attempts wait for the gate; resync gate and shared limiter behaviour unchanged | A |
 | AT-28 | Escalation after the configured number of failures | `escalated` true; still not ready; retries continue at the capped interval | A |
 | AT-29 | Blocker open; process restart with a persisted ledger | Origin `loaded`; instance still open; downtime window with the persisted fence | later (M2-C, D-4) |

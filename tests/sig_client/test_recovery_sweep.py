@@ -30,6 +30,7 @@ from realtime_kit import (
     MARKET,
     FakeTransport,
     Harness,
+    ManualClock,
     batch,
     market_detail,
     settle,
@@ -39,6 +40,7 @@ from sig_testkit import TOURNAMENT, fixture, json_response
 
 import engine
 from engine.sig_client.errors import SigRateLimitedError
+from engine.sig_client.rate_limiter import RateLimiter, RequestKind
 from engine.sig_client.readiness import ReadinessStatus
 from engine.sig_client.realtime import (
     MarketReady,
@@ -59,7 +61,7 @@ from engine.sig_client.wire import TournamentMarket
 QUIET = RealtimeFeedPolicy(tick_s=1e6)  # the timer never fires within these tests
 INTERVAL = 60.0  # test value only
 SWEEP = SweepPolicy(  # test values only
-    interval_s=INTERVAL, deadline_s=10.0, max_pages=3, pages_per_window=10
+    interval_s=INTERVAL, deadline_s=10.0, max_pages=3, attempts_per_window=10
 )
 MARKETS_ROUTE = f"/api/v1/tournaments/{TOURNAMENT.slug}/markets"
 MARKETS = f"/tournaments/{TOURNAMENT.slug}/markets"
@@ -92,10 +94,15 @@ class Listing:
         *pages: list[dict[str, Any]],
         held: frozenset[int] = frozenset(),
         responses: dict[int, httpx.Response] | None = None,
+        transient_failures: int | dict[int, int] = 0,
+        transient_retry_after: str | None = None,
     ) -> None:
         self.pages = [list(p) for p in pages]
         self.held = held
         self.responses = responses or {}
+        self.transient_failures = transient_failures
+        self.transient_retry_after = transient_retry_after
+        self.attempts_by_page: dict[int, int] = {}
         self.requests: list[httpx.Request] = []
         self.waiting: list[asyncio.Future[None]] = []
         self.cancelled = 0
@@ -120,6 +127,20 @@ class Listing:
             self.times.append(self.clock())
         cursor = request.url.params.get("cursor")
         index = 0 if cursor is None else int(cursor[1:])
+        self.attempts_by_page[index] = self.attempts_by_page.get(index, 0) + 1
+        fail_count = (
+            self.transient_failures.get(index, 0)
+            if isinstance(self.transient_failures, dict)
+            else self.transient_failures
+        )
+        if self.attempts_by_page[index] <= fail_count:
+            return json_response(
+                503,
+                {"error": {"code": "SERVICE_UNAVAILABLE", "message": "synthetic"}},
+                {"Retry-After": self.transient_retry_after}
+                if self.transient_retry_after is not None
+                else None,
+            )
         if index in self.held:
             future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
             self.waiting.append(future)
@@ -219,7 +240,7 @@ def test_sweep_policy_has_no_defaults() -> None:
         SweepPolicy()  # type: ignore[call-arg]
     with pytest.raises(TypeError):
         SweepPolicy(interval_s=60.0)  # type: ignore[call-arg]
-    with pytest.raises(TypeError):  # the page budget is explicit too
+    with pytest.raises(TypeError):  # the HTTP-attempt budget is explicit too
         SweepPolicy(interval_s=60.0, deadline_s=10.0, max_pages=3)  # type: ignore[call-arg]
 
 
@@ -238,14 +259,14 @@ def test_sweep_policy_has_no_defaults() -> None:
         {"max_pages": 51},
         {"max_pages": 2.0},
         {"max_pages": True},
-        {"pages_per_window": 0},
-        {"pages_per_window": 1.5},
-        {"pages_per_window": True},
+        {"attempts_per_window": 0},
+        {"attempts_per_window": 1.5},
+        {"attempts_per_window": True},
     ],
 )
 def test_sweep_policy_rejects_invalid_values(kwargs: dict[str, Any]) -> None:
     values: dict[str, Any] = {
-        "interval_s": 60.0, "deadline_s": 10.0, "max_pages": 3, "pages_per_window": 10
+        "interval_s": 60.0, "deadline_s": 10.0, "max_pages": 3, "attempts_per_window": 10
     }
     with pytest.raises(ValueError):
         SweepPolicy(**{**values, **kwargs})
@@ -748,7 +769,7 @@ def test_complete_walk_reaching_the_step_after_closing_began_is_dropped() -> Non
 
 def test_repeated_schedule_is_a_fixed_delay_and_walks_never_overlap() -> None:
     long_deadline = SweepPolicy(
-        interval_s=INTERVAL, deadline_s=500.0, max_pages=3, pages_per_window=10
+        interval_s=INTERVAL, deadline_s=500.0, max_pages=3, attempts_per_window=10
     )
     listing = Listing([row(MARKET)], held=frozenset({0}))
 
@@ -853,14 +874,13 @@ def test_detail_route_is_untouched_by_the_sweep() -> None:
     run(scenario, h)
 
 
-# --- the sweep's own page budget (M2-B2-F1) ------------------------------------------------
+# --- the sweep's own HTTP-attempt budget (M2-B2-F2; AT-41 to AT-43) -----------------------
 
 
-def test_page_budget_bounds_a_fast_sweep_and_leaves_shared_capacity() -> None:
-    """A short interval and many pages: the sweep starts at most `pages_per_window` page
-    reads in any rolling 60 s, so a recovery read is admitted at once (at 674091a the same
-    sweep took 77 of the 80 shared reads in 2 s and the recovery read waited 60 s)."""
-    fast = SweepPolicy(interval_s=1.0, deadline_s=600.0, max_pages=50, pages_per_window=10)
+def test_attempt_budget_bounds_a_fast_sweep_and_limits_its_shared_demand() -> None:
+    """A short interval and many pages: the sweep starts at most ten HTTP attempts
+    in any rolling 60 s. With no other consumers, the recovery read starts at once."""
+    fast = SweepPolicy(interval_s=1.0, deadline_s=600.0, max_pages=50, attempts_per_window=10)
     pages = [[row(str(1000 + i))] for i in range(49)] + [[row(MARKET)]]
     listing = Listing(*pages)
 
@@ -886,25 +906,124 @@ def test_page_budget_bounds_a_fast_sweep_and_leaves_shared_capacity() -> None:
     run(scenario, harness(listing, sweep=fast))
 
 
+def test_sweep_retries_cannot_exhaust_shared_reads_before_recovery() -> None:
+    """One successful page can use four HTTP attempts; charge each retry to the sweep
+    gate so a permitted budget cannot consume the whole shared read window."""
+    fast = SweepPolicy(interval_s=1.0, deadline_s=600.0, max_pages=50, attempts_per_window=29)
+    listing = Listing(
+        *[[row(str(1000 + i))] for i in range(49)],
+        [row(MARKET)],
+        transient_failures=3,
+    )
+
+    async def scenario(h: Harness) -> None:
+        await ready_market(h)
+        for _ in range(55):
+            if h.limiter.used(RequestKind.READ) >= 80:
+                break
+            await h.clock.advance(1.0)
+        assert listing.attempts_by_page.get(0) == 4
+        assert h.limiter.used(RequestKind.READ) < 80
+        assert h.feed._sweep_gate is not None
+        assert h.feed._sweep_gate.used(RequestKind.READ) <= 29
+        t0 = h.clock()
+        details = h.count(f"/markets/{MARKET}")
+        h.transport.batch(h.topic(), batch(1, 0))
+        h.transport.batch(h.topic(), batch(5, 4))
+        await settle()
+        assert h.count(f"/markets/{MARKET}") == details + 1 and h.clock() == t0
+        await h.stop()
+
+    run(scenario, harness(listing, sweep=fast))
+
+
+def test_attempt_budget_failure_mid_retry_never_applies_a_partial_walk() -> None:
+    """Page 1 shows closed; page 2 gets 503s. Its fourth try cannot enter the gate,
+    so no row from page 1 is applied and the walk ends before its deadline."""
+    tight = SweepPolicy(interval_s=INTERVAL, deadline_s=10.0, max_pages=3, attempts_per_window=4)
+    listing = Listing([row(MARKET, "closed")], [row("102")], transient_failures={1: 3})
+
+    async def scenario(h: Harness) -> None:
+        await ready_market(h)
+        before = ledger_state(h)
+        await h.clock.advance(INTERVAL)
+        await h.clock.advance(2.0)  # retry backoffs: 0.25 + 0.5 + 1.0 seconds
+        assert listing.attempts_by_page == {0: 1, 1: 3}
+        assert h.feed._sweep_gate is not None
+        assert h.feed._sweep_gate.used(RequestKind.READ) == 4
+        assert ledger_state(h) == before and h.feed.is_ready(MARKET)
+        assert h.task is not None and not h.task.done()
+        await h.stop()
+
+    run(scenario, harness(listing, sweep=tight))
+
+
+def test_retry_after_still_delays_a_gated_retry() -> None:
+    policy = SweepPolicy(interval_s=INTERVAL, deadline_s=20.0, max_pages=3, attempts_per_window=2)
+    listing = Listing(
+        [row(MARKET, "closed")], transient_failures=1, transient_retry_after="5"
+    )
+
+    async def scenario(h: Harness) -> None:
+        await ready_market(h)
+        await h.clock.advance(INTERVAL)
+        assert listing.attempts_by_page == {0: 1}
+        await h.clock.advance(4.9)
+        assert listing.attempts_by_page == {0: 1} and h.feed.is_ready(MARKET)
+        await h.clock.advance(0.1)
+        assert listing.attempts_by_page == {0: 2}
+        assert h.feed._sweep_gate is not None
+        assert h.feed._sweep_gate.used(RequestKind.READ) == 2
+        assert not h.feed.is_ready(MARKET)
+        await h.stop()
+
+    run(scenario, harness(listing, sweep=policy))
+
+
+def test_close_cancels_a_walk_waiting_for_attempt_admission() -> None:
+    policy = SweepPolicy(interval_s=INTERVAL, deadline_s=100.0, max_pages=3, attempts_per_window=1)
+    listing = Listing([row(MARKET, "closed")], [row("102")])
+
+    async def scenario(h: Harness) -> None:
+        await ready_market(h)
+        before = ledger_state(h)
+        await h.clock.advance(INTERVAL)
+        assert listing.attempts_by_page == {0: 1}  # second page waits at the gate
+        await h.stop()
+        assert listing.attempts_by_page == {0: 1} and ledger_state(h) == before
+        assert not h.feed.is_ready(MARKET)
+
+    run(scenario, harness(listing, sweep=policy))
+
+
+def test_short_shared_window_is_not_miscounted_as_fractional_resync_burst() -> None:
+    """The 40/60 resync gate can emit 40 starts in 10s, not ceil(40*10/60)."""
+    clock = ManualClock()
+    short = RateLimiter(read_limit=12, window=10.0, clock=clock, sleep=clock.sleep)
+    policy = SweepPolicy(interval_s=1.0, deadline_s=10.0, max_pages=3, attempts_per_window=2)
+    with pytest.raises(ValueError, match="no nominal capacity"):
+        Harness(policy=QUIET, sweep=policy, clock=clock, limiter=short)
+
+
 @pytest.mark.parametrize(("pages", "accepted"), [(29, True), (30, False), (500, False)])
-def test_feed_refuses_a_page_budget_that_leaves_no_shared_capacity(
+def test_feed_refuses_an_attempt_budget_that_leaves_no_nominal_capacity(
     pages: int, accepted: bool
 ) -> None:
     """With the default gates (40 resyncs and 10 recovery starts a minute) and the shared
     80-read limit, the sweep may take at most 29: the gated starts stay below the limit."""
-    policy = SweepPolicy(interval_s=60.0, deadline_s=10.0, max_pages=3, pages_per_window=pages)
+    policy = SweepPolicy(interval_s=60.0, deadline_s=10.0, max_pages=3, attempts_per_window=pages)
     if accepted:
         Harness(policy=QUIET, sweep=policy)
     else:
-        with pytest.raises(ValueError, match="no shared read capacity"):
+        with pytest.raises(ValueError, match="no nominal capacity"):
             Harness(policy=QUIET, sweep=policy)
 
 
-def test_page_admission_past_the_walk_deadline_fails_the_walk() -> None:
-    """One page per window and a 10 s deadline: page 2 cannot be admitted in time, so the
+def test_attempt_admission_past_the_walk_deadline_fails_the_walk() -> None:
+    """One attempt per window and a 10 s deadline: page 2 cannot be admitted in time, so the
     walk fails at once (the gate knows the wait passes the deadline) and page 1's `closed`
     row is never applied; the next walk starts one interval after that failure."""
-    tight = SweepPolicy(interval_s=INTERVAL, deadline_s=10.0, max_pages=3, pages_per_window=1)
+    tight = SweepPolicy(interval_s=INTERVAL, deadline_s=10.0, max_pages=3, attempts_per_window=1)
     listing = Listing([row(MARKET, "closed")], [row("102")])
 
     async def scenario(h: Harness) -> None:

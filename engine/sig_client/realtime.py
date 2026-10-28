@@ -96,8 +96,9 @@ withdrawn; a market listed `open` changes nothing; a market absent from the list
 open LIFECYCLE_UNKNOWN blocker and its readiness is withdrawn, because no documented rule
 says what absence means (it is read as neither open nor closed). The sweep never confirms
 or clears a blocker, never provides bootstrap evidence and never publishes MarketReady.
-Its own page gate (SweepPolicy.pages_per_window) admits each page before the shared
-limiter, and the feed refuses a policy whose gated reads leave no shared capacity.
+Its own attempt gate (SweepPolicy.attempts_per_window) admits each HTTP attempt,
+including retries, before the shared limiter. It caps sweep traffic but cannot reserve
+shared reads for recovery or account callers, which have no priority.
 
 Readiness: `readiness(market_id)` returns a MarketReadiness (readiness.py) explaining
 every failing condition; `is_ready(market_id)` is exactly `readiness(...).status is
@@ -1220,30 +1221,28 @@ class RealtimeMarketFeed:
     # --- lifecycle sweep (M2-B2, design 9.3, AT-26; opt-in) ---------------------------
 
     def _sweep_budget(self, sweep: SweepPolicy, shared: RateLimiter) -> RateLimiter:
-        """The sweep's page gate, after checking that the feed's gated read starts leave
-        capacity in the shared account limiter for every other reader.
+        """Gate every sweep HTTP attempt, including retries, before the shared limiter.
 
-        Per window of the shared limiter, the resync gate, the recovery gate and the sweep
-        gate together may start at most `demand` reads; it must stay strictly below the
-        shared read limit. This bounds logical starts only (see SweepPolicy).
+        The capacity check also considers the maximum logical starts of the resync and
+        recovery gates in a shared window. It is not a reservation: those reads may retry
+        and unrelated account clients can consume the shared budget (see SweepPolicy).
         """
         window = shared.window
         demand = (
-            sweep.pages_per_window
-            + math.ceil(self._policy.resync_reads_per_minute * window / 60.0)
-            + math.ceil(
-                self._recovery.attempts_per_window * window / self._recovery.attempt_window_s
-            )
+            sweep.attempts_per_window
+            + self._policy.resync_reads_per_minute * math.ceil(window / 60.0)
+            + self._recovery.attempts_per_window
+            * math.ceil(window / self._recovery.attempt_window_s)
         )
         limit = shared.limit(RequestKind.READ)
         if demand >= limit:
             raise ValueError(
-                f"the sweep page budget leaves no shared read capacity: resyncs, recovery "
-                f"attempts and sweep pages may start {demand} reads per {window:g} s, and "
-                f"the shared limiter admits {limit}"
+                f"the sweep attempt budget and the other feed gates can demand "
+                f"{demand} starts per {window:g} s, while the shared limiter admits "
+                f"{limit}; the policy leaves no nominal capacity"
             )
         return RateLimiter(
-            read_limit=sweep.pages_per_window,
+            read_limit=sweep.attempts_per_window,
             write_limit=1,
             window=window,
             clock=self._clock,
@@ -1277,8 +1276,8 @@ class RealtimeMarketFeed:
         gate = self._sweep_gate
         assert gate is not None
 
-        async def admit_page() -> None:
-            # The sweep's own page budget, before the shared limiter (SweepPolicy).
+        async def admit_attempt() -> None:
+            # Each HTTP attempt, including retries, spends one sweep token.
             await gate.acquire(RequestKind.READ, deadline=deadline)
 
         try:
@@ -1289,7 +1288,7 @@ class RealtimeMarketFeed:
                         status="any",
                         page_limit=MARKETS_PAGE_MAX,
                         max_pages=policy.max_pages,
-                        before_page=admit_page,
+                        before_attempt=admit_attempt,
                     )
                 finally:
                     timer.cancel()

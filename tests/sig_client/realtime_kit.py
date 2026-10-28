@@ -338,6 +338,7 @@ class Harness:
         ledger: RecoveryLedger | None = None,
         recovery: RecoveryPolicy | None = None,
         clock: ManualClock | None = None,
+        limiter: RateLimiter | None = None,
         sweep: SweepPolicy | None = None,
     ) -> None:
         self.clock = clock or ManualClock()
@@ -355,7 +356,9 @@ class Harness:
         self.transport = transport or FakeTransport()
         self.events: list[FeedEvent] = []
         self.observed: list[tuple[str, bool]] = []
-        self.limiter = RateLimiter(clock=self.clock, sleep=self.clock.sleep)
+        self.limiter = limiter if limiter is not None else RateLimiter(
+            clock=self.clock, sleep=self.clock.sleep
+        )
         config = SigConfig(api_key=ApiKey(SENTINEL_KEY), tournament=tournament, base_url=BASE_URL)
         mock = httpx.MockTransport(self.router)
         self.rest = SigRestClient(

@@ -861,6 +861,7 @@ class SigRestClient:
         cursor: str | None = None,
         status: str = "any",
         search: str | None = None,
+        before_attempt: Callable[[], Awaitable[None]] | None = None,
     ) -> TournamentMarketsPage:
         """One page of GET /tournaments/{slug}/markets."""
         limit = _check_int("limit", limit, 1, MARKETS_PAGE_MAX)
@@ -875,7 +876,9 @@ class SigRestClient:
             params["cursor"] = cursor
         if search is not None:
             params["search"] = search
-        page = await self._get_model(path, params, TournamentMarketsPage)
+        page = await self._get_model(
+            path, params, TournamentMarketsPage, before_attempt=before_attempt
+        )
         self._check_page_size(path, len(page.data), limit)
         return page
 
@@ -887,12 +890,17 @@ class SigRestClient:
         page_limit: int = MARKETS_PAGE_MAX,
         max_pages: int = DEFAULT_MAX_PAGES,
         before_page: Callable[[], Awaitable[None]] | None = None,
+        before_attempt: Callable[[], Awaitable[None]] | None = None,
     ) -> list[TournamentMarket]:
         """Every market in the tournament, or an error. Never a partial list.
 
         Each page has its own read deadline; there is no deadline for the whole list.
         `before_page`, if given, is awaited before each page is requested (a caller's own
         admission gate); an exception from it ends the walk with no partial result.
+        `before_attempt`, if given, is awaited before each HTTP attempt, including every
+        retry, before the shared account limiter. It applies to market-list pages only;
+        tournament verification is a separate read. A failure ends the walk without a
+        partial result. The hook must be scoped to this call, not shared client state.
         """
         path = f"/tournaments/{_segment(self._config.tournament.slug)}/markets"
 
@@ -900,7 +908,8 @@ class SigRestClient:
             if before_page is not None:
                 await before_page()
             return await self.list_tournament_markets_page(
-                limit=page_limit, cursor=cursor, status=status, search=search
+                limit=page_limit, cursor=cursor, status=status, search=search,
+                before_attempt=before_attempt,
             )
 
         return await self._collect(
@@ -1664,9 +1673,16 @@ class SigRestClient:
     # --- transport ----------------------------------------------------------------------
 
     async def _get_model(
-        self, path: str, params: Mapping[str, str | int] | None, model: type[ModelT]
+        self,
+        path: str,
+        params: Mapping[str, str | int] | None,
+        model: type[ModelT],
+        *,
+        before_attempt: Callable[[], Awaitable[None]] | None = None,
     ) -> ModelT:
-        return self._validate(path, await self._get_json(path, params), model)
+        return self._validate(
+            path, await self._get_json(path, params, before_attempt=before_attempt), model
+        )
 
     @staticmethod
     def _validate(path: str, data: object, model: type[ModelT]) -> ModelT:
@@ -1708,9 +1724,15 @@ class SigRestClient:
             verification_read=verification_read,
         )
 
-    async def _get_json(self, path: str, params: Mapping[str, str | int] | None) -> object:
+    async def _get_json(
+        self,
+        path: str,
+        params: Mapping[str, str | int] | None,
+        *,
+        before_attempt: Callable[[], Awaitable[None]] | None = None,
+    ) -> object:
         """One logical GET under one overall deadline. Private by design."""
-        return (await self._get_observed(path, params)).body
+        return (await self._get_observed(path, params, before_attempt=before_attempt)).body
 
     async def _get_observed(
         self,
@@ -1718,6 +1740,7 @@ class SigRestClient:
         params: Mapping[str, str | int] | None,
         *,
         conflict: Callable[[bytes], tuple[MissingValuation, ...] | None] | None = None,
+        before_attempt: Callable[[], Awaitable[None]] | None = None,
     ) -> _Exchange:
         """One logical GET under one overall deadline, with this call's own observations.
 
@@ -1760,6 +1783,9 @@ class SigRestClient:
             # A mismatch latched before this attempt (or during a retry wait) stops it.
             self._raise_if_latched()
             try:
+                if before_attempt is not None:
+                    await within_deadline("caller admission", before_attempt)
+                    self._raise_if_latched()
                 # A cancelled admission consumes no token: the limiter admits only in a
                 # synchronous step after its wait, and keeps no queue of waiters.
                 await within_deadline(

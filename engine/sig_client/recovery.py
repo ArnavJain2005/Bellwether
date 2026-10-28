@@ -357,33 +357,31 @@ class SweepPolicy:
     - `max_pages`: the walk's page cap, at most DEFAULT_MAX_PAGES (50). Pages are requested
       at the documented maximum of 100 markets, so 237 markets need 3 pages. A walk that
       would need more fails with no partial result.
-    - `pages_per_window`: the sweep's own page budget. A feed-wide sweep gate admits at
-      most this many page reads in any rolling window of the shared account limiter
-      (60 s), before each page asks the shared limiter itself. A page whose gate
-      admission cannot come before the walk's deadline fails the walk.
+    - `attempts_per_window`: the sweep's own HTTP-attempt budget. A feed-wide gate
+      admits at most this many attempts in any rolling window of the shared account
+      limiter, before each attempt (including retries) asks the shared limiter itself.
+      A gate admission that cannot fit the walk's deadline fails the whole walk.
 
-    Cost and capacity: one walk is at most `max_pages` page reads, and the sweep starts
-    at most `pages_per_window` page reads per window, however short `interval_s` is.
-    The feed refuses a policy unless its gated starts per window (orderbook resyncs,
-    recovery attempts and sweep pages together) stay strictly below the shared limiter's
-    read limit, so at least that difference is left for every other reader, including
-    account reads. The gates count logical starts, not HTTP attempts: each page may still
-    make several attempts under the REST client's ReadRetryPolicy, every one admitted by
-    the shared limiter, which has no priorities and reserves nothing. How much of the
-    budget the sweep should get is Arnav's allocation; no value is chosen here.
+    Cost and capacity: one walk is at most `max_pages` logical page reads, but may use
+    several HTTP attempts per page. The attempt gate bounds all of those, even with a
+    short interval or repeated transient failures. The constructor also checks the
+    *logical start* limits of the resync and recovery gates against the shared window,
+    but their retries and other same-account clients can use the remaining capacity.
+    There is no guaranteed reservation or priority for recovery or account reads. How
+    much of the budget the sweep should get is Arnav's allocation; no value is chosen.
     """
 
     interval_s: float
     deadline_s: float
     max_pages: int
-    pages_per_window: int
+    attempts_per_window: int
 
     def __post_init__(self) -> None:
         check_positive_seconds("interval_s", self.interval_s)
         check_positive_seconds("deadline_s", self.deadline_s)
         if check_positive_int("max_pages", self.max_pages) > DEFAULT_MAX_PAGES:
             raise ValueError(f"max_pages must be at most {DEFAULT_MAX_PAGES}")
-        check_positive_int("pages_per_window", self.pages_per_window)
+        check_positive_int("attempts_per_window", self.attempts_per_window)
 
 
 def bounded_jitter(delay: float, jittered: object) -> float:
