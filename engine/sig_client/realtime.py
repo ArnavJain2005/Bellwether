@@ -1224,15 +1224,20 @@ class RealtimeMarketFeed:
         """Gate every sweep HTTP attempt, including retries, before the shared limiter.
 
         The capacity check also considers the maximum logical starts of the resync and
-        recovery gates in a shared window. It is not a reservation: those reads may retry
-        and unrelated account clients can consume the shared budget (see SweepPolicy).
+        recovery gates in a shared window, read from the gates themselves: a gate admits at
+        most its limit in any of its windows, so at most limit x ceil(W / its window) in a
+        shared window W. It is not a reservation: those reads may retry and unrelated
+        account clients can consume the shared budget (see SweepPolicy).
         """
         window = shared.window
+
+        def most_starts(gate: RateLimiter) -> int:
+            return gate.limit(RequestKind.READ) * math.ceil(window / gate.window)
+
         demand = (
             sweep.attempts_per_window
-            + self._policy.resync_reads_per_minute * math.ceil(window / 60.0)
-            + self._recovery.attempts_per_window
-            * math.ceil(window / self._recovery.attempt_window_s)
+            + most_starts(self._resync_gate)
+            + most_starts(self._recovery_gate)
         )
         limit = shared.limit(RequestKind.READ)
         if demand >= limit:

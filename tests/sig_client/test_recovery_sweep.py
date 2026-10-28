@@ -1079,3 +1079,107 @@ def test_exhausted_caller_gate_is_reported_as_caller_admission_not_rate_admissio
         await h.tokens.aclose()
 
     run(scenario, harness(listing))
+
+
+# --- M2-B2-F4: the post-walk guards are exercised -------------------------------------------
+# Each reader below stands in for list_all_tournament_markets (white-box seam) and returns a
+# complete list showing the market `closed`, so any guard that failed would quarantine it.
+
+
+def _closed_rows() -> list[TournamentMarket]:
+    exact = json.loads(json.dumps(row(MARKET, "closed")), parse_float=Decimal)
+    return [TournamentMarket.model_validate(exact)]
+
+
+def test_walk_returning_after_its_deadline_applies_nothing() -> None:
+    """The list comes back after the injected clock passed the walk deadline, before the
+    deadline timer could expire the scope: the commit step's own deadline guard drops it."""
+    listing = Listing([row(MARKET)])
+
+    async def scenario(h: Harness) -> None:
+        async def late(**kwargs: Any) -> list[TournamentMarket]:
+            h.clock.now += SWEEP.deadline_s + 1.0  # time passes; no waiter runs
+            return _closed_rows()
+
+        await ready_market(h)
+        before = ledger_state(h)
+        h.rest.list_all_tournament_markets = late  # type: ignore[method-assign]
+        await h.clock.advance(INTERVAL)
+        await settle()
+        assert ledger_state(h) == before and h.feed.is_ready(MARKET)
+        assert h.task is not None and not h.task.done()
+        await h.stop()
+
+    run(scenario, harness(listing))
+
+
+def test_reader_swallowing_the_deadline_cancel_applies_nothing() -> None:
+    """The deadline expires the walk's scope while the reader waits; the reader swallows
+    that cancellation and returns a complete list anyway. Nothing is applied."""
+    listing = Listing([row(MARKET)])
+    swallowed: list[bool] = []
+
+    async def scenario(h: Harness) -> None:
+        async def swallowing(**kwargs: Any) -> list[TournamentMarket]:
+            try:
+                await asyncio.get_running_loop().create_future()
+            except asyncio.CancelledError:
+                swallowed.append(True)  # and carry on as if nothing happened
+            return _closed_rows()
+
+        await ready_market(h)
+        before = ledger_state(h)
+        h.rest.list_all_tournament_markets = swallowing  # type: ignore[method-assign]
+        await h.clock.advance(INTERVAL)
+        await h.clock.advance(SWEEP.deadline_s)
+        await settle()
+        assert swallowed == [True]
+        assert ledger_state(h) == before and h.feed.is_ready(MARKET)
+        assert h.task is not None and not h.task.done()  # a failed walk, not a stopped feed
+        await h.stop()
+
+    run(scenario, harness(listing))
+
+
+def test_reader_swallowing_an_external_cancel_applies_nothing() -> None:
+    """The sweep task is cancelled from outside while the reader waits; the reader swallows
+    it and returns a complete list. The cancellation still wins: nothing is applied."""
+    listing = Listing([row(MARKET)])
+    tasks: list[asyncio.Task[Any]] = []
+
+    async def scenario(h: Harness) -> None:
+        async def swallowing(**kwargs: Any) -> list[TournamentMarket]:
+            task = asyncio.current_task()
+            assert task is not None
+            tasks.append(task)
+            try:
+                await asyncio.get_running_loop().create_future()
+            except asyncio.CancelledError:
+                pass
+            return _closed_rows()
+
+        await ready_market(h)
+        before = ledger_state(h)
+        h.rest.list_all_tournament_markets = swallowing  # type: ignore[method-assign]
+        await h.clock.advance(INTERVAL)
+        (task,) = tasks
+        task.cancel()
+        await settle()
+        assert task.done() and task.cancelled()
+        assert ledger_state(h) == before and h.feed.is_ready(MARKET)
+        await h.stop()
+
+    run(scenario, harness(listing))
+
+
+def test_capacity_check_reads_each_gate_window_instead_of_assuming_60_s() -> None:
+    """White-box: with a 30 s resync gate, 40 resync starts can happen twice in one 60 s
+    shared window, so 10 + 80 + 10 = 100 >= 80 is refused. A check that assumed a 60 s
+    resync window would count 40 and accept it."""
+    h = Harness(policy=QUIET)
+    h.feed._resync_gate = RateLimiter(
+        read_limit=40, write_limit=1, window=30.0, clock=h.clock, sleep=h.clock.sleep
+    )
+    policy = SweepPolicy(interval_s=60.0, deadline_s=10.0, max_pages=3, attempts_per_window=10)
+    with pytest.raises(ValueError, match="100 starts per 60 s"):
+        h.feed._sweep_budget(policy, h.limiter)
