@@ -37,6 +37,13 @@ Cancellation: only `SigClientError` is classified as a component failure. Cancel
 the assembling task (and any other exception, which would be a programming error)
 propagates unchanged and produces no snapshot.
 
+Immutability: a snapshot is immutable all the way down, so nothing a caller does can
+change the data its findings, reasons and status were computed from. Every retained A2
+result, wire model, provenance record and A3 record is checked when it is built: only
+frozen dataclasses, frozen pydantic models, tuples, frozensets, read-only mappings and
+immutable scalars are accepted (`_check_immutable`). Deliberately bypassing that (for
+example with `object.__setattr__`) is outside what any Python object can prevent.
+
 Redaction: reasons, findings and failures hold client-written text, component labels and
 row positions only; never balances, quantities, market ids, titles or cursors. Result
 objects hold response values for engine use only; never log them.
@@ -44,6 +51,7 @@ objects hold response values for engine use only; never log them.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import re
 import time
@@ -51,10 +59,12 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
-from enum import StrEnum
+from enum import Enum, StrEnum
 from types import MappingProxyType
 from typing import Literal
 from urllib.parse import quote
+
+from pydantic import BaseModel
 
 from engine.config import TournamentRef
 from engine.sig_client.account_reads import (
@@ -463,6 +473,45 @@ class ComponentFailure:
         return ", ".join(parts)
 
 
+# --- immutability ----------------------------------------------------------------------------
+
+_IMMUTABLE_SCALARS = (str, int, float, Decimal, datetime, Enum, type(None))
+
+
+def _check_immutable(value: object, where: str) -> None:
+    """Raise TypeError unless `value` cannot be changed through any reachable reference.
+
+    Accepted: immutable scalars (bool is an int), tuples and frozensets of accepted values,
+    read-only mappings (MappingProxyType) of them, frozen dataclasses and frozen pydantic
+    models whose fields are accepted and which hold no extra fields. Anything else, such
+    as a list or dict reachable from a retained observation, is refused.
+    """
+    if isinstance(value, _IMMUTABLE_SCALARS):
+        return
+    if isinstance(value, (tuple, frozenset)):
+        for index, item in enumerate(value):
+            _check_immutable(item, f"{where}[{index}]")
+        return
+    if isinstance(value, MappingProxyType):
+        for key, item in value.items():
+            _check_immutable(key, f"{where}<key>")
+            _check_immutable(item, f"{where}[{key!r}]")
+        return
+    if isinstance(value, BaseModel):
+        if value.model_config.get("frozen") is not True or value.model_extra:
+            raise TypeError(f"{where}: {type(value).__name__} is not a frozen wire model")
+        for name in type(value).model_fields:
+            _check_immutable(getattr(value, name), f"{where}.{name}")
+        return
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        if not type(value).__dataclass_params__.frozen:  # type: ignore[attr-defined]
+            raise TypeError(f"{where}: {type(value).__name__} is not a frozen dataclass")
+        for field in dataclasses.fields(value):
+            _check_immutable(getattr(value, field.name), f"{where}.{field.name}")
+        return
+    raise TypeError(f"{where}: {type(value).__name__} is mutable or not known to be immutable")
+
+
 # --- component results ---------------------------------------------------------------------
 
 
@@ -488,6 +537,9 @@ class ComponentResult:
         if not isinstance(self.outcome, Outcome):
             raise TypeError("outcome must be an Outcome")
         kind = self.component.kind
+        # Findings, reasons and the status are computed from what is kept here.
+        _check_immutable(self.read, f"{self.component.label}.read")
+        _check_immutable(self.failure, f"{self.component.label}.failure")
         if self.outcome is Outcome.NOT_REQUESTED:
             if kind in REQUIRED_KINDS:
                 raise ValueError("a required component is always requested")
@@ -666,14 +718,22 @@ class BalanceObservation:
 
 
 def _same_exactly(left: object, right: object) -> bool:
-    # Exact agreement: the same value and the same wire spelling ("847.5" and "847.50"
-    # count as different), so no numeric normalization ever hides a change.
+    """Agreement of two balance-field values as A2 decoded them (K13 and cash).
+
+    Numbers agree when they are equal Decimals with the same (sign, digits, exponent),
+    as decoded by A2 (`parse_float=Decimal`; JSON integers via `Decimal(int)`). So
+    "847.5" and "847.50" differ, and "100" and "1e2" differ, but "100" and "1.00e2"
+    agree, as do "1e2" and "1E+2": A2 keeps the decoded Decimal, not the JSON text,
+    so lexemes that decode to the same triple cannot be told apart here. This is not a
+    byte-exact comparison of the response. Other values agree when they have the same
+    type and are equal.
+    """
     if isinstance(left, Decimal) or isinstance(right, Decimal):
         return (
             isinstance(left, Decimal)
             and isinstance(right, Decimal)
             and left == right
-            and str(left) == str(right)
+            and left.as_tuple() == right.as_tuple()
         )
     return type(left) is type(right) and left == right
 
@@ -710,8 +770,9 @@ class CashCandidate:
     """A candidate tournament cash value, never established and never available for orders.
 
     `value` is the closing read's `myBalance` only when both balance reads were OBSERVED
-    with identity MATCH and agreed exactly on myBalance, isPendingEnrolment,
-    initialBalance and currencyName; otherwise None with source NONE. `currency` and
+    with identity MATCH and agreed on myBalance, isPendingEnrolment, initialBalance and
+    currencyName under `_same_exactly` (equal decoded Decimals with the same sign, digits
+    and exponent; not the JSON text); otherwise None with source NONE. `currency` and
     `reported_pending_at_source` come from the same closing read under the same rule.
     `source_established` is always False (OQ-W11) and `excludes_resting_orders` always
     UNKNOWN (OQ-C3) until Arnav records evidence.
@@ -1182,8 +1243,9 @@ def _vouches(results: Mapping[ComponentId, ComponentResult], cash: CashCandidate
             )
     if cash.source is CashSource.CLOSING:
         said.append(
-            "the opening and closing balance responses agreed exactly on myBalance, "
-            "isPendingEnrolment, initialBalance and currencyName"
+            "the opening and closing balance responses agreed on myBalance, "
+            "isPendingEnrolment, initialBalance and currencyName as decoded (equal Decimals "
+            "with the same sign, digits and exponent; not a comparison of the JSON text)"
         )
     return said
 
@@ -1552,7 +1614,7 @@ def build_account_snapshot(
         for c in request.not_requested()
     )
     timings = [r.timing for r in results if r.timing is not None]
-    return AccountSnapshot(
+    snapshot = AccountSnapshot(
         tournament=tournament,
         status=status,
         requested=requested,
@@ -1578,6 +1640,8 @@ def build_account_snapshot(
         vouches_for=tuple(_vouches(by_component, cash)),
         cannot_vouch_for=tuple(cannot),
     )
+    _check_immutable(snapshot, "snapshot")
+    return snapshot
 
 
 # --- assembly -------------------------------------------------------------------------------

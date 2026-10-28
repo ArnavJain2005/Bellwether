@@ -94,7 +94,7 @@ def test_t6_rows_lots_and_summary_are_kept_exactly_as_sent() -> None:
     assert no.lots[0].side == "NO" and no.lots[0].quantity == Decimal("2.5")
     # A zero row with the documented null currentPrice.
     assert flat.quantity == 0 and flat.currentPrice is None and flat.settled is True
-    assert flat.lots == []
+    assert flat.lots == ()  # an empty JSON array, kept as an immutable tuple
     assert result.summary.totalMarketValue == Decimal("3.8875")
     assert yes.lots[0].openedAt == "2026-10-02T12:00:00.000Z"  # timestamps kept as strings
 
@@ -165,6 +165,8 @@ def test_t6_an_empty_response_is_retained_as_observed() -> None:
         (lambda b: b["positions"][0].update(exchangeId=36), "positions.0.exchangeId"),
         (lambda b: b["positions"][0].pop("option"), "positions.0.option"),
         (lambda b: b["positions"][0].update(lots=None), "positions.0.lots"),
+        (lambda b: b["positions"][0].update(lots={}), "positions.0.lots"),
+        (lambda b: b["positions"][0].update(lots="lots"), "positions.0.lots"),
         (lambda b: b["positions"][0]["lots"][0].update(side=5), "lots.0.side"),
         (lambda b: b["positions"][0]["lots"][0].pop("openedAt"), "lots.0.openedAt"),
         (lambda b: b["summary"].update(totalCostBasis=None), "summary.totalCostBasis"),
@@ -174,6 +176,18 @@ def test_malformed_positions_are_rejected_naming_the_location(mutate: Any, locat
     with pytest.raises(SigResponseError) as info:
         read_positions(Router({POSITIONS: exact_response(200, positions_with(mutate))}))
     assert location in info.value.reason
+
+
+def test_lots_are_an_immutable_tuple_in_order() -> None:
+    # A3-F1: the account snapshot retains position rows, so lots must not be a list.
+    result = read_positions(
+        Router({POSITIONS: exact_response(200, positions_with(lambda b: None))})
+    )
+    lots = result.rows[0].lots
+    assert type(lots) is tuple
+    assert [lot.lotId for lot in lots] == ["placeholder-lot-1", "placeholder-lot-2"]
+    with pytest.raises(AttributeError):
+        lots.clear()  # type: ignore[attr-defined]
 
 
 @pytest.mark.parametrize(

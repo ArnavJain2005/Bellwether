@@ -12,11 +12,14 @@ import inspect
 import itertools
 import re
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
+from types import MappingProxyType
 
 import httpx
 import pytest
 from account_kit import ORDERS, POSITIONS, TOURNAMENT_PATH, orders_page
+from pydantic import ValidationError
 from sig_testkit import FakeClock, fixture, json_response, make_client, run
 from snapshot_kit import (
     FILLS,
@@ -36,6 +39,7 @@ from engine.account.snapshot import (
     OPEN_ORDERS,
     OPENING,
     AccountStatus,
+    ComponentResult,
     FindingKind,
     Identity,
     Outcome,
@@ -51,7 +55,7 @@ from engine.sig_client.account_reads import (
     ScopeEvidence,
     VerificationUse,
 )
-from engine.sig_client.wire import EconomicCommandCoverage
+from engine.sig_client.wire import EconomicCommandCoverage, TournamentPosition
 
 ENGINE_ACCOUNT = Path(snap.__file__).resolve().parent
 
@@ -520,3 +524,88 @@ def test_verification_read_made_by_a_later_component_is_listed_in_reads():
     assert snapshot.balance_closing.identity is Identity.MATCH
     assert snapshot.identity.opening is Identity.NOT_OBSERVED
     assert CLOSING in snapshot.requested
+
+
+# --- immutability of retained observations (A3-F1) --------------------------------------
+
+
+def _mutable_paths(root: object) -> list[str]:
+    """Every list, dict, set or bytearray reachable from `root` (an independent walk)."""
+    found: list[str] = []
+    seen: set[int] = set()
+
+    def visit(value: object, where: str) -> None:
+        if id(value) in seen or isinstance(value, (str, bytes, int, float, type)):
+            return
+        seen.add(id(value))
+        if isinstance(value, (list, dict, set, bytearray)):
+            found.append(where)
+            return
+        if isinstance(value, (tuple, frozenset)):
+            for index, item in enumerate(value):
+                visit(item, f"{where}[{index}]")
+        elif isinstance(value, MappingProxyType):
+            for key, item in value.items():
+                visit(item, f"{where}[{key!r}]")
+        elif hasattr(value, "__dict__"):
+            for name, item in vars(value).items():
+                visit(item, f"{where}.{name}")
+
+    visit(root, "snapshot")
+    return found
+
+
+def test_retained_lots_cannot_be_changed_through_the_snapshot():
+    # Reviewed head 52cefea: `lots` was a list, `clear()` emptied the retained row and the
+    # snapshot kept findings computed from the lots it had before.
+    snapshot, _, _ = assemble()
+    for row in (snapshot.positions.read.rows[0], snapshot.components[1].read.rows[0]):
+        assert isinstance(row.lots, tuple) and len(row.lots) == 2
+        with pytest.raises(AttributeError):
+            row.lots.clear()
+        with pytest.raises(AttributeError):
+            row.lots.append(row.lots[0])
+        with pytest.raises(ValidationError):
+            row.lots = ()
+        with pytest.raises(ValidationError):
+            row.lots[0].quantity = Decimal(0)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        snapshot.positions.read.rows = ()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        snapshot.components = ()
+    assert len(snapshot.positions.read.rows[0].lots) == 2
+    # The kept findings are still those of the kept data.
+    rebuilt = build_account_snapshot(
+        snapshot.tournament,
+        SnapshotRequest(),
+        snapshot.components[:4],
+        evaluated_mono=snapshot.evaluated_mono,
+        evaluated_utc=snapshot.evaluated_utc,
+    )
+    assert rebuilt.findings == snapshot.findings == ()
+
+
+def test_nothing_mutable_is_reachable_from_any_snapshot():
+    full, _, _ = assemble(request=FULL)
+    failed, _, _ = assemble(
+        {
+            POSITIONS: json_response(409, fixture("positions_missing_valuation")),
+            FILLS: error(500, "INTERNAL_ERROR"),
+        },
+        SnapshotRequest(fills=True),
+    )
+    for snapshot in (full, failed):
+        assert _mutable_paths(snapshot) == []
+
+
+def test_a_read_holding_a_mutable_container_is_refused():
+    snapshot, _, _ = assemble()
+    read = snapshot.positions.read
+    row = read.rows[0]
+    listed = TournamentPosition.model_construct(**(dict(row) | {"lots": list(row.lots)}))
+    for bad in (
+        dataclasses.replace(read, rows=(listed,)),
+        dataclasses.replace(read, rows=list(read.rows)),
+    ):
+        with pytest.raises(TypeError, match="positions.read"):
+            ComponentResult.observed(snap.POSITIONS, bad)

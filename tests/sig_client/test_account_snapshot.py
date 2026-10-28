@@ -6,11 +6,21 @@ validated against a real SIG response.
 
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 
+import httpx
 import pytest
 from account_kit import ORDERS, POSITIONS, TOURNAMENT_PATH, exact_response, taking
-from sig_testkit import API, FakeClock, fixture, json_response, make_client, run
+from sig_testkit import (
+    API,
+    FakeClock,
+    fixture,
+    json_response,
+    make_client,
+    raw_response,
+    run,
+)
 from snapshot_kit import (
     FILLS,
     FULL,
@@ -492,13 +502,42 @@ def test_t37_equal_balances_other_field_differs(change, field):
     assert snapshot.cash.value is None
 
 
-def test_t37_same_value_different_spelling_is_a_difference():
-    body = fixture("tournament")
-    first = exact_response(200, body | {"myBalance": Decimal("847.5")})
-    second = exact_response(200, body | {"myBalance": Decimal("847.50")})
-    snapshot, _, _ = assemble({TOURNAMENT_PATH: sequence(first, second)})
-    assert snapshot.balance_differences == ("myBalance",)
-    assert snapshot.cash.value is None
+def balance_lexeme(lexeme: str) -> httpx.Response:
+    """A tournament body whose myBalance is written with exactly this JSON number text."""
+    text = json.dumps(fixture("tournament") | {"myBalance": "@@"})
+    return raw_response(
+        200, text.replace('"@@"', lexeme).encode(), {"content-type": "application/json"}
+    )
+
+
+@pytest.mark.parametrize(
+    ("opening", "closing", "agree"),
+    [
+        # A2 decodes JSON integers with Decimal(int) and other numbers with
+        # parse_float=Decimal, and keeps the Decimal, not the text. Agreement is on the
+        # decoded (sign, digits, exponent): not a byte-exact comparison of the JSON.
+        ("100", "1.00e2", True),  # both decode to Decimal("100")
+        ("1e2", "1E+2", True),  # both decode to Decimal("1E+2")
+        ("100", "100", True),
+        ("100", "1e2", False),  # equal value, different exponent
+        ("847.5", "847.50", False),  # equal value, different digits
+        ("100", "100.0", False),
+        ("847.5", "847.6", False),
+    ],
+)
+def test_t37_balance_agreement_is_on_decoded_decimals(opening, closing, agree):
+    snapshot, _, _ = assemble(
+        {TOURNAMENT_PATH: sequence(balance_lexeme(opening), balance_lexeme(closing))}
+    )
+    assert snapshot.balance_differences == (() if agree else ("myBalance",))
+    assert (snapshot.cash.source is CashSource.CLOSING) is agree
+    if agree:
+        assert snapshot.cash.value == snapshot.balance_opening.my_balance
+        assert snapshot.status is AccountStatus.OBSERVED_UNRESOLVED
+    else:
+        assert snapshot.cash.value is None
+        assert snapshot.status is AccountStatus.INCOMPLETE
+        assert [f.check_id for f in snapshot.findings] == ["K13"]
 
 
 def test_t38_agreeing_balances_give_a_candidate_from_the_closing_read():
