@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import json
 import logging
 import math
@@ -39,7 +40,11 @@ from realtime_kit import (
 from sig_testkit import TOURNAMENT, fixture, json_response
 
 import engine
-from engine.sig_client.errors import SigRateLimitedError
+from engine.sig_client.errors import (
+    SigDeadlineExceededError,
+    SigRateBudgetError,
+    SigRateLimitedError,
+)
 from engine.sig_client.rate_limiter import RateLimiter, RequestKind
 from engine.sig_client.readiness import ReadinessStatus
 from engine.sig_client.realtime import (
@@ -56,6 +61,7 @@ from engine.sig_client.recovery import (
     SweepObservation,
     SweepPolicy,
 )
+from engine.sig_client.rest import SigRestClient
 from engine.sig_client.wire import TournamentMarket
 
 QUIET = RealtimeFeedPolicy(tick_s=1e6)  # the timer never fires within these tests
@@ -1038,3 +1044,38 @@ def test_attempt_admission_past_the_walk_deadline_fails_the_walk() -> None:
         await h.stop()
 
     run(scenario, harness(listing, sweep=tight))
+
+
+# --- M2-B2-F3: no page-only hook; caller-admission failures are named as such --------------
+
+
+def test_market_list_offers_no_page_only_admission_hook() -> None:
+    """A per-page hook cannot see retries, which is the F2 defect: the only caller gate on
+    the market-list walk is the per-HTTP-attempt `before_attempt`."""
+    parameters = inspect.signature(SigRestClient.list_all_tournament_markets).parameters
+    assert "before_page" not in parameters
+    assert "before_attempt" in parameters
+    page = inspect.signature(SigRestClient.list_tournament_markets_page).parameters
+    assert "before_attempt" in page
+
+
+def test_exhausted_caller_gate_is_reported_as_caller_admission_not_rate_admission() -> None:
+    """A caller gate that cannot admit before its deadline fails the read before any HTTP
+    attempt or shared-limiter token, labelled with its own phase."""
+    listing = Listing([row(MARKET, "closed")])
+
+    async def scenario(h: Harness) -> None:
+        await h.rest.verify_tournament()
+        shared = h.limiter.used(RequestKind.READ)
+
+        async def exhausted() -> None:
+            raise SigRateBudgetError("sweep gate: admission would pass the walk deadline")
+
+        with pytest.raises(SigDeadlineExceededError) as caught:
+            await h.rest.list_all_tournament_markets(before_attempt=exhausted)
+        assert caught.value.phase == "caller admission" and caught.value.attempts == 0
+        assert listing.requests == [] and h.limiter.used(RequestKind.READ) == shared
+        await h.rest.aclose()
+        await h.tokens.aclose()
+
+    run(scenario, harness(listing))

@@ -160,7 +160,8 @@ class SigRetryExhaustedError(SigClientError):
 class SigDeadlineExceededError(SigClientError):
     """A logical read's overall deadline passed, or would pass before the next step.
 
-    `phase` is where it ran out: "rate admission", "request" (sending, waiting for and
+    `phase` is where it ran out: "caller admission" (a caller's own per-attempt gate,
+    such as the lifecycle sweep's), "rate admission", "request" (sending, waiting for and
     reading the response) or "retry wait". `last_error` is the previous attempt's
     failure, if any. No response that arrives after the deadline is returned.
     """

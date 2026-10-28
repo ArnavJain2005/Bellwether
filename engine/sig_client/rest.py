@@ -889,14 +889,11 @@ class SigRestClient:
         search: str | None = None,
         page_limit: int = MARKETS_PAGE_MAX,
         max_pages: int = DEFAULT_MAX_PAGES,
-        before_page: Callable[[], Awaitable[None]] | None = None,
         before_attempt: Callable[[], Awaitable[None]] | None = None,
     ) -> list[TournamentMarket]:
         """Every market in the tournament, or an error. Never a partial list.
 
         Each page has its own read deadline; there is no deadline for the whole list.
-        `before_page`, if given, is awaited before each page is requested (a caller's own
-        admission gate); an exception from it ends the walk with no partial result.
         `before_attempt`, if given, is awaited before each HTTP attempt, including every
         retry, before the shared account limiter. It applies to market-list pages only;
         tournament verification is a separate read. A failure ends the walk without a
@@ -905,8 +902,6 @@ class SigRestClient:
         path = f"/tournaments/{_segment(self._config.tournament.slug)}/markets"
 
         async def fetch(cursor: str | None) -> TournamentMarketsPage:
-            if before_page is not None:
-                await before_page()
             return await self.list_tournament_markets_page(
                 limit=page_limit, cursor=cursor, status=status, search=search,
                 before_attempt=before_attempt,
@@ -1782,10 +1777,15 @@ class SigRestClient:
                 raise SigClientClosedError("the SIG client is closed")
             # A mismatch latched before this attempt (or during a retry wait) stops it.
             self._raise_if_latched()
-            try:
-                if before_attempt is not None:
+            if before_attempt is not None:
+                # The caller's own gate, before any shared token is taken. Its budget
+                # failure is named for it, not for the shared limiter.
+                try:
                     await within_deadline("caller admission", before_attempt)
-                    self._raise_if_latched()
+                except SigRateBudgetError:
+                    raise expired("caller admission") from None
+                self._raise_if_latched()
+            try:
                 # A cancelled admission consumes no token: the limiter admits only in a
                 # synchronous step after its wait, and keeps no queue of waiters.
                 await within_deadline(
