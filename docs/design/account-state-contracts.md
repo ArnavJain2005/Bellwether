@@ -879,15 +879,20 @@ nothing about positions, orders or any other component read in between.
 | Component age | `t − started_mono` of the component's earliest request | Time since we first asked for that component. For a walk, the first page sets it |
 | Oldest component age | The largest component age, with its component named | The figure to quote for the snapshot |
 
-**Counterexample.** The positions request starts at 1 and finishes at 2. The closing
-balance finishes at 900, and the snapshot is evaluated at 900. Then:
+**Counterexample.** The opening balance request starts at 0. The positions request
+starts at 1 and finishes at 2. The closing balance finishes at 900, and the snapshot is
+evaluated at 900. Then:
 
 - completion age is 0;
+- opening balance component age is 900;
 - positions component age is 899 (898 since its response finished);
-- oldest component age is 899, named `positions`.
+- oldest component age is 900, named `balance_opening`.
 
-A recent closing balance read refreshes neither positions nor orders, and the snapshot
-never reports their age as the closing read's.
+The oldest component is taken over every requested component, the opening balance
+included. A recent closing balance read refreshes neither the opening balance,
+positions nor orders, and the snapshot never reports their age as the closing read's.
+(Corrected in A3: an earlier draft named `positions` at 899 by leaving the opening
+balance out of the calculation.)
 
 Every age here is **local**. It measures our own requests, never SIG's state. A response
 may reflect projected state older than the request that fetched it (A1-N1), so no local
@@ -1018,8 +1023,9 @@ own."
    closing read gives `Y ≠ X` (or the same value with a different pending flag). K13
    fires. The status is `INCOMPLETE` and `cash.value` is None. Both observations are kept
    with their values, flags, currency and provenance.
-9. **Ages.** This is the counterexample in 5.8: the snapshot reports positions as its
-   oldest component, at age 899, not the completion age of 0.
+9. **Ages.** This is the counterexample in 5.8: the snapshot reports the opening
+   balance as its oldest component, at age 900, and positions at age 899, not the
+   completion age of 0.
 
 ## 6. Mapping unresolved contracts to PRD questions
 
@@ -1101,7 +1107,7 @@ and the shared limiter. None calls SIG.
 | T36 | A3 | Opening `myBalance = X`, closing `Y ≠ X` | Example 5.12.8: K13; `INCOMPLETE`; `cash.value` None; both observations kept with values, flags, currency and provenance; `balance_differences` names `myBalance` |
 | T37 | A3 | Equal balances, but the pending flag (or currency, or `initialBalance`) differs | K13; `INCOMPLETE`; `cash.value` None; the differing field named |
 | T38 | A3 | Both balance observations agree exactly and have identity `MATCH` | `cash.value` equals the closing `myBalance`; `cash.source = CLOSING`; currency and pending flag from the closing read |
-| T39 | A3 | Positions request 1 to 2, closing balance finishes at 900, evaluated at 900 | Example 5.12.9: completion age 0; positions component age 899; oldest component age 899, named `positions` |
+| T39 | A3 | Opening balance request starts at 0, positions request 1 to 2, closing balance finishes at 900, evaluated at 900 | Example 5.12.9: completion age 0; opening balance component age 900; positions component age 899; oldest component age 900, named `balance_opening` |
 | T40 | A3 | Any snapshot | No field or reason calls server state fresh because of a local age; no maximum-age constant exists in A3 |
 | T41 | A3 | All requested components `OBSERVED`, identities `MATCH`, no difference | `OBSERVED_UNRESOLVED`, never `READY`; the status enum has no ready member |
 | T42 | A3 | Any snapshot | `cash.source_established is False` and `excludes_resting_orders == UNKNOWN`; the 5.11 list is in `cannot_vouch_for`; `does_not_cover` present |
