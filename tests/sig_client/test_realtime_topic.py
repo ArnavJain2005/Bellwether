@@ -109,7 +109,10 @@ def test_duplicate_ignores_arrays(revision: int) -> None:
         ),
     )
     assert out.duplicate is True
-    assert out.trades == [] and out.settlements == [] and out.resync is None
+    assert out.trades == [] and out.settlements == []
+    # M2-B1 (design 4.7): never emitted, but its settlement and its unseen trade id
+    # open blockers (test_recovery_duplicates.py).
+    assert out.blockers == {StaleReason.MARKET_SETTLED, StaleReason.REVISION_ANOMALY}
     assert t.last_revision == 5
 
 
