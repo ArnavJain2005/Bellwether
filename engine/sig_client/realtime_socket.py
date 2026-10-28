@@ -100,7 +100,17 @@ changes gets that push as soon as it is acknowledged, before its SUBSCRIBED is e
 Ordering: one task owns the socket. It reads frames, sends joins, heartbeats and token
 pushes, runs the timers, and emits every event into one bounded queue, so the feed sees
 events in the order they happened: a SocketEvent always precedes every SUBSCRIBED of the
-rejoins that follow it.
+rejoins that follow it. A loss report is never queued behind events it makes stale:
+- A lost socket discards every queued event and its SocketEvent becomes the next one.
+  Delivering the old socket's backlog after the SocketEvent would let it advance the
+  revision past the window's fence (confirming the window with frames from before the
+  break), and a queued SUBSCRIBED would re-subscribe a topic on a dead socket. Discarded
+  frames count as undelivered, like any frame lost in transit: the feed's revision
+  checks and its window keep the market not ready until its own evidence arrives.
+- A channel that ends (CHANNEL_ERROR, TIMED_OUT, CLOSED) discards that topic's queued
+  events, and its status is queued ahead of every ordinary event, behind earlier loss
+  reports (at most one per topic, so the queue stays bounded). Other topics' events keep
+  their order. The same reasoning applies per topic: its backlog is from the ended join.
 
 Secrets: the anon key, the token, the connection URL (it carries the key) and raw frames
 never appear in a log line, repr or raised error. The websockets library gets a disabled
@@ -127,6 +137,7 @@ Proxy: [owner decision] environment proxies are disabled, as in the REST clients
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import re
@@ -435,6 +446,10 @@ class RealtimeSocketPolicy:
             raise ValueError("rejoin_max_s must be at least rejoin_initial_s")
 
 
+def _topic(event: TransportEvent) -> str | None:
+    return None if isinstance(event, SocketEvent) else event.topic
+
+
 def _backoff(failures: int, initial: float, cap: float) -> float:
     """initial, 2x, 4x, ... capped: the wait after `failures` consecutive failures."""
     return min(initial * 2 ** max(failures - 1, 0), cap)
@@ -506,6 +521,7 @@ class RealtimeSocketTransport:
         self._applied = 0  # commands the socket task has acted on
         self._appliers: list[tuple[int, asyncio.Future[None]]] = []
         self._events: deque[TransportEvent] = deque()
+        self._urgent = 0  # how many queued events, at the front, are loss reports
         self._readable = asyncio.Event()
         self._writable = asyncio.Event()
         self._failure: str | None = None  # the socket task died unexpectedly
@@ -576,6 +592,7 @@ class RealtimeSocketTransport:
                 return None
             if self._events:
                 event = self._events.popleft()
+                self._urgent = max(self._urgent - 1, 0)
                 self._writable.set()
                 return event
             if self._failure is not None:
@@ -638,12 +655,45 @@ class RealtimeSocketTransport:
 
     # --- events -------------------------------------------------------------------------
 
-    def _emit_now(self, event: TransportEvent) -> None:
-        """Queue past the bound: only a SocketEvent, at most one per lost socket."""
+    # The queue is `_events`: first a prefix of `_urgent` loss reports, in the order they
+    # happened, then ordinary events in arrival order. A loss report is never queued behind
+    # an event it makes stale (see "Ordering" in the module docstring).
+
+    def _report_socket_loss(self, event: SocketEvent) -> None:
+        """Discard everything queued (it all came from the lost socket, or is superseded
+        by this report) and make `event` the next and only event."""
         if self._closing:
             return
+        dropped = sum(1 for e in self._events if not isinstance(e, SocketEvent))
+        self._events.clear()
         self._events.append(event)
+        self._urgent = 1
         self._readable.set()
+        self._writable.set()
+        if dropped:
+            logger.warning("realtime socket lost: %d undelivered event(s) discarded", dropped)
+
+    def _report_channel_end(self, event: ChannelStatusEvent) -> None:
+        """Drop every queued event of `event.topic` and queue `event` ahead of all ordinary
+        events: at most one loss report per topic waits, behind earlier loss reports."""
+        if self._closing:
+            return
+        topic = event.topic
+        urgent = [e for e in itertools.islice(self._events, self._urgent) if _topic(e) != topic]
+        ordinary = list(itertools.islice(self._events, self._urgent, None))
+        kept = [e for e in ordinary if _topic(e) != topic]
+        dropped = sum(1 for e in ordinary if isinstance(e, BroadcastEvent) and _topic(e) == topic)
+        self._events = deque([*urgent, event, *kept])
+        self._urgent = len(urgent) + 1
+        self._readable.set()
+        self._writable.set()
+        if dropped:
+            logger.warning(
+                "realtime socket: %s %s; %d undelivered broadcast(s) discarded",
+                topic,
+                event.status,
+                dropped,
+            )
 
     async def _emit(self, event: TransportEvent) -> None:
         while len(self._events) >= self._policy.max_pending_events and not self._closing:
@@ -671,8 +721,7 @@ class RealtimeSocketTransport:
         except Exception as exc:  # noqa: BLE001 - a bug must not leave receive() waiting
             self._failure = type(exc).__name__
             logger.error("realtime socket task failed (%s)", self._failure)
-            self._events.append(SocketEvent(SocketState.ERROR))
-            self._readable.set()
+            self._report_socket_loss(SocketEvent(SocketState.ERROR))
         finally:
             self._resolve_appliers()
             await self._drop_connection()
@@ -882,7 +931,7 @@ class RealtimeSocketTransport:
         logger.warning(
             "realtime socket: %s %s (%s); joining again in %.1fs", channel.topic, status, why, delay
         )
-        await self._emit(ChannelStatusEvent(channel.topic, status))
+        self._report_channel_end(ChannelStatusEvent(channel.topic, status))
 
     def refused_joins(self) -> dict[str, int]:
         """Topics whose explicit join refusals in a row reached the escalation threshold.
@@ -1054,7 +1103,7 @@ class RealtimeSocketTransport:
         delay = self._reconnect_delay()
         self._reconnect_at = self._clock() + delay
         logger.warning("realtime socket lost (%s); reconnecting in %.1fs", lost.why, delay)
-        self._emit_now(SocketEvent(lost.state))
+        self._report_socket_loss(SocketEvent(lost.state))
         await self._discard_connection(conn, recv)
 
     async def _drop_connection(self) -> None:

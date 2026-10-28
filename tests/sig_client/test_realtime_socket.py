@@ -821,6 +821,78 @@ def test_loss_is_reported_before_cleanup_and_before_any_rejoin() -> None:
     run(scenario)
 
 
+def test_loss_reports_jump_the_backlog_of_a_held_consumer(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The queue rule (module docstring, "Ordering"), with nobody reading the queue."""
+
+    def queued(rig: Rig) -> list[Any]:
+        return list(rig.transport._events)
+
+    async def scenario(rig: Rig) -> None:
+        transport = rig.transport
+        await transport.connect(ENDPOINT, TOKEN)
+        await transport.subscribe(TOPIC)
+        await transport.subscribe(OTHER)
+        conn = rig.server.conn
+        conn.ack(TOPIC)
+        conn.ack(OTHER)
+        conn.broadcast(TOPIC, "market_batch", '{"n":1}')
+        conn.broadcast(OTHER, "market_batch", '{"n":2}')
+        conn.broadcast(TOPIC, "market_batch", '{"n":3}')
+        await settle()
+        other_subscribed = ChannelStatusEvent(OTHER, ChannelStatus.SUBSCRIBED)
+        other_broadcast = BroadcastEvent(OTHER, "market_batch", {"n": 2})
+        assert queued(rig) == [
+            SUBSCRIBED, other_subscribed,
+            BroadcastEvent(TOPIC, "market_batch", {"n": 1}), other_broadcast,
+            BroadcastEvent(TOPIC, "market_batch", {"n": 3}),
+        ]
+        # A channel end: its topic's backlog goes, its status goes first; others keep order.
+        ref = conn.joins(TOPIC)[-1]["ref"]
+        conn.channel_event(TOPIC, "phx_error", {}, ref, ref)
+        await settle()
+        topic_error = ChannelStatusEvent(TOPIC, ChannelStatus.CHANNEL_ERROR)
+        assert queued(rig) == [topic_error, other_subscribed, other_broadcast]
+        # A second end of the same topic replaces its report: one per topic at most.
+        await rig.clock.advance(1.0)
+        await rig.clock.advance(10.0)  # the rejoin times out
+        assert queued(rig) == [
+            ChannelStatusEvent(TOPIC, ChannelStatus.TIMED_OUT), other_subscribed, other_broadcast
+        ]
+        # A lost socket: everything queued goes; the SocketEvent is the only event.
+        conn.lose()
+        await settle()
+        assert queued(rig) == [SocketEvent(SocketState.ERROR)]
+        # On the next socket, a channel end queues behind the unread SocketEvent.
+        await rig.clock.advance(1.0)
+        fresh = rig.server.conn
+        fresh.ack(OTHER)
+        ref = fresh.ack(TOPIC)
+        fresh.broadcast(TOPIC, "market_batch", '{"n":4}')
+        await settle()
+        fresh.channel_event(TOPIC, "phx_close", {}, ref, ref)
+        await settle()
+        assert queued(rig) == [
+            SocketEvent(SocketState.ERROR),
+            ChannelStatusEvent(TOPIC, ChannelStatus.CLOSED),
+            other_subscribed,
+        ]
+        # Delivery follows the queue; the urgent prefix is consumed in order.
+        assert await transport.receive() == SocketEvent(SocketState.ERROR)
+        assert await transport.receive() == ChannelStatusEvent(TOPIC, ChannelStatus.CLOSED)
+        fresh.broadcast(OTHER, "market_batch", '{"n":5}')
+        await settle()
+        assert await transport.receive() == other_subscribed
+        assert await transport.receive() == BroadcastEvent(OTHER, "market_batch", {"n": 5})
+
+    with caplog.at_level(logging.DEBUG):
+        run(scenario)
+    assert "undelivered broadcast(s) discarded" in caplog.text
+    assert "undelivered event(s) discarded" in caplog.text
+    assert '"n"' not in caplog.text  # counts only, never frame content
+
+
 def test_close_is_bounded_even_when_cleanup_ignores_cancellation() -> None:
     async def main() -> None:
         rig = Rig(QUIET)

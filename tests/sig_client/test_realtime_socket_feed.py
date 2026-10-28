@@ -31,7 +31,16 @@ from realtime_kit import (
     token_body,
 )
 from sig_testkit import json_response
-from socket_kit import ENDPOINT, NEW_TOKEN_VALUE, TOKEN, TOPIC, FakeServer, own_tasks, settle
+from socket_kit import (
+    ENDPOINT,
+    NEW_TOKEN_VALUE,
+    TOKEN,
+    TOPIC,
+    FakeConnection,
+    FakeServer,
+    own_tasks,
+    settle,
+)
 from websockets.asyncio.server import ServerConnection, serve
 
 from engine.sig_client.realtime import (
@@ -207,6 +216,113 @@ def test_socket_loss_withdraws_readiness_while_cleanup_is_held(cleanup: str) -> 
         await h.clock.advance(2.0)
         await until(lambda: h.feed.is_ready(MARKET))
         conn.close_gate.set()  # lets an abandoned cleanup end before the task check
+
+    feed_run(scenario)
+
+
+def hold_consumer(rig: FeedRig) -> asyncio.Event:
+    """Gate the feed's next receive() calls (clear the event to hold the feed)."""
+    gate = asyncio.Event()
+    gate.set()
+    receive = rig.transport.receive
+
+    async def held() -> Any:
+        await gate.wait()
+        return await receive()
+
+    rig.transport.receive = held  # type: ignore[method-assign]
+    return gate
+
+
+async def ready_with_backlog(rig: FeedRig) -> tuple[FakeConnection, asyncio.Event]:
+    """A ready market (revision 1 accepted), then a held feed with batches 2 and 3 queued."""
+    h = rig.h
+    await rig.start()
+    conn = rig.server.conn
+    conn.ack()
+    await until(lambda: h.feed.is_ready(MARKET))
+    conn.broadcast(TOPIC, "market_batch", market_batch(1, 0, "0.55"))  # the fence
+    await until(lambda: h.feed.last_revision(MARKET) == 1)
+    gate = hold_consumer(rig)
+    gate.clear()
+    conn.broadcast(TOPIC, "noop", "{}")  # answers the receive() already in flight
+    await until(lambda: not rig.transport._events)
+    conn.broadcast(TOPIC, "market_batch", market_batch(2, 1, "0.57"))
+    conn.broadcast(TOPIC, "market_batch", market_batch(3, 2, "0.58"))
+    await until(lambda: len(rig.transport._events) == 2)
+    assert h.feed.is_ready(MARKET)  # nothing detected yet
+    return conn, gate
+
+
+@pytest.mark.parametrize("evidence", ["contiguous", "gap"])
+def test_socket_loss_jumps_a_backlog_for_a_delayed_consumer(evidence: str) -> None:
+    """Review of 54032ec: the loss must not wait behind the old socket's queued events."""
+
+    async def scenario(rig: FeedRig) -> None:
+        h = rig.h
+        conn, gate = await ready_with_backlog(rig)
+        conn.lose()
+        await until(lambda: list(rig.transport._events) == [SocketEvent(SocketState.ERROR)])
+        seen, observed = len(h.events), len(h.observed)
+        gate.set()  # the consumer resumes
+        await until(lambda: not h.feed.is_ready(MARKET))
+        assert h.events[seen] == MarketStale(MARKET, StaleReason.SOCKET_ERROR)  # first
+        # The old socket's batches were never applied or published.
+        assert h.feed.last_revision(MARKET) == 1
+        assert not any(isinstance(e, BookUpdated) for e in h.events[seen:])
+        assert all(not ready for _, ready in h.observed[observed:])
+        # The next join still needs its ack and a REST resync.
+        await h.clock.advance(1.0)
+        fresh = rig.server.conn
+        assert fresh is not conn and len(fresh.joins()) == 1
+        reads = h.count(ORDERBOOK)
+        await h.clock.advance(3.0)
+        assert h.count(ORDERBOOK) == reads and not h.feed.is_ready(MARKET)
+        fresh.ack()
+        await until(lambda: h.count(ORDERBOOK) == reads + 1)
+        assert not h.feed.is_ready(MARKET)  # the window (fence 1) still blocks
+        if evidence == "contiguous":
+            # Its own evidence: a clean batch past the fence on the new socket.
+            fresh.broadcast(TOPIC, "market_batch", market_batch(2, 1, "0.57"))
+            await h.clock.advance(2.0)
+            await until(lambda: h.feed.is_ready(MARKET))
+        else:
+            # The discarded revisions show up as a gap: blocked, not ready.
+            fresh.broadcast(TOPIC, "market_batch", market_batch(4, 3, "0.59"))
+            await h.clock.advance(2.0)
+            await until(lambda: StaleReason.REVISION_GAP in h.feed.blockers(MARKET))
+            await h.clock.advance(5.0)
+            assert not h.feed.is_ready(MARKET)
+
+    feed_run(scenario)
+
+
+def test_channel_end_jumps_its_topic_backlog_for_a_delayed_consumer() -> None:
+    async def scenario(rig: FeedRig) -> None:
+        h = rig.h
+        conn, gate = await ready_with_backlog(rig)
+        ref = conn.joins()[-1]["ref"]
+        conn.channel_event(TOPIC, "phx_error", {}, ref, ref)
+        await until(
+            lambda: list(rig.transport._events)
+            == [ChannelStatusEvent(TOPIC, ChannelStatus.CHANNEL_ERROR)]
+        )
+        seen = len(h.events)
+        gate.set()
+        await until(lambda: not h.feed.is_ready(MARKET))
+        assert h.events[seen] == MarketStale(MARKET, StaleReason.CHANNEL_ERROR)
+        assert h.feed.last_revision(MARKET) == 1
+        assert not any(isinstance(e, BookUpdated) for e in h.events[seen:])
+        reads = h.count(ORDERBOOK)
+        await h.clock.advance(1.0)  # rejoin backoff
+        assert len(conn.joins()) == 2 and h.count(ORDERBOOK) == reads
+        conn.ack()
+        await h.clock.advance(1.0)  # the feed's min_resync_interval_s since its last read
+        await until(lambda: h.count(ORDERBOOK) == reads + 1)
+        assert not h.feed.is_ready(MARKET)  # the channel break opened a window
+        conn.broadcast(TOPIC, "market_batch", market_batch(2, 1, "0.57"))
+        await h.clock.advance(2.0)
+        await until(lambda: h.feed.is_ready(MARKET))
 
     feed_run(scenario)
 
