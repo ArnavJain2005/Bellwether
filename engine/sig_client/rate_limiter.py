@@ -216,3 +216,12 @@ class RateLimiter:
     def used(self, kind: RequestKind) -> int:
         """Admissions of `kind` inside the current rolling window."""
         return self._budgets[kind].in_window(self._clock())
+
+    def limit(self, kind: RequestKind) -> int:
+        """The most `kind` admissions this limiter allows in any rolling window."""
+        return self._budgets[kind].limit
+
+    @property
+    def window(self) -> float:
+        """The rolling window, in seconds, shared by both budgets."""
+        return self._budgets[RequestKind.READ].window

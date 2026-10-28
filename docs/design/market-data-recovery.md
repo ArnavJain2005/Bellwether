@@ -454,8 +454,8 @@ compares a local wall-clock time with a SIG timestamp (`asOf.at`, `executedAt`,
 signature and return type (`frozenset[StaleReason]`). In M2-A it returns the reason of
 **every open and every quarantined instance**, so a quarantined settlement stays visible as
 `MARKET_SETTLED`. M2-A also adds new blocking reasons: `HISTORY_UNKNOWN` (4.2) and
-`LIFECYCLE_NOT_OPEN` (4.6); M2-B adds `REVISION_ANOMALY` (4.7). Callers are **not**
-unaffected:
+`LIFECYCLE_NOT_OPEN` (4.6); M2-B adds `REVISION_ANOMALY` (4.7) and `LIFECYCLE_UNKNOWN`
+(the lifecycle sweep, 5). Callers are **not** unaffected:
 
 - A feed started without retained history reports `{HISTORY_UNKNOWN}` and is never ready,
   where today it reports no blocker and becomes ready after its first orderbook read.
@@ -721,11 +721,36 @@ them.
 - **Shared rate budget.** All reads share the account limiter (80 of 100 reads a minute).
   [Code] The feed already gates orderbook resyncs at 40 starts a minute
   (`realtime.py:291`). Recovery reads get their own gate (*configurable*, like the resync
-  gate) so that they cannot starve account reconciliation or resyncs, and the shared
-  limiter still has no priorities. Note the scale: after a reconnect the existing resync
+  gate) to bound their logical starts. This cannot reserve reads for account reconciliation
+  or resyncs: retries and other same-account clients share a limiter with no priorities.
+  Note the scale: after a reconnect the existing resync
   alone needs one read per market (237 for every market). Where a lifecycle check covers
   many markets, it uses the market list [TMKTS] (three pages for 237 markets) rather than
   one market-detail read per market.
+- **Lifecycle sweep [Implemented in M2-B2, opt-in].** A feed runs the sweep only when given
+  a `SweepPolicy`. It has no defaults: the interval, the walk deadline, the page cap and
+  the HTTP-attempt budget are Arnav's, and no module in `engine/` creates one. One complete
+  `status=any` walk at a time, with a fixed delay between walks and SIG's `Retry-After` as
+  a floor. Only a complete walk is applied, and only to restrict:
+  - a row showing `settled` or `closed` quarantines the market (`LIFECYCLE_NOT_OPEN`);
+  - **absence** of a covered market from a complete walk opens `LIFECYCLE_UNKNOWN`
+    [client policy]. No documented rule says what absence means (Q16), so it is read as
+    neither open nor closed: the market is blocked, not quarantined, and nothing clears
+    it, including a later walk listing it `open` (D-7);
+  - a row showing `open` changes nothing. A listing never confirms a settlement, clears a
+    blocker, provides bootstrap evidence or publishes `MarketReady`.
+
+  **Budget.** The sweep's own gate (`attempts_per_window`) admits every market-list HTTP
+  attempt, including retries, before the shared limiter. A walk whose next attempt cannot
+  fit the gate and walk deadline fails without applying partial results. The feed rejects
+  policies whose sweep-attempt cap plus the resync and recovery gates' maximum *logical*
+  starts reach the shared read limit. The calculation handles shared windows shorter than
+  the other gates' windows by counting their full bursts. With the default 60-second
+  window and gates of 40 and 10 starts, at most 29 sweep attempts are allowed per window.
+  This caps sweep traffic under retries, but **does not reserve** reads: resync and
+  recovery reads may retry, and other same-account clients may consume the shared budget.
+  It therefore does not guarantee prompt recovery or account reads. The allocation is
+  Arnav's, and no operational value is chosen here.
 - **Retry scheduling.** One attempt per market at a time; triggers during an attempt
   coalesce into one follow-up, which starts after the current attempt ends (as for
   resyncs). Failed attempts back off exponentially with jitter and a floor from any
@@ -935,6 +960,10 @@ an answer from SIG.
 | AT-24 | Tape walk complete over a past window, then a later read returns an extra row (late projection) | First walk never cleared anything | later (Q3, Q4) |
 | AT-25 | `NULL_TRADE_SEQUENCE` with any combination of tape and price reads | Never cleared while Q3 to Q6 and Q11 are open | A |
 | AT-26 | Periodic lifecycle sweep finds a market `closed` | Quarantined `LIFECYCLE_NOT_OPEN`; result `QUARANTINED` | later (M2-B) |
+| AT-40 | A complete sweep walk omits a covered market that was ready; later walks list it `open` | `LIFECYCLE_UNKNOWN` opens (not quarantined); readiness withdrawn; never cleared, no `MarketReady`; a partial walk that omits it changes nothing | M2-B2 |
+| AT-41 | Sweep with a short interval and many pages, while a recovery read is wanted | At most `attempts_per_window` sweep HTTP attempts per shared window; with no other consumers, recovery starts without sweep-induced saturation; a policy whose nominal gate limits reach the shared cap is refused | M2-B2 |
+| AT-42 | Market-list pages succeed after retryable 503 responses, with recovery wanted during the walk | Every retry spends a sweep token before the shared limiter; the sweep alone cannot exhaust the shared read window; if the next attempt cannot fit its deadline, no partial list is applied | M2-B2 |
+| AT-43 | Shared limiter window is shorter than the resync and recovery gates' windows | Constructor counts the full bursts those gates can make inside the shorter window and refuses an excessive sweep policy | M2-B2 |
 | AT-27 | Recovery gate saturated | Attempts wait for the gate; resync gate and shared limiter behaviour unchanged | A |
 | AT-28 | Escalation after the configured number of failures | `escalated` true; still not ready; retries continue at the capped interval | A |
 | AT-29 | Blocker open; process restart with a persisted ledger | Origin `loaded`; instance still open; downtime window with the persisted fence | later (M2-C, D-4) |
@@ -998,7 +1027,8 @@ would spend budget for nothing.
 ### 9.3 Later slices (not proposed for implementation yet)
 
 - **M2-B:** duplicate-batch detectors (4.7) and a periodic lifecycle sweep with the market
-  list [TMKTS] (*configurable* interval).
+  list [TMKTS] (*configurable* interval). [Implemented: M2-B1 and M2-B2; the sweep is
+  opt-in and unconfigured (section 5).]
 - **M2-C:** a durable ledger (origin `loaded`) with blocker instances, windows, fences and
   the last accepted revision per topic (D-4). Needs a storage decision; SQLite storage is
   not started.
@@ -1047,6 +1077,9 @@ evidence, the affected blocker stays open.
 - **Q14 (redelivery).** After a client reconnects, are batches it missed ever re-sent?
 - **Q15 (clocks).** Do `asOf.at` (engine clock) and `createdAt`, `executedAt`, `settledOn`
   come from the same clock?
+- **Q16 (listing membership).** Can a market of the tournament be absent from a complete
+  `GET /tournaments/{slug}/markets?status=any` walk? If so, what does absence mean
+  (removed from the tournament, hidden, a listing fault), and how is a client told?
 
 ## 11. Decisions for Arnav
 
@@ -1084,6 +1117,11 @@ none. Until each is decided, M2-A keeps the behaviour that relaxes nothing (9.2)
   bootstrap, should the same standard (a lifecycle read showing `open`, made after the
   window) also settle the *settlement* part of a lost window? The trade part would still
   need D-2 or Q3 to Q8. This would make lost-window blockers clearable with residual risk.
+- **D-7 (absence from the market list).** M2-B2 blocks a market absent from a complete
+  sweep walk with `LIFECYCLE_UNKNOWN`, which nothing clears (fail-closed, chosen for the
+  M2-B2 review repair). Should anything ever clear it, for example a later walk or a
+  market-detail read showing `open`, given that neither is versioned (Q1, Q16)? Until
+  decided, it stays open for the life of the ledger.
 
 ## 12. References
 
