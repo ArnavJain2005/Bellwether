@@ -241,6 +241,42 @@ def test_timeout_then_success_uses_same_key(tmp_path):
     assert not rig.paused
 
 
+def test_timeout_then_400_on_retry_is_unknown(tmp_path):
+    rig = make_rig(tmp_path, [httpx.ReadTimeout("t"), error(400, "VALIDATION_ERROR")])
+    record = place(rig)
+    assert (record.status, record.http_status) == ("unknown", 400)
+    assert rig.paused
+    assert_identical_retries(rig, 2)  # no further requests
+    assert rig.sig.steps == []
+    events = rig.events("order_unknown")
+    assert len(events) == 1 and events[0]["level"] == "error"
+    assert "retry refused" in events[0]["message"]
+    assert "earlier attempt may have been placed" in events[0]["message"]
+    assert not rig.events("order_rejected")
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        error(503, "SERVICE_UNAVAILABLE"),
+        error(502, "ORDER_STATUS_UNKNOWN"),
+        error(409, "REQUEST_IN_FLIGHT"),
+        error(429, "RATE_LIMITED", {"Retry-After": "1"}),
+    ],
+)
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [(400, "VALIDATION_ERROR"), (401, "INVALID_API_KEY"), (403, "FORBIDDEN"), (404, "NOT_FOUND")],
+)
+def test_any_refusal_on_a_retry_is_unknown(tmp_path, first, status, code):
+    rig = make_rig(tmp_path, [first, error(status, code)])
+    record = place(rig)
+    assert record.status == "unknown"
+    assert rig.paused
+    assert_identical_retries(rig, 2)
+    assert not rig.events("order_rejected")
+
+
 def test_no_response_retries_three_times_then_unknown(tmp_path):
     rig = make_rig(tmp_path, [httpx.ReadTimeout("t")] * 4)
     record = place(rig)
