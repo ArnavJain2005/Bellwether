@@ -207,13 +207,4 @@ figures are claimed here.
 
 Built by **Arnav Jain** for the SIG Predictions Cup 2026.
 
-Development was AI-assisted under written rules
-([`CLAUDE.md`](CLAUDE.md), [`AGENTS.md`](AGENTS.md)):
-- Claude Code wrote the engine and the bot;
-- Antigravity wrote the dashboard and data pipelines;
-- every pull request was reviewed and merged by hand, and the project rules require a
-  second-model review of order and risk code.
-
-LinkedIn: _[add link]_ · Email: _[add address]_
-
 <sub>Audited against `main` at `c9d22ca` (PR #56), Nov 2, 2026. SUSQies are simulated competition funds; no real money is traded.</sub>
