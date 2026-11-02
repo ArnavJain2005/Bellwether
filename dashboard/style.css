@@ -333,19 +333,19 @@ div[data-testid="stTabs"] div[data-baseweb="tab-panel"] {
 }
 
 .bw-panel-row1 {
-    height: 362px;
+    height: 344px;
 }
 
 .bw-panel-row2 {
-    height: 382px;
+    height: 364px;
 }
 
 .bw-panel-tab2-top {
-    height: 358px;
+    height: 340px;
 }
 
 .bw-panel-tab2-bottom {
-    height: 386px;
+    height: 368px;
 }
 
 .bw-panel-header {
@@ -570,4 +570,122 @@ table.bw-table tbody tr.bw-row-error td {
 
 .bw-single-snap-banner strong {
     color: var(--bw-text);
+}
+
+/* DASH-EW-3: STOP BOT Button, Confirmation Step & Result Banners */
+div.stButton > button {
+    font-family: var(--bw-font-mono) !important;
+    font-size: 0.74rem !important;
+    font-weight: 800 !important;
+    letter-spacing: 0.06em !important;
+    min-height: 34px !important;
+    height: 36px !important;
+    padding: 0.18rem 0.65rem !important;
+    border-radius: 4px !important;
+}
+
+div.stButton > button[kind="primary"] {
+    background: rgba(255, 77, 94, 0.22) !important;
+    border: 1px solid var(--bw-down) !important;
+    color: #FFD7CE !important;
+}
+
+div.stButton > button[kind="primary"]:hover:not(:disabled) {
+    background: rgba(255, 77, 94, 0.36) !important;
+    border-color: #FF7A85 !important;
+    color: #FFFFFF !important;
+}
+
+div.stButton > button:disabled {
+    background: #141820 !important;
+    border: 1px solid var(--bw-border-strong) !important;
+    color: var(--bw-text-muted) !important;
+    opacity: 0.85 !important;
+}
+
+.bw-stop-confirm-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.65rem;
+    background: rgba(255, 176, 0, 0.14);
+    border: 1px solid var(--bw-amber);
+    border-left: 4px solid var(--bw-amber);
+    border-radius: 4px;
+    padding: 0.36rem 0.75rem;
+    min-height: 36px;
+    box-sizing: border-box;
+    font-size: 0.74rem;
+    color: var(--bw-text);
+}
+
+.bw-stop-confirm-badge {
+    background: rgba(255, 176, 0, 0.24);
+    border: 1px solid var(--bw-amber);
+    color: var(--bw-amber);
+    font-size: 0.68rem;
+    font-weight: 800;
+    letter-spacing: 0.06em;
+    padding: 0.08rem 0.45rem;
+    border-radius: 3px;
+    white-space: nowrap;
+}
+
+.bw-stop-confirm-msg {
+    font-weight: 700;
+    color: var(--bw-text);
+    flex: 1 1 auto;
+}
+
+.bw-stop-confirm-msg code {
+    color: var(--bw-amber);
+    background: #11151B;
+    padding: 0.05rem 0.32rem;
+    border-radius: 3px;
+}
+
+.bw-stop-confirm-note {
+    font-size: 0.66rem;
+    font-weight: 700;
+    color: var(--bw-amber);
+    white-space: nowrap;
+}
+
+.bw-stop-result-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    border-radius: 4px;
+    padding: 0.32rem 0.78rem;
+    margin-bottom: 0.24rem;
+    font-size: 0.70rem;
+}
+
+.bw-stop-result-banner code {
+    background: rgba(10, 12, 15, 0.65);
+    padding: 0.04rem 0.30rem;
+    border-radius: 3px;
+    color: var(--bw-text);
+}
+
+.bw-stop-result-ok {
+    background: rgba(255, 176, 0, 0.14);
+    border: 1px solid var(--bw-amber);
+    border-left: 4px solid var(--bw-amber);
+    color: var(--bw-amber);
+}
+
+.bw-stop-result-warn {
+    background: rgba(255, 176, 0, 0.12);
+    border: 1px solid var(--bw-amber);
+    border-left: 4px solid var(--bw-amber);
+    color: var(--bw-amber);
+}
+
+.bw-stop-result-err {
+    background: rgba(255, 77, 94, 0.16);
+    border: 1px solid var(--bw-down);
+    border-left: 4px solid var(--bw-down);
+    color: #FFD7CE;
 }

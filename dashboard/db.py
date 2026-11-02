@@ -1,9 +1,10 @@
-"""Read-only SQLite data layer for the Bellwether election-week monitor.
+"""Read-only SQLite data layer and single STOP file writer for the Bellwether monitor.
 
 Follows ``bot/CONTRACT.md`` and ``AGENTS.md``:
 - Opens ``bot/state/bellwether.db`` strictly in read-only URI mode (``mode=ro``).
 - Uses the exact table and column names from ``bot/CONTRACT.md``.
-- Never creates, modifies, or deletes database or state files.
+- Writes nothing except ``bot/state/STOP`` via ``write_stop_file`` (Task DASH-EW-3),
+  using atomic exclusive file creation (`mode="x"`) that never overwrites or deletes.
 - Never imports ``engine/`` or ``bot/``, never reads ``.env``, and makes no network calls.
 - Returns explicit ``no data`` / ``bad format`` states when the file, a table, a column,
   rows, or JSON payloads are missing or malformed.
@@ -11,16 +12,22 @@ Follows ``bot/CONTRACT.md`` and ``AGENTS.md``:
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
 import sqlite3
+import stat
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
+
+# Exact STOP control filename and contract path from `bot/CONTRACT.md`.
+STOP_FILENAME: str = "STOP"
+STOP_CONTRACT_PATH: str = "bot/state/STOP"
 
 # Heartbeat STALE threshold in seconds (single source of truth).
 # Source: Task DASH-EW-1 specification ("ALIVE (age < a threshold from CONTRACT.md
@@ -348,6 +355,20 @@ class FilterCriteria:
 
 
 @dataclass(frozen=True)
+class StopWriteResult:
+    """Result of the single permitted dashboard write (`bot/state/STOP`)."""
+
+    ok: bool
+    already_existed: bool
+    stop_path: Path
+    ts_utc: str
+    ts_ist: str
+    content: str
+    error_kind: str  # "" | "already_exists" | "folder_missing" | "permission_denied" | "os_error" | "verification_failed"
+    message: str
+
+
+@dataclass(frozen=True)
 class MonitorSnapshot:
     """Complete read-only snapshot of all tables and derived dashboard states."""
 
@@ -411,6 +432,141 @@ def resolve_paths(
     return resolved_db, resolved_state
 
 
+def resolve_stop_path(state_dir: str | Path | None = None) -> Path:
+    """Return the resolved path to ``bot/state/STOP`` (or ``<state_dir>/STOP`` in tests)."""
+    _, resolved_state = resolve_paths(state_dir=state_dir)
+    return resolved_state / STOP_FILENAME
+
+
+def write_stop_file(
+    state_dir: str | Path | None = None,
+    now_utc: datetime | None = None,
+) -> StopWriteResult:
+    """Atomically create ``bot/state/STOP`` (the only file write allowed in ``dashboard/``).
+
+    - Uses ``STOP_FILENAME`` (``bot/state/STOP`` per ``bot/CONTRACT.md``).
+    - Writes ``"<UTC ISO-8601 timestamp> dashboard\\n"``.
+    - Uses exclusive creation (``mode="x"``) so an existing ``STOP`` file is never
+      overwritten, truncated, or deleted.
+    - Never creates parent directories; fails clearly if the folder is missing or
+      read-only.
+    - Verifies ``stop_path.is_file()`` after writing before claiming success.
+    """
+    stop_path = resolve_stop_path(state_dir=state_dir)
+    parent_dir = stop_path.parent
+    current_utc = now_utc.astimezone(UTC) if now_utc else datetime.now(UTC)
+    ts_utc = current_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    ts_ist = format_ist_timestamp(ts_utc)
+    payload = f"{ts_utc} dashboard\n"
+
+    if not parent_dir.exists() or not parent_dir.is_dir():
+        return StopWriteResult(
+            ok=False,
+            already_existed=False,
+            stop_path=stop_path,
+            ts_utc=ts_utc,
+            ts_ist=ts_ist,
+            content="",
+            error_kind="folder_missing",
+            message=f"STOP WRITE FAILED (folder missing): State directory does not exist ({parent_dir})",
+        )
+
+    if stop_path.exists():
+        return StopWriteResult(
+            ok=False,
+            already_existed=True,
+            stop_path=stop_path,
+            ts_utc=ts_utc,
+            ts_ist=ts_ist,
+            content="",
+            error_kind="already_exists",
+            message=f"STOP ALREADY PRESENT: {stop_path} already exists; no second write performed.",
+        )
+
+    try:
+        dir_mode = parent_dir.stat().st_mode
+        if not (dir_mode & stat.S_IWUSR) or not os.access(parent_dir, os.W_OK):
+            raise PermissionError(
+                errno.EACCES,
+                "Permission denied: state directory is read-only",
+                str(parent_dir),
+            )
+
+        with stop_path.open("x", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+    except FileExistsError:
+        return StopWriteResult(
+            ok=False,
+            already_existed=True,
+            stop_path=stop_path,
+            ts_utc=ts_utc,
+            ts_ist=ts_ist,
+            content="",
+            error_kind="already_exists",
+            message=f"STOP ALREADY PRESENT: {stop_path} already exists; no second write performed.",
+        )
+    except FileNotFoundError as exc:
+        return StopWriteResult(
+            ok=False,
+            already_existed=False,
+            stop_path=stop_path,
+            ts_utc=ts_utc,
+            ts_ist=ts_ist,
+            content="",
+            error_kind="folder_missing",
+            message=f"STOP WRITE FAILED (folder missing): {exc}",
+        )
+    except PermissionError as exc:
+        return StopWriteResult(
+            ok=False,
+            already_existed=False,
+            stop_path=stop_path,
+            ts_utc=ts_utc,
+            ts_ist=ts_ist,
+            content="",
+            error_kind="permission_denied",
+            message=f"STOP WRITE FAILED (permission denied): {exc}",
+        )
+    except OSError as exc:
+        is_perm = exc.errno in {errno.EACCES, errno.EPERM, errno.EROFS}
+        kind = "permission_denied" if is_perm else "os_error"
+        label = "permission denied" if is_perm else type(exc).__name__
+        return StopWriteResult(
+            ok=False,
+            already_existed=False,
+            stop_path=stop_path,
+            ts_utc=ts_utc,
+            ts_ist=ts_ist,
+            content="",
+            error_kind=kind,
+            message=f"STOP WRITE FAILED ({label}): {exc}",
+        )
+
+    if not stop_path.is_file():
+        return StopWriteResult(
+            ok=False,
+            already_existed=False,
+            stop_path=stop_path,
+            ts_utc=ts_utc,
+            ts_ist=ts_ist,
+            content="",
+            error_kind="verification_failed",
+            message=f"STOP WRITE FAILED (verification failed): {stop_path} does not exist after write.",
+        )
+
+    return StopWriteResult(
+        ok=True,
+        already_existed=False,
+        stop_path=stop_path,
+        ts_utc=ts_utc,
+        ts_ist=ts_ist,
+        content=payload.strip(),
+        error_kind="",
+        message=f"STOP CREATED: {stop_path} at {ts_ist}",
+    )
+
+
 def build_readonly_uri(db_path: Path) -> str:
     """Construct a strict SQLite ``mode=ro`` URI for a local filesystem path."""
     posix_path = db_path.resolve().as_posix()
@@ -460,7 +616,7 @@ def parse_utc_timestamp(value: Any) -> datetime | None:
     except ValueError:
         return None
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=UTC)
+        return datetime.combine(dt.date(), dt.time(), tzinfo=UTC)
     return dt.astimezone(UTC)
 
 

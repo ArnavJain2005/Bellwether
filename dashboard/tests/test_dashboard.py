@@ -1,10 +1,13 @@
-"""Unit and Streamlit AppTest suite for Tasks DASH-EW-1 and DASH-EW-2 (`dashboard/`)."""
+"""Unit and Streamlit AppTest suite for Tasks DASH-EW-1, DASH-EW-2, and DASH-EW-3 (`dashboard/`)."""
 
 from __future__ import annotations
 
+import ast
 import json
+import os
 import sqlite3
-from datetime import UTC, datetime
+import stat
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -22,17 +25,21 @@ from dashboard.app import (
     render_positions_panel_html,
     render_quotes_panel_html,
     render_race_pnl_panel_html,
+    render_stop_confirmation_html,
+    render_stop_result_banner_html,
 )
 from dashboard.db import (
     CONTRACT_SCHEMA,
     HEARTBEAT_STALE_SECONDS,
     SQLITE_BUSY_TIMEOUT_MS,
+    STOP_FILENAME,
     FilterCriteria,
     connect_readonly,
     default_repo_root,
     load_monitor_snapshot,
     parse_pnl_json,
     parse_positions_json,
+    write_stop_file,
 )
 from dashboard.sample_db import create_sample_state
 
@@ -402,3 +409,323 @@ def test_readonly_busy_timeout_and_db_busy_banner(
 def test_heartbeat_stale_threshold_constant() -> None:
     """HEARTBEAT_STALE_SECONDS is the single constant (30.0s) governing heartbeat staleness."""
     assert HEARTBEAT_STALE_SECONDS == 30.0
+
+
+def test_stop_button_confirm_then_write_creates_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DASH-EW-3: Clicking STOP BOT opens confirmation (no write), survives refresh, and Confirm creates STOP."""
+    state_dir = tmp_path / "stop_confirm_flow"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    db_path = create_sample_state(mode="normal", target_dir=state_dir, now_utc=FIXED_NOW)
+    stop_path = state_dir / STOP_FILENAME
+    assert not stop_path.exists()
+
+    monkeypatch.setenv("BELLWETHER_DB_PATH", str(db_path))
+    monkeypatch.setenv("BELLWETHER_STATE_DIR", str(state_dir))
+
+    app_file = default_repo_root() / "dashboard" / "app.py"
+    at = AppTest.from_file(str(app_file), default_timeout=15)
+    at.run()
+    assert not at.exception
+
+    stop_btn = at.button(key="stop_bot_btn")
+    assert stop_btn.label == "STOP BOT"
+    assert stop_btn.disabled is False
+    assert not stop_path.exists()
+
+    # Step 1: Click STOP BOT -> opens confirmation, pauses refresh, writes nothing
+    stop_btn.click().run()
+    assert not at.exception
+    assert not stop_path.exists(), "Clicking STOP BOT must not create STOP before Confirm"
+    assert at.session_state["confirm_open"] is True
+    md_open = "\n".join(m.value for m in at.markdown)
+    assert "This creates" in md_open and "bot/state/STOP" in md_open and "halts trading. Confirm?" in md_open
+    assert "REFRESH: PAUSED (CONFIRM OPEN)" in md_open
+
+    # Step 2: Survival across refresh without premature write
+    at.run()
+    assert not at.exception
+    assert at.session_state["confirm_open"] is True
+    assert not stop_path.exists()
+
+    # Step 3: Click Confirm -> atomically creates STOP with UTC timestamp + "dashboard"
+    at.button(key="confirm_stop_btn").click().run()
+    assert not at.exception
+    assert at.session_state["confirm_open"] is False
+    assert stop_path.is_file(), "Confirm must create bot/state/STOP in the target state directory"
+
+    file_content = stop_path.read_text(encoding="utf-8")
+    assert file_content.endswith("Z dashboard\n")
+
+    md_after = "\n".join(m.value for m in at.markdown)
+    assert "STOP FILE PRESENT" in md_after
+    assert str(stop_path) in md_after
+    assert "IST" in md_after
+
+    stop_btn_after = at.button(key="stop_bot_btn")
+    assert stop_btn_after.label == "STOP ACTIVE"
+    assert stop_btn_after.disabled is True
+
+    # Step 4: Subsequent refresh does not double-submit or overwrite STOP
+    mtime_first = stop_path.stat().st_mtime_ns
+    content_first = stop_path.read_text(encoding="utf-8")
+    at.run()
+    assert not at.exception
+    assert stop_path.read_text(encoding="utf-8") == content_first
+    assert stop_path.stat().st_mtime_ns == mtime_first
+
+
+def test_stop_button_cancel_writes_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DASH-EW-3: Clicking STOP BOT then Cancel closes confirmation and writes nothing."""
+    state_dir = tmp_path / "stop_cancel_flow"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    db_path = create_sample_state(mode="normal", target_dir=state_dir, now_utc=FIXED_NOW)
+    stop_path = state_dir / STOP_FILENAME
+
+    monkeypatch.setenv("BELLWETHER_DB_PATH", str(db_path))
+    monkeypatch.setenv("BELLWETHER_STATE_DIR", str(state_dir))
+
+    app_file = default_repo_root() / "dashboard" / "app.py"
+    at = AppTest.from_file(str(app_file), default_timeout=15)
+    at.run()
+    assert not at.exception
+
+    at.button(key="stop_bot_btn").click().run()
+    assert at.session_state["confirm_open"] is True
+    assert not stop_path.exists()
+
+    at.button(key="cancel_stop_btn").click().run()
+    assert not at.exception
+    assert at.session_state["confirm_open"] is False
+    assert not stop_path.exists(), "Cancel must never create bot/state/STOP"
+    assert at.button(key="stop_bot_btn").label == "STOP BOT"
+    assert at.button(key="stop_bot_btn").disabled is False
+
+
+def test_stop_already_present_means_no_second_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DASH-EW-3: If STOP already exists, write_stop_file and UI never write a second time."""
+    state_dir = tmp_path / "stop_existing"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    db_path = create_sample_state(mode="normal", target_dir=state_dir, now_utc=FIXED_NOW)
+    stop_path = state_dir / STOP_FILENAME
+
+    # First write creates STOP
+    res1 = write_stop_file(state_dir=state_dir, now_utc=FIXED_NOW)
+    assert res1.ok is True
+    assert res1.already_existed is False
+    assert stop_path.is_file()
+    original_content = stop_path.read_text(encoding="utf-8")
+    assert original_content == "2026-11-03T14:30:00Z dashboard\n"
+
+    # Second write attempt must not overwrite or touch existing STOP
+    later_now = FIXED_NOW + timedelta(minutes=5)
+    res2 = write_stop_file(state_dir=state_dir, now_utc=later_now)
+    assert res2.ok is False
+    assert res2.already_existed is True
+    assert res2.error_kind == "already_exists"
+    assert "STOP ALREADY PRESENT" in res2.message
+    assert stop_path.read_text(encoding="utf-8") == original_content
+
+    # Also verify UI shows disabled STOP ACTIVE when STOP already exists
+    monkeypatch.setenv("BELLWETHER_DB_PATH", str(db_path))
+    monkeypatch.setenv("BELLWETHER_STATE_DIR", str(state_dir))
+    app_file = default_repo_root() / "dashboard" / "app.py"
+    at = AppTest.from_file(str(app_file), default_timeout=15)
+    at.run()
+    assert not at.exception
+    assert at.button(key="stop_bot_btn").label == "STOP ACTIVE"
+    assert at.button(key="stop_bot_btn").disabled is True
+    assert "STOP FILE PRESENT" in "\n".join(m.value for m in at.markdown)
+
+
+def test_stop_readonly_folder_shows_failure_and_no_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DASH-EW-3: Read-only folder fails cleanly with exact error and never claims success."""
+    ro_dir = tmp_path / "readonly_state"
+    ro_dir.mkdir(parents=True, exist_ok=True)
+    db_path = create_sample_state(mode="normal", target_dir=ro_dir, now_utc=FIXED_NOW)
+    stop_path = ro_dir / STOP_FILENAME
+
+    os.chmod(ro_dir, stat.S_IREAD)
+    try:
+        res = write_stop_file(state_dir=ro_dir, now_utc=FIXED_NOW)
+        assert res.ok is False
+        assert res.already_existed is False
+        assert res.error_kind == "permission_denied"
+        assert "STOP WRITE FAILED" in res.message
+        assert "permission denied" in res.message.lower()
+        assert not stop_path.exists()
+
+        banner_html = render_stop_result_banner_html(res)
+        assert "STOP WRITE FAILED" in banner_html
+        assert "STOP CREATED" not in banner_html
+        assert "STOP FILE PRESENT" not in banner_html
+
+        # Also test full AppTest flow against read-only folder
+        monkeypatch.setenv("BELLWETHER_DB_PATH", str(db_path))
+        monkeypatch.setenv("BELLWETHER_STATE_DIR", str(ro_dir))
+        app_file = default_repo_root() / "dashboard" / "app.py"
+        at = AppTest.from_file(str(app_file), default_timeout=15)
+        at.run()
+        at.button(key="stop_bot_btn").click().run()
+        at.button(key="confirm_stop_btn").click().run()
+        assert not at.exception
+        assert not stop_path.exists()
+        md_err = "\n".join(m.value for m in at.markdown)
+        assert "STOP WRITE FAILED (permission denied)" in md_err
+        assert "STOP CREATED" not in md_err
+    finally:
+        os.chmod(ro_dir, stat.S_IWRITE | stat.S_IREAD)
+
+
+def test_stop_missing_folder_shows_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DASH-EW-3: Missing state folder fails cleanly without creating directories or claiming success."""
+    missing_dir = tmp_path / "nonexistent_state_folder"
+    stop_path = missing_dir / STOP_FILENAME
+    assert not missing_dir.exists()
+
+    res = write_stop_file(state_dir=missing_dir, now_utc=FIXED_NOW)
+    assert res.ok is False
+    assert res.already_existed is False
+    assert res.error_kind == "folder_missing"
+    assert "STOP WRITE FAILED (folder missing)" in res.message
+    assert not missing_dir.exists()
+    assert not stop_path.exists()
+
+    # Also test AppTest flow when state folder is missing
+    monkeypatch.setenv("BELLWETHER_DB_PATH", str(missing_dir / "bellwether.db"))
+    monkeypatch.setenv("BELLWETHER_STATE_DIR", str(missing_dir))
+    app_file = default_repo_root() / "dashboard" / "app.py"
+    at = AppTest.from_file(str(app_file), default_timeout=15)
+    at.run()
+    at.button(key="stop_bot_btn").click().run()
+    at.button(key="confirm_stop_btn").click().run()
+    assert not at.exception
+    assert not missing_dir.exists()
+    md_err = "\n".join(m.value for m in at.markdown)
+    assert "STOP WRITE FAILED (folder missing)" in md_err
+    assert "STOP CREATED" not in md_err
+
+
+def _scan_source_for_forbidden_io(
+    source_code: str,
+    rel_file: str,
+    allowed_writer: tuple[str, str] = ("dashboard/db.py", "write_stop_file"),
+) -> list[str]:
+    """Return any forbidden write, open-in-write-mode, or delete calls found in ``source_code``."""
+    tree = ast.parse(source_code, filename=rel_file)
+    violations: list[str] = []
+
+    write_method_names = {"write", "writelines", "write_text", "write_bytes", "mkdir", "makedirs"}
+    delete_method_names = {
+        "unlink",
+        "rmdir",
+        "remove",
+        "removedirs",
+        "rmtree",
+        "move",
+        "rename",
+        "replace",
+    }
+
+    def _visit(node: ast.AST, current_func: str | None) -> None:
+        next_func = current_func
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            next_func = node.name
+
+        if isinstance(node, ast.Call):
+            is_allowed_writer = (rel_file, current_func or "") == allowed_writer
+            func_name = ""
+            is_method = False
+            if isinstance(node.func, ast.Name):
+                func_name = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                func_name = node.func.attr
+                is_method = True
+
+            # 1. Delete / remove / rename calls are forbidden EVERYWHERE in dashboard/ (even in write_stop_file)
+            if func_name in delete_method_names:
+                violations.append(
+                    f"{rel_file}:{node.lineno} ({current_func}): forbidden delete/modify call '{func_name}'"
+                )
+
+            # 2. Write calls outside the single STOP writer function
+            if func_name in write_method_names and not is_allowed_writer:
+                violations.append(
+                    f"{rel_file}:{node.lineno} ({current_func}): forbidden write call '{func_name}' outside {allowed_writer}"
+                )
+
+            # 3. Any open() or .open() call
+            if func_name == "open":
+                mode_arg: str | None = None
+                if not is_method and len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+                    mode_arg = str(node.args[1].value)
+                elif is_method and len(node.args) >= 1 and isinstance(node.args[0], ast.Constant):
+                    mode_arg = str(node.args[0].value)
+                for kw in node.keywords:
+                    if kw.arg == "mode" and isinstance(kw.value, ast.Constant):
+                        mode_arg = str(kw.value.value)
+
+                if not is_allowed_writer:
+                    if mode_arg is None or any(ch in mode_arg for ch in ("w", "a", "x", "+")):
+                        violations.append(
+                            f"{rel_file}:{node.lineno} ({current_func}): forbidden open(mode={mode_arg!r}) outside {allowed_writer}"
+                        )
+                else:
+                    # Inside write_stop_file: only atomic exclusive creation ("x") is allowed, never overwrite ("w", "a", "+")
+                    if mode_arg != "x":
+                        violations.append(
+                            f"{rel_file}:{node.lineno} ({current_func}): STOP writer must use atomic mode='x', found {mode_arg!r}"
+                        )
+
+        for child in ast.iter_child_nodes(node):
+            _visit(child, next_func)
+
+    _visit(tree, None)
+    return violations
+
+
+def test_static_no_other_writes_or_deletes_in_dashboard() -> None:
+    """DASH-EW-3: Fail if any write call, open in write mode, or delete call appears in dashboard/ outside write_stop_file."""
+    dashboard_dir = default_repo_root() / "dashboard"
+    py_files = sorted(
+        p for p in dashboard_dir.rglob("*.py") if "tests" not in p.parts
+    )
+    assert len(py_files) >= 3
+
+    all_violations: list[str] = []
+    for path in py_files:
+        rel_path = path.relative_to(default_repo_root()).as_posix()
+        source = path.read_text(encoding="utf-8")
+        all_violations.extend(_scan_source_for_forbidden_io(source, rel_path))
+
+    assert all_violations == [], f"Forbidden I/O calls found in dashboard/: {all_violations}"
+
+    # Self-verify that the static scanner catches write, open-in-write-mode, and delete calls
+    assert _scan_source_for_forbidden_io("def f(p):\n    p.write_text('x')\n", "dashboard/app.py")
+    assert _scan_source_for_forbidden_io("def f(p):\n    open(p, 'w')\n", "dashboard/app.py")
+    assert _scan_source_for_forbidden_io("def f(p):\n    p.unlink()\n", "dashboard/db.py")
+    assert _scan_source_for_forbidden_io(
+        "def write_stop_file(p):\n    p.unlink()\n", "dashboard/db.py"
+    )
+    assert _scan_source_for_forbidden_io(
+        "def write_stop_file(p):\n    p.open('w')\n", "dashboard/db.py"
+    )
+    assert not _scan_source_for_forbidden_io(
+        "def write_stop_file(p):\n    with p.open('x') as fh:\n        fh.write('ok')\n",
+        "dashboard/db.py",
+    )
+    assert render_stop_confirmation_html()
