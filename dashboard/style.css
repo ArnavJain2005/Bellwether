@@ -77,6 +77,27 @@ div[data-testid="stVerticalBlock"] > div {
     background: linear-gradient(90deg, rgba(148, 163, 184, 0.08) 0%, #0C0E11 38%);
 }
 
+.bw-hb-banner.bw-hb-db-busy {
+    border-left-color: var(--bw-amber);
+    background: linear-gradient(90deg, rgba(255, 176, 0, 0.14) 0%, #0C0E11 45%);
+}
+
+.bw-db-busy-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: rgba(255, 176, 0, 0.14);
+    border: 1px solid var(--bw-amber);
+    border-left: 4px solid var(--bw-amber);
+    border-radius: 4px;
+    padding: 0.36rem 0.85rem;
+    margin-bottom: 0.35rem;
+    color: var(--bw-amber);
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+}
+
 .bw-hb-left {
     display: flex;
     align-items: center;
@@ -120,6 +141,12 @@ div[data-testid="stVerticalBlock"] > div {
     color: #CBD5E1;
     background: rgba(148, 163, 184, 0.14);
     border: 1px solid rgba(148, 163, 184, 0.4);
+}
+
+.bw-hb-status-db-busy {
+    color: var(--bw-amber);
+    background: rgba(255, 176, 0, 0.2);
+    border: 1px solid var(--bw-amber);
 }
 
 .bw-hb-age {
