@@ -530,8 +530,23 @@ def render_events_panel_html(table: TableResult) -> str:
     )
 
 
+def render_db_busy_banner_html(snapshot: MonitorSnapshot) -> str:
+    """Render a top-level DB BUSY banner when SQLite is locked beyond busy_timeout."""
+    if not snapshot.db_busy:
+        return ""
+    detail = snapshot.db_busy_message or "SQLite database is temporarily locked by writer."
+    return (
+        f'<div class="bw-db-busy-banner" data-testid="db-busy-banner">'
+        f'  <span><strong>DB BUSY</strong> — {_esc(detail)}</span>'
+        f'  <span>AUTO-RETRYING ON NEXT REFRESH</span>'
+        f'</div>'
+    )
+
+
 def render_monitor_body(snapshot: MonitorSnapshot, refresh_paused: bool = False) -> None:
     """Render the full monitor content inside the page or auto-refresh fragment."""
+    if snapshot.db_busy:
+        st.markdown(render_db_busy_banner_html(snapshot), unsafe_allow_html=True)
     st.markdown(
         render_heartbeat_banner_html(
             snapshot.heartbeat,

@@ -10,6 +10,7 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 from dashboard.app import (
+    render_db_busy_banner_html,
     render_decisions_panel_html,
     render_events_panel_html,
     render_exposure_panel_html,
@@ -20,6 +21,8 @@ from dashboard.app import (
 )
 from dashboard.db import (
     CONTRACT_SCHEMA,
+    HEARTBEAT_STALE_SECONDS,
+    SQLITE_BUSY_TIMEOUT_MS,
     connect_readonly,
     default_repo_root,
     load_monitor_snapshot,
@@ -245,3 +248,37 @@ def test_contract_schema_matches_all_seven_tables() -> None:
         "snapshots",
         "events",
     }
+
+
+def test_readonly_busy_timeout_and_db_busy_banner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """connect_readonly sets busy_timeout and locked DB renders DB BUSY banner without crashing."""
+    db_path = create_sample_state(mode="normal", target_dir=tmp_path, now_utc=FIXED_NOW)
+    conn = connect_readonly(db_path)
+    try:
+        timeout_row = conn.execute("PRAGMA busy_timeout").fetchone()
+        assert timeout_row is not None
+        assert int(timeout_row[0]) == SQLITE_BUSY_TIMEOUT_MS
+    finally:
+        conn.close()
+
+    # Simulate SQLite lock contention on connection open
+    def _raise_locked(*_args: object, **_kwargs: object) -> sqlite3.Connection:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr("dashboard.db.connect_readonly", _raise_locked)
+    snap = load_monitor_snapshot(db_path=db_path, state_dir=tmp_path, now_utc=FIXED_NOW)
+    assert snap.db_busy is True
+    assert snap.heartbeat.status == "DB BUSY"
+    busy_html = render_db_busy_banner_html(snap)
+    assert "DB BUSY" in busy_html
+    assert "database is locked" in busy_html
+    hb_html = render_heartbeat_banner_html(snap.heartbeat, snap.fetched_at_ist, False)
+    assert "DB BUSY" in hb_html
+
+
+def test_heartbeat_stale_threshold_constant() -> None:
+    """HEARTBEAT_STALE_SECONDS is the single constant (30.0s) governing heartbeat staleness."""
+    assert HEARTBEAT_STALE_SECONDS == 30.0

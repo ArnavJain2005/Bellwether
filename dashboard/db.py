@@ -20,8 +20,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+# Heartbeat STALE threshold in seconds (single source of truth).
+# Source: Task DASH-EW-1 specification ("ALIVE (age < a threshold from CONTRACT.md
+# or 30s if not given)"). `bot/CONTRACT.md` specifies that `heartbeat` is rewritten
+# every loop (and `snapshots` appended every 60 s) without a numeric heartbeat stale
+# threshold, so this 30.0s constant is the authoritative threshold.
 HEARTBEAT_STALE_SECONDS: float = 30.0
 QUOTE_STALE_SECONDS: float = 60.0
+SQLITE_BUSY_TIMEOUT_MS: int = 2000
 IST_TZ = timezone(timedelta(hours=5, minutes=30), name="IST")
 
 OPEN_ORDER_STATUSES: frozenset[str] = frozenset(
@@ -142,7 +148,7 @@ class TableResult:
     """Result of querying a contract table in read-only mode."""
 
     table: str
-    status: str  # "ok" | "empty" | "missing_file" | "missing_table" | "missing_columns" | "db_error"
+    status: str  # "ok" | "empty" | "missing_file" | "missing_table" | "missing_columns" | "db_busy" | "db_error"
     rows: list[dict[str, Any]] = field(default_factory=list)
     missing_columns: tuple[str, ...] = ()
     message: str = ""
@@ -156,7 +162,7 @@ class TableResult:
 class HeartbeatState:
     """Evaluated heartbeat banner state and control flags."""
 
-    status: str  # "ALIVE" | "STALE" | "NO HEARTBEAT"
+    status: str  # "ALIVE" | "STALE" | "NO HEARTBEAT" | "DB BUSY"
     age_seconds: float | None
     age_display: str
     ts_ist_display: str
@@ -214,6 +220,8 @@ class MonitorSnapshot:
     events_table: TableResult
     heartbeat: HeartbeatState
     hero: HeroMetrics
+    db_busy: bool = False
+    db_busy_message: str | None = None
 
 
 def default_repo_root() -> Path:
@@ -259,11 +267,30 @@ def build_readonly_uri(db_path: Path) -> str:
     return f"file:{encoded_path}?mode=ro"
 
 
-def connect_readonly(db_path: Path) -> sqlite3.Connection:
-    """Open ``db_path`` in read-only mode (`mode=ro`) without creating the file."""
+def is_sqlite_busy_error(exc: BaseException) -> bool:
+    """Return True when ``exc`` indicates SQLite lock / busy contention."""
+    if not isinstance(exc, sqlite3.Error):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code in {
+        getattr(sqlite3, "SQLITE_BUSY", 5),
+        getattr(sqlite3, "SQLITE_LOCKED", 6),
+    }:
+        return True
+    msg = str(exc).lower()
+    return "database is locked" in msg or "database table is locked" in msg or "busy" in msg
+
+
+def connect_readonly(
+    db_path: Path,
+    busy_timeout_ms: int = SQLITE_BUSY_TIMEOUT_MS,
+) -> sqlite3.Connection:
+    """Open ``db_path`` in read-only mode (`mode=ro`) with an explicit busy timeout."""
     uri = build_readonly_uri(db_path)
-    conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+    timeout_sec = max(0.001, busy_timeout_ms / 1000.0)
+    conn = sqlite3.connect(uri, uri=True, timeout=timeout_sec)
     conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")
     return conn
 
 
@@ -433,6 +460,12 @@ def _inspect_and_query_table(
             message=f"{len(rows)} row(s)",
         )
     except sqlite3.Error as exc:
+        if is_sqlite_busy_error(exc):
+            return TableResult(
+                table=table,
+                status="db_busy",
+                message=f"DB BUSY — SQLite lock contention on '{table}': {exc}",
+            )
         return TableResult(
             table=table,
             status="db_error",
@@ -446,7 +479,7 @@ def _evaluate_heartbeat(
     now_utc: datetime,
     stale_threshold_seconds: float = HEARTBEAT_STALE_SECONDS,
 ) -> HeartbeatState:
-    """Evaluate heartbeat liveness (`ALIVE` / `STALE` / `NO HEARTBEAT`) and flags."""
+    """Evaluate heartbeat liveness (`ALIVE` / `STALE` / `NO HEARTBEAT` / `DB BUSY`) and flags."""
     stop_path = state_dir / "STOP"
     paused_path = state_dir / "PAUSED"
     stop_file_exists = stop_path.exists()
@@ -454,10 +487,16 @@ def _evaluate_heartbeat(
     paused_file_reason = _read_paused_file_reason(paused_path)
 
     if not heartbeat_table.has_data:
+        no_data_status = (
+            "DB BUSY" if heartbeat_table.status == "db_busy" else "NO HEARTBEAT"
+        )
+        no_data_age = (
+            "DB BUSY" if heartbeat_table.status == "db_busy" else "NO DATA"
+        )
         return HeartbeatState(
-            status="NO HEARTBEAT",
+            status=no_data_status,
             age_seconds=None,
-            age_display="NO DATA",
+            age_display=no_data_age,
             ts_ist_display="NO DATA",
             stop_file_exists=stop_file_exists,
             paused_file_exists=paused_file_exists,
@@ -753,6 +792,7 @@ def load_monitor_snapshot(
     order_limit: int = 50,
     decision_limit: int = 50,
     event_limit: int = 60,
+    busy_timeout_ms: int = SQLITE_BUSY_TIMEOUT_MS,
 ) -> MonitorSnapshot:
     """Load all contract tables and compute banner & hero states in read-only mode."""
     resolved_db, resolved_state = resolve_paths(db_path=db_path, state_dir=state_dir)
@@ -788,14 +828,22 @@ def load_monitor_snapshot(
             events_table=tables["events"],
             heartbeat=hb_state,
             hero=hero_state,
+            db_busy=False,
+            db_busy_message=None,
         )
 
     try:
-        conn = connect_readonly(resolved_db)
+        conn = connect_readonly(resolved_db, busy_timeout_ms=busy_timeout_ms)
     except sqlite3.Error as exc:
-        err_msg = f"NO DATA — Cannot open {resolved_db.name} in read-only mode: {exc}"
+        is_busy = is_sqlite_busy_error(exc)
+        err_status = "db_busy" if is_busy else "missing_file"
+        err_msg = (
+            f"DB BUSY — {resolved_db.name} is locked by writer ({exc})"
+            if is_busy
+            else f"NO DATA — Cannot open {resolved_db.name} in read-only mode: {exc}"
+        )
         tables = {
-            name: TableResult(table=name, status="missing_file", message=err_msg)
+            name: TableResult(table=name, status=err_status, message=err_msg)
             for name in CONTRACT_SCHEMA
         }
         hb_state = _evaluate_heartbeat(tables["heartbeat"], resolved_state, current_utc)
@@ -821,9 +869,11 @@ def load_monitor_snapshot(
             events_table=tables["events"],
             heartbeat=hb_state,
             hero=hero_state,
+            db_busy=is_busy,
+            db_busy_message=err_msg if is_busy else None,
         )
 
-    with conn:
+    try:
         heartbeat_table = _inspect_and_query_table(
             conn,
             "heartbeat",
@@ -862,8 +912,21 @@ def load_monitor_snapshot(
             "SELECT * FROM events ORDER BY id DESC LIMIT ?",
             (event_limit,),
         )
+    finally:
+        conn.close()
 
-    conn.close()
+    all_tables = (
+        heartbeat_table,
+        snapshots_table,
+        exposure_table,
+        orders_table,
+        decisions_table,
+        quotes_table,
+        events_table,
+    )
+    busy_tables = [t for t in all_tables if t.status == "db_busy"]
+    db_busy = len(busy_tables) > 0
+    db_busy_message = busy_tables[0].message if busy_tables else None
 
     hb_state = _evaluate_heartbeat(heartbeat_table, resolved_state, current_utc)
     hero_state = _compute_hero_metrics(
@@ -889,4 +952,6 @@ def load_monitor_snapshot(
         events_table=events_table,
         heartbeat=hb_state,
         hero=hero_state,
+        db_busy=db_busy,
+        db_busy_message=db_busy_message,
     )
