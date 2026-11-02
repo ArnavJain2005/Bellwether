@@ -152,10 +152,21 @@ def test_terms_not_acknowledged_rejects_and_pauses(tmp_path):
     assert rig.paused
 
 
-def test_other_409_rejects_and_pauses(tmp_path):
-    rig = make_rig(tmp_path, [error(409, "CONFLICT")])
-    assert place(rig).status == "rejected"
+@pytest.mark.parametrize("code", ["CONFLICT", "INVALID_ID"])
+def test_other_409_is_unknown_and_pauses(tmp_path, code):
+    rig = make_rig(tmp_path, [error(409, code)])
+    record = place(rig)
+    assert (record.status, record.http_status) == ("unknown", 409)
+    assert "may have been placed" in record.error
     assert rig.paused
+    assert len(rig.sig.posts()) == 1  # never retried
+    events = rig.events("order_unknown")
+    assert len(events) == 1 and events[0]["level"] == "error"
+    assert "earlier request may have been placed" in events[0]["message"]
+    assert not rig.events("order_rejected")
+    # Unknown blocks every new key.
+    (rig.state_dir / "PAUSED").unlink()
+    assert place(rig, make_intent(sig_exchange_id="40")).status == "blocked"
     assert len(rig.sig.posts()) == 1
 
 

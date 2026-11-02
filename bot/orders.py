@@ -337,7 +337,13 @@ class OrderPath:
                 return
             if status == 409:
                 if code != "REQUEST_IN_FLIGHT":
-                    self._rejected(key, response, pause=f"409 {code or '-'} (outcome unconfirmed)")
+                    # Key reuse or a duplicate command: the earlier request may have been
+                    # placed (OQ-W10 W10-d), so the outcome is unknown, never retried.
+                    self._unknown(
+                        key,
+                        f"HTTP 409 {code or '-'}: the earlier request may have been placed",
+                        http_status=status,
+                    )
                     return
                 in_flight += 1
                 if in_flight > MAX_IN_FLIGHT_WAITS:
