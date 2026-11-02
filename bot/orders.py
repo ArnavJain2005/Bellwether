@@ -296,20 +296,20 @@ class OrderPath:
         key = row["key"]
         status_tries = in_flight = rate_limited = no_response = 0
         first_no_response: float | None = None
-        sent_once = False
+        attempts = 0  # requests sent for this key, with or without a response
         while True:
             try:
                 response = await self._writer.post_order(body)
             except SigRateBudgetError:
                 # Admission refused before sending; earlier attempts may have landed.
-                if sent_once:
+                if attempts:
                     self._unknown(key, "write admission blocked during retries")
                 else:
                     db.update_order(self._conn, key, status="rejected", error="rate budget")
                     self.pause(f"order {key}: write admission blocked")
                 return
             except WriteNoResponse as exc:
-                sent_once = True
+                attempts += 1
                 no_response += 1
                 if first_no_response is None:
                     first_no_response = self._clock()
@@ -322,9 +322,23 @@ class OrderPath:
                     return
                 await self._sleep(wait)
                 continue
-            sent_once = True
+            attempts += 1
             db.update_order(self._conn, key, http_status=response.status)
             status, code = response.status, response.code
+            retry_answer_expected = status in (200, 429, 502, 503) or (
+                status == 409 and code == "REQUEST_IN_FLIGHT"
+            )
+            if attempts > 1 and not retry_answer_expected:
+                # A retry resends the identical bytes, including an expirationDate that
+                # may now be past, so a refusal says nothing about the earlier attempt.
+                # Only a first attempt can be 'rejected'.
+                self._unknown(
+                    key,
+                    f"retry refused with HTTP {status} {code or '-'}: the earlier attempt "
+                    "may have been placed",
+                    http_status=status,
+                )
+                return
             if status == 200:
                 self._apply_success(row, response, intent, probe)
                 return
