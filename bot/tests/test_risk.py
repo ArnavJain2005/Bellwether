@@ -18,6 +18,7 @@ def state(tmp_path, **overrides) -> RiskState:
         "race_committed": Decimal(0),
         "writes_last_min": 0,
         "unknown_orders": 0,
+        "journal_committed": Decimal(0),
         "state_dir": tmp_path,
     }
     values.update(overrides)
@@ -113,6 +114,60 @@ def test_loss_stop(tmp_path):
     # loss_stop 2000 x 0.10 = 200
     assert not check(make_intent(), state(tmp_path, limits=limits, balance=Decimal(99799))).allowed
     assert check(make_intent(), state(tmp_path, limits=limits, balance=Decimal(99800))).allowed
+
+
+def test_balance_falling_with_nothing_journaled_trips_the_loss_stop(tmp_path):
+    conn = db.connect(tmp_path / "b.db")
+    limits = make_limits(start_balance=100000)
+    s = risk.build_state(
+        conn,
+        limits,
+        race_key="senate:PA",
+        balance=Decimal(99799),
+        writes_last_min=0,
+        state_dir=tmp_path,
+    )
+    assert s.journal_committed == 0
+    result = check(make_intent(), s)
+    assert not result.allowed and result.reason.startswith("loss stop")
+
+
+def test_spending_up_to_the_total_cap_never_trips_the_loss_stop(tmp_path):
+    limits = make_limits(start_balance=100000)  # loss stop 200, total cap 1000
+    for spent in range(0, 1001, 10):
+        cash_spent = Decimal(spent)
+        s = state(
+            tmp_path,
+            limits=limits,
+            balance=Decimal(100000) - cash_spent,
+            total_committed=cash_spent,
+            journal_committed=cash_spent,
+        )
+        result = check(make_intent(quantity=1), s)
+        assert "loss stop" not in result.reason, spent
+    # At the cap itself the total cap refuses, not the loss stop.
+    assert "total committed cap" in result.reason
+
+
+def test_journal_buys_up_to_the_cap_through_build_state(tmp_path):
+    conn = db.connect(tmp_path / "b.db")
+    for n in range(25):  # 25 resting orders of 40 SUSQies = 1000, the total cap
+        _order(conn, f"o{n}", "resting", price="0.400", quantity=100, race_key=f"r{n}")
+    limits = make_limits(start_balance=100000, preexisting_committed=300)
+    s = risk.build_state(
+        conn,
+        limits,
+        race_key="senate:PA",
+        balance=Decimal(99000),
+        writes_last_min=0,
+        state_dir=tmp_path,
+        extra_committed=Decimal(200),
+    )
+    # The proxy excludes preexisting and external commitments; the caps include them.
+    assert s.journal_committed == Decimal(1000)
+    assert s.total_committed == Decimal(1500)
+    result = check(make_intent(quantity=1), s)
+    assert not result.allowed and "total committed cap" in result.reason
 
 
 def test_writes_per_minute(tmp_path):
