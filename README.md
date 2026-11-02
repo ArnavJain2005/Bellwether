@@ -1,140 +1,219 @@
 <h1 align="center">Bellwether</h1>
 
-<p align="center"><strong>A prediction-market trading system under development for the SIG Predictions Cup 2026</strong></p>
-
-<p align="center">Market data · Contract equivalence · Recovery engineering · Risk-aware execution design</p>
+<p align="center"><strong>A risk-gated trading system for prediction markets, built for the SIG Predictions Cup 2026.</strong></p>
 
 <p align="center"><a href="https://github.com/ArnavJain2005/Bellwether/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/ArnavJain2005/Bellwether/actions/workflows/ci.yml/badge.svg?branch=main"></a></p>
 
-<p align="center"><strong>Current state: read-only foundations and offline validation. Trading is not activated.</strong></p>
+> **Highlights**
+> - **A real-time prediction-market system** that parses every price as an exact
+>   decimal and fails closed when it may have missed data.
+> - **Risk-gated execution:** one `risk.check` for every order, an idempotency
+>   journal written before each send, and a test proving nothing bypasses either.
+> - **A live monitoring dashboard** with a confirmation-gated STOP control.
 
-<p align="center"><a href="#what-exists-today">What exists</a> · <a href="#architecture">Architecture</a> · <a href="#evidence-and-limits">Evidence</a> · <a href="#roadmap">Roadmap</a> · <a href="#run-locally">Run locally</a></p>
+<p align="center">
+  <img src="docs/assets/screenshots/dashboard-live-monitor.png" alt="Bellwether election-week monitor showing heartbeat, exposure by race, quotes with edges, orders, decisions and events" width="100%">
+  <br><sub><em>Sample data.</em> The election-week monitor: bot heartbeat, exposure against caps, SIG quotes against Kalshi and Polymarket, and every order, decision and event with its reason.</sub>
+</p>
 
-Bellwether is being built to identify potential mispricings in SIG's simulated-funds US midterm election markets. SIG is the **only intended execution venue**; Polymarket and Kalshi supply **reference-market data**, not accounts or trades. The engineering goal is a defensible chain from contract equivalence and fresh prices to a reasoned signal, an engine-enforced risk check and, eventually, a limit order. The project also serves as a quant and systems engineering case study: correctness, provenance and measurable failure behavior matter more than an unverified backtest or a claimed return.
+## The problem
 
-> [!IMPORTANT]
-> The repository has **no strategy, fair-value engine, order placement, risk check, operational pause/restart controller or runnable trading service**. No acceptance gate authorizes live SIG trading. Its market-data and account components have offline tests, but the end-to-end system has not been demonstrated against live SIG. See the [authoritative PRD](docs/PRD.md) for requirements and gate definitions.
+SIG's Predictions Cup runs US midterm election markets: 237 YES/NO contracts across
+117 races, traded with simulated funds called SUSQies. Polymarket and Kalshi list many
+of the same races with real money behind them.
 
-## At a glance
+Bellwether prices SIG's contracts against those two venues and buys on SIG when SIG's
+price is out of line. SIG is the only venue it trades on; Polymarket and Kalshi are
+read-only references.
 
-| Scope | Verified repository state |
-| :--- | :--- |
-| Competition | SIG Predictions Cup 2026; simulated SUSQies only. A recorded SIG inventory contains **237 contracts** and yields **117 proposed race keys**. These are a snapshot and title-derived proposals, not verified current coverage or authoritative race IDs. |
-| Data sources | Read-only SIG REST client and market-data WebSocket adapter; Polymarket/Kalshi election-market discovery pipeline. |
-| Contract mapping | Offline, provenance-pinned review workflow. **0/237** SIG contracts have an authoritative race identity or reviewed Info-tab text; **0** verified counterparts on either venue; **0** fair-value-eligible contracts. [Coverage report](markets/R1_REPORT.md). |
-| Execution | No order writer, active risk policy, strategy or live/paper trading loop. |
-| Quality | Offline tests, recorded SIG fixtures, fake transports, Ruff and [CI](.github/workflows/ci.yml). The latest audited `main` CI run [passed](https://github.com/ArnavJain2005/Bellwether/actions/runs/40740802674). |
+**What makes it hard:**
+- **Contract equivalence.** Two similarly worded contracts can settle differently, so
+  every match needs review.
+- **Undocumented behaviour.** The exchange API leaves key behaviour open, such as how
+  a NO order's price is quoted and what happens after a timeout.
+- **One shared budget.** All keys share 100 reads and 30 writes per minute.
+- **Duplicates and position flips.** A bug can mean a duplicate order, or a sell that
+  silently becomes a buy of the other side.
 
-*Repository snapshot: `main` at [`278de70`](https://github.com/ArnavJain2005/Bellwether/commit/278de70eeba113020e0a0b579e577f1d00091a13), audited October 28, 2026. Open work is not included in the implemented column, for example [PR #42](https://github.com/ArnavJain2005/Bellwether/pull/42) (lifecycle sweep) and [PR #44](https://github.com/ArnavJain2005/Bellwether/pull/44) (venue filter fix).*
+## What I built
 
-## What exists today
-
-| Area | Implemented on `main` | Boundary that still matters |
+| Component | What it does | Key files |
 | :--- | :--- | :--- |
-| **SIG reads** | Tournament, markets, prices, orderbooks, trades, open orders and tournament account reads through [`SigRestClient`](engine/sig_client/rest.py) and [`account_reads.py`](engine/sig_client/account_reads.py). Exact `Decimal` wire parsing, explicit tournament scope where supported, deadlines, retries and a shared rate limiter. | Account cash, wire quantity units and some price meanings remain unresolved; [`O1`](docs/design/order-wire-contracts.md) records evidence and open questions, not settled behavior. |
-| **Market feed** | [`RealtimeSocketTransport`](engine/sig_client/realtime_socket.py) implements a market-only Supabase WebSocket transport. The [feed](engine/sig_client/realtime.py) handles token refresh, revision gaps and REST book resync; the [ledger](engine/sig_client/recovery.py) tracks blockers and missed windows. | Tested offline; a socket join or book resync cannot clear a settlement/trade blocker. Production bootstrap, durable recovery and blocker clearing are absent, so production markets do not become ready. |
-| **Account snapshot** | [`AccountSnapshot`](engine/account/snapshot.py) assembles A2 reads with provenance, component outcomes, timing, scope findings and unresolved fields. | Separate reads are not atomic. The snapshot does **not** establish spendable cash, equity or trading readiness. |
-| **Reference discovery** | [`data/venue_markets/`](data/venue_markets/README.md) fetches and validates relevant Polymarket/Kalshi market lists, including rules-based House eligibility checks. | A market list is not a current quote feed, complete coverage guarantee or settlement-equivalent mapping. Open [PR #44](https://github.com/ArnavJain2005/Bellwether/pull/44) proposes excluding state-legislative House markets (for example Kalshi `KXTXHOUSE`) that the current filter can admit as federal House references. |
-| **Mapping review** | [`data/r1_mapping/`](data/r1_mapping/README.md) audits a complete recorded SIG pagination walk, produces candidate suggestions, validates reviewer decisions and regenerates a coverage/missing-input report. | All 237 venue decisions remain unresolved; the frozen venue snapshot is incomplete and fails the current validator. Suggestions cannot become fair values without reviewed rules and identity evidence. |
-| **Operational design** | [Hosting evidence and dry-run runbook](deploy/README.md), [market recovery design](docs/design/market-data-recovery.md), [account contracts](docs/design/account-state-contracts.md) and [order-wire evidence](docs/design/order-wire-contracts.md). | These are design/evidence artifacts. No server, deployment launcher, trade journal or order path exists. |
+| **SIG client** | Async REST reads pinned to the tournament, a shared rate limiter, retries with deadlines, and exact `Decimal` wire parsing. Also a realtime WebSocket adapter and feed with revision-gap detection and REST resync, plus a recovery ledger that keeps markets blocked until missed data is accounted for. | [`rest.py`](engine/sig_client/rest.py) · [`rate_limiter.py`](engine/sig_client/rate_limiter.py) · [`realtime_socket.py`](engine/sig_client/realtime_socket.py) · [`recovery.py`](engine/sig_client/recovery.py) |
+| **Account state** | Tournament balance, positions, orders, fills, P&L and settlement reads, assembled into a snapshot. Each read records where its data came from, how old it is, and which fields are still unresolved. | [`account_reads.py`](engine/sig_client/account_reads.py) · [`snapshot.py`](engine/account/snapshot.py) |
+| **Election-week bot** | A buy-only trading loop with two strategies: complement pricing within a race, and reference pricing against Kalshi and Polymarket. It has one risk gate, an idempotency journal and restart reconciliation, and it runs in dry run by default. | [`main.py`](bot/main.py) · [`strategy.py`](bot/strategy.py) · [`risk.py`](bot/risk.py) · [`orders.py`](bot/orders.py) |
+| **Reference prices** | Public Kalshi and Polymarket quotes, with staleness, spread and cross-venue disagreement checks before a fair value is formed. | [`refs.py`](bot/refs.py) |
+| **Contract mapping** | Venue discovery and filtering, and a candidate-matching workflow tied to pinned source data. The bot's map is approved by hand: 114 SIG contracts in 57 Senate, governor and chamber-control races, with 10 races excluded. | [`venue_markets/`](data/venue_markets/README.md) · [`r1_mapping/`](data/r1_mapping/README.md) · [`map.yaml`](bot/map.yaml) · [`map_review.md`](bot/map_review.md) |
+| **Dashboard** | A Streamlit monitor that opens the bot's SQLite database read-only. It has filters, 6-hour IST history, and a STOP control that requires confirmation. | [`app.py`](dashboard/app.py) · [`db.py`](dashboard/db.py) |
+| **Operations** | systemd units and a step-by-step runbook for a single Ubuntu server, plus hosting evidence and the server design. | [`BOT_RUNBOOK.md`](deploy/BOT_RUNBOOK.md) · [`deploy/`](deploy/README.md) |
 
-### Architecture
-
-The solid paths below describe **implemented read and review components**. They are separate foundations, not a running end-to-end trading loop.
+## Architecture
 
 ```mermaid
 flowchart LR
-  SIG["SIG REST"] --> Reads["Read client + recorded fixtures"] --> Snapshot["Account snapshot"]
-  WS["SIG market WebSocket"] --> Socket["Socket adapter"] --> Feed["Realtime feed"] --> Ledger["Recovery ledger + readiness"]
-  Venues["Polymarket + Kalshi"] --> Discovery["Market discovery + validation"] --> Review["Offline mapping review"]
-  Reads --> Review
+  SIG["SIG REST<br/>prices · books · account"] --> Loop
+  Refs["Kalshi + Polymarket<br/>public quotes"] --> Loop
+  Map["Approved contract map<br/>bot/map.yaml"] --> Loop
+  Limits["config/risk.yaml<br/>owner-only limits"] --> Risk
+  Loop["Trading loop<br/>bot/main.py"] --> Strat["Strategies<br/>complement · reference"]
+  Strat --> Risk["risk.check"]
+  Risk -->|denied| DB
+  Risk -->|allowed| Journal["Journal row committed<br/>before send"]
+  Journal --> Writer["SIG limit orders<br/>same-key retries"]
+  Writer --> DB[("SQLite WAL<br/>bot/state/bellwether.db")]
+  DB -->|read-only| Dash["Streamlit dashboard"]
+  Dash -->|STOP file only| Loop
 ```
 
-The **target system** has a separate decision and execution path. The blocks below are planned; the arrows do not imply those connections exist today.
+Every arrow above is code on `main`. The dashboard never imports the bot. It reads the
+database read-only and can do one thing: create a `STOP` file that the loop checks on
+every pass ([contract](bot/CONTRACT.md)).
 
-```mermaid
-flowchart LR
-  Sources["Verified SIG + reference quotes"] --> Equivalence["Reviewed contract equivalence"] --> Fair["Fair value + signal"]
-  Fair --> Guard["Readiness + risk checks"] --> Orders["SIG limit orders"]
-  Orders --> Journal["Journal + reconciliation"] --> Guard
-```
+## Engineering decisions
 
-**Why the separation matters:** a similarly worded election contract can settle differently; a fresh book does not prove that an unsequenced settlement was observed; and a snapshot assembled from several endpoints does not prove account-wide atomicity. Each uncertainty blocks the corresponding claim or decision rather than being silently filled in.
-
-## Evidence and limits
-
-The implementation is designed around explicit evidence and failure states. Its current tests demonstrate **offline behavior**, not trading performance or production readiness.
-
-| Engineering choice | Evidence you can inspect |
-| :--- | :--- |
-| Exact numeric ingestion | REST [wire models](engine/sig_client/wire.py) and [WebSocket decoder](engine/sig_client/realtime_socket.py) retain JSON numeric values as `Decimal`/integer rather than converting them through binary floats. |
-| Conservative market recovery | [Recovery ledger](engine/sig_client/recovery.py), [readiness model](engine/sig_client/readiness.py) and [design/acceptance tests](docs/design/market-data-recovery.md) preserve blockers across feed replacement in one process and distinguish book evidence from lifecycle/trade evidence. The ledger is not durable across process restart. |
-| Auditable account observations | [A3 snapshot](engine/account/snapshot.py) reports each read's outcome, temporal span and unresolved meaning; it does not label a cross-endpoint view `READY`. |
-| Reproducible mapping review | [Pinned source hashes](markets/r1_sources.json), [decisions](markets/r1_mapping.json) and [generated report](markets/R1_REPORT.md). The validator refuses unsupported verified matches and fair-value eligibility. |
+- **Decimal everywhere.** JSON numbers are decoded as `Decimal`, and prices are
+  stored as decimal strings, so 0.535 never becomes 0.53499…
+  ([`wire.py`](engine/sig_client/wire.py), [`limits.py`](bot/limits.py),
+  [contract](bot/CONTRACT.md#units)).
+- **Journal before send, and retry with the same key.** Each order's row is committed
+  with its idempotency key before any bytes leave. Retries rebuild the identical
+  request from that row. Any outcome SIG does not confirm becomes `unknown` and pauses
+  new orders ([`orders.py`](bot/orders.py)).
+- **Buy-only, limit-only, on-tick.** The bot never sells, because an oversized sell
+  turns into a buy of the other side. Every order has an explicit limit price, rounded
+  down to the 0.005 grid ([`strategy.py`](bot/strategy.py), [`risk.py`](bot/risk.py)).
+  NO orders stay off until a probe settles the API's NO-price convention
+  ([`probe.py`](bot/probe.py)).
+- **Caps count what might be at risk.** Per-order, per-race, total-committed and
+  cash-reserve limits include resting orders. Orders with an unknown outcome count at
+  full size ([`risk.py`](bot/risk.py)).
+- **One gate, enforced by a test.** Only `bot/orders.py` may call the order endpoint,
+  and only after `risk.check`. A test fails the build if any other code path reaches it
+  ([`test_bypass.py`](bot/tests/test_bypass.py)).
+- **File-based controls.** A `PAUSED` file stops new orders until a human removes it,
+  and a `STOP` file cancels all orders and exits. Cancelling is never gated by the
+  risk check ([`main.py`](bot/main.py), [`sig_writer.py`](bot/sig_writer.py)).
+- **Restart reconciliation.** On startup, the bot resolves journal rows a previous run
+  left mid-send. In live mode it cancels every open order, then reads balance,
+  positions and orders before trading. Anything it cannot explain pauses the bot
+  ([`main.py`](bot/main.py)).
+- **One rate budget.** Reads and writes share one limiter, and writes are also capped
+  per minute in `risk.check`
+  ([`rate_limiter.py`](engine/sig_client/rate_limiter.py), [`risk.py`](bot/risk.py)).
+- **The key never leaks.** It is read only from the environment and is redacted from
+  logs, reprs, errors and stored bodies. Tests enforce this
+  ([`config.py`](engine/config.py), [`test_secrets.py`](bot/tests/test_secrets.py)).
 
 <details>
-<summary><strong>Explore the mapping evidence: why 237 contracts are still unresolved</strong></summary>
+<summary><strong>Screenshot gallery (sample data)</strong></summary>
 
-The recorded walk has three pages (100 + 100 + 37) and was complete **when captured**. Its titles generate 117 race-key proposals. They do not provide authoritative race/stage IDs, regular-versus-special status or SIG Info-tab resolution clauses. The available frozen venue dump is incomplete and predates later filter repairs. Candidate suggestions are therefore leads for human review, never confirmed matches or a proof of absence. The [report](markets/R1_REPORT.md) enumerates missing evidence per market; the [review protocol](markets/README.md) specifies settlement-equivalence criteria.
+<br>
+
+**Positions, per-race P&L and 6-hour history (IST)**
+<img src="docs/assets/screenshots/dashboard-positions-pnl-history.png" alt="Positions table, per-race P&L and a six-hour balance and exposure chart" width="100%">
+
+**Filters:** one race selected. The filter applies to orders, decisions and positions.
+<img src="docs/assets/screenshots/dashboard-filtered-by-race.png" alt="Dashboard filtered to a single race from the sidebar" width="100%">
+
+**STOP BOT confirmation:** auto-refresh pauses until the operator confirms or cancels.
+<img src="docs/assets/screenshots/dashboard-stop-confirmation.png" alt="STOP BOT confirmation row with Confirm and Cancel buttons" width="100%">
+
+**Fault states:** a stale heartbeat, an active STOP file and a pause after rate limiting.
+<img src="docs/assets/screenshots/dashboard-stale-heartbeat.png" alt="Stale heartbeat banner with STOP and PAUSED indicators" width="100%">
+
+All screenshots come from the repository's sample-database generator
+([`sample_db.py`](dashboard/tests/sample_db.py)). The races, balances and orders are
+synthetic, and none show real trading.
 
 </details>
 
-<details>
-<summary><strong>Explore the safety boundary: what a green CI run does not prove</strong></summary>
+## Testing and quality
 
-The suite uses recorded fixtures, synthetic data and fake transports. It has not established full live SIG WebSocket interoperability, resolution equivalence, a correct write-side API contract, outage cancellation, durable restart recovery or an unattended cloud soak. The [PRD acceptance gates](docs/PRD.md#acceptance-gates) remain unmet. [PR #42](https://github.com/ArnavJain2005/Bellwether/pull/42) proposes an opt-in lifecycle sweep, and [PR #44](https://github.com/ArnavJain2005/Bellwether/pull/44) proposes a venue-filter fix. Both are still under review; neither is a merged capability.
+These counts were measured on `main` at
+[`c9d22ca`](https://github.com/ArnavJain2005/Bellwether/commit/c9d22ca7128095f08e8e8c294406a0a598fb86e9)
+on Nov 2, 2026:
 
-</details>
+| Suite | Tests | In CI |
+| :--- | ---: | :---: |
+| Engine (`tests/`) | 2,020 | ✓ |
+| Bot (`bot/tests/`) | 207 | ✓ |
+| Data and mapping (`data/*/tests/`) | 725 | run separately |
+| Dashboard (`dashboard/tests/`) | 25 | run separately (needs Streamlit) |
+| **Total** | **2,977** | |
 
-## Roadmap
+- Every suite passes, and `ruff check .` is clean.
+- [GitHub Actions](.github/workflows/ci.yml) runs Ruff and `pytest` on Python 3.11 for
+  every push and pull request.
+- Pre-commit runs a gitleaks secret scan.
+- Tests use recorded SIG fixtures, fakes and synthetic data. They never call the live
+  API.
 
-Progress depends on [G-1 through G-11](docs/PRD.md#acceptance-gates), with recorded evidence required at each gate. The tracks can advance independently where their dependencies allow.
+## Tech stack
 
-| Step | Deliverable and acceptance focus | State |
-| :--- | :--- | :--- |
-| **1. Establish inputs** | Reviewed SIG-to-venue equivalence, authoritative race/group identity and fresh comparable quotes; complete market-data recovery rules. | Mapping workflow and socket adapter built; approvals, quote collectors and blocker clearing pending. |
-| **2. Prove the decision path** | Reference collectors, SQLite storage, fair value and explainable shadow signals; test candidate strategies without sending orders. | Planned; no backtest or alpha result claimed. |
-| **3. Build protected execution** | Resolve order-wire questions; journal idempotency keys before send; enforce limit-only orders, pending exposure, risk checks and bypass tests. The [O1 evidence note](docs/design/order-wire-contracts.md) is a draft under review. O1-F1 corrected its Arnav-only check runbook: retries now depend on the response code, and cancel-all requires a complete, scoped inventory of open orders. None of its real-platform checks has been run, and the expiry check observes only whether an expiry is accepted, so G-4 stays blocked. O2 implementation pending. |
-| **4. Recover and control** | Tournament-scoped restart reconciliation, pauses, protective cancellation, loss reset and terminal controls; verify resting-order outage bounds. | Designs only; G-2 through G-8 not met. |
-| **5. Operate, then decide** | Verify ₹0 hosting, run an unattended cloud **dry-run** and reboot/fault exercises; consider a limited SIG pilot only after all gates pass and Arnav explicitly activates it. | [H1 design/runbook](deploy/README.md) written; G-9/G-10/G-11 not met. |
-| **6. Present and evaluate** | A simple, responsive monitoring dashboard after terminal controls; later analyze calibration, repricing lag, fill quality, risk blocks and uptime from actual logs. | Planned; no dashboard or performance results exist. |
-
-<details>
-<summary><strong>View proposed pilot limits and open policy questions</strong></summary>
-
-The competition starts with **100,000 SUSQies**. The following are *provisional ceilings*, not activated configuration: **500** per order, **2,000** per race, **3,000** per related group, **10,000** total commitment including pending/unresolved orders, **90,000** minimum uncommitted reserve and a **2,000** loss trigger below the eventual baseline. Commitment, group boundaries, tournament cash and equity valuation still require decisions and evidence. No `config/risk.yaml` exists and nothing enforces these figures. A loss trigger is not a guarantee of maximum loss. See the [PRD](docs/PRD.md#provisional-pilot-ceilings).
-
-</details>
+Python 3.11 · asyncio · httpx · Pydantic v2 · websockets · SQLite (WAL) · PyYAML ·
+Streamlit · Altair · pandas · pytest · Ruff · GitHub Actions · systemd
 
 ## Run locally
-
-Python **3.11+**. The repository's [CI workflow](.github/workflows/ci.yml) uses Python 3.11 and runs install, Ruff and the default test suite:
 
 ```bash
 python -m pip install -e .
 python -m ruff check .
 python -m pytest
+python -m pytest data/venue_markets/tests data/r1_mapping/tests
 ```
 
-The default `pytest` configuration targets `tests/`. Run the additional offline data suites explicitly:
+Dashboard on sample data (Streamlit, Altair and pandas are not in `pyproject.toml`).
+The generator writes to a temporary directory and prints the two environment variables
+to set:
 
 ```bash
-python -m pytest data/venue_markets/tests data/r1_mapping/tests
-python -m data.r1_mapping inventory
-python -m data.r1_mapping validate
-python -m data.r1_mapping report --check
+python -m pip install streamlit altair pandas
+python -m pytest dashboard/tests
+python -m dashboard.sample_db --mode normal
+streamlit run dashboard/app.py
 ```
 
-The offline mapping commands require only committed source files. Candidate regeneration additionally needs the **exact hash-pinned, git-ignored venue snapshot** named in [`r1_sources.json`](markets/r1_sources.json); see the [workflow instructions](data/r1_mapping/README.md). There is **no engine start/trade command**. Live SIG capture is reserved for Arnav; development uses fixtures and fake transports. Never commit a key or `.env`.
+The bot's command line:
 
-## Project guide
+```bash
+python -m bot.main --help
+```
 
-| Read this | For |
+`python -m bot.main --dry-run` runs the full loop without sending any order or cancel.
+It still reads live SIG prices and public reference quotes. It needs `SUSQ_API_KEY` in
+your environment (never commit it), and it shares the account's rate budget. It was not
+run for this README.
+
+## Status and roadmap
+
+| Area | Status |
 | :--- | :--- |
-| [PRD](docs/PRD.md) | Authoritative requirements, scope, roadmap, acceptance gates and open decisions. |
-| [Market recovery](docs/design/market-data-recovery.md) · [account state](docs/design/account-state-contracts.md) · [order contracts](docs/design/order-wire-contracts.md) | Design reasoning and unresolved platform behavior. |
-| [Mapping workflow](data/r1_mapping/README.md) · [review records](markets/README.md) · [coverage report](markets/R1_REPORT.md) | Reproduce the candidate and review process, and see what evidence is missing. |
-| [Deployment preparation](deploy/README.md) | Hosting questions, proposed server design and future dry-run runbook. |
-| [Contributor rules](CLAUDE.md) · [agent rules](AGENTS.md) | Ownership, testing and safety boundaries. Some older status paragraphs lag current `main`; use this README and the actual code for implementation status, and the PRD for policy. |
+| SIG read client, realtime feed, recovery ledger, account snapshot | On `main`, tested offline |
+| Election-week bot (strategies, risk gate, journal, reconciliation) | On `main`, tested with fakes. [`config/risk.yaml`](config/risk.yaml) is in `dry_run` mode, and NO orders are disabled. |
+| Contract map | 114 contracts approved by hand in Senate, governor and chamber-control races. Individual House seats are not approved. |
+| Dashboard | On `main`, tested on sample data |
+| Engine order path, durable recovery, ₹0 hosting gates | Open. See the [PRD acceptance gates](docs/PRD.md#acceptance-gates) and [open questions](docs/PRD.md#open-questions). |
 
-Bellwether is a work in progress. Its present contribution is a tested, inspectable foundation for market ingestion, evidence-led mapping and fail-closed state handling; measured trading outcomes will require the later decision, execution and deployment stages.
+The bot is a scoped exception for the competition's final days (see
+[`CLAUDE.md`](CLAUDE.md)). The longer-term engine roadmap, requirements and acceptance
+gates are in the [PRD](docs/PRD.md).
+
+## Results
+
+Results will be added after the competition closes. No P&L, rank, win rate or latency
+figures are claimed here.
+
+## About
+
+Built by **Arnav Jain** for the SIG Predictions Cup 2026.
+
+Development was AI-assisted under written rules
+([`CLAUDE.md`](CLAUDE.md), [`AGENTS.md`](AGENTS.md)):
+- Claude Code wrote the engine and the bot;
+- Antigravity wrote the dashboard and data pipelines;
+- every pull request was reviewed and merged by hand, and the project rules require a
+  second-model review of order and risk code.
+
+LinkedIn: _[add link]_ · Email: _[add address]_
+
+<sub>Audited against `main` at `c9d22ca` (PR #56), Nov 2, 2026. SUSQies are simulated competition funds; no real money is traded.</sub>
