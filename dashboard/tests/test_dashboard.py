@@ -729,3 +729,275 @@ def test_static_no_other_writes_or_deletes_in_dashboard() -> None:
         "dashboard/db.py",
     )
     assert render_stop_confirmation_html()
+
+
+# ---------------------------------------------------------------------------
+# DASH-UI-SIMPLIFY (UI v2) parity, Needs Attention, STOP flow & safety nets
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["normal", "empty", "missing", "stale", "single_snapshot", "malformed_json", "db_busy"],
+)
+def test_v2_feature_parity_across_all_states(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """DASH-UI-SIMPLIFY: Parity test across all 7 states asserting every checklist item appears in v2."""
+    from dataclasses import replace as dc_replace
+
+    from dashboard.app import (
+        render_hero_row_v2_html,
+        render_needs_attention_html,
+        render_status_strip_v2_html,
+        render_ui_footer_html,
+    )
+
+    state_dir = tmp_path / f"v2_parity_{mode}"
+    sample_mode = "normal" if mode == "db_busy" else mode
+    db_path = create_sample_state(
+        mode=sample_mode,  # type: ignore[arg-type]
+        target_dir=state_dir,
+        now_utc=FIXED_NOW,
+    )
+
+    snap = load_monitor_snapshot(db_path=db_path, state_dir=state_dir, now_utc=FIXED_NOW)
+    if mode == "db_busy":
+        snap = dc_replace(
+            snap,
+            db_busy=True,
+            db_busy_message="database is locked (SQLITE_BUSY after 2500ms timeout)",
+        )
+
+    strip_html = render_status_strip_v2_html(snap, refresh_paused=False)
+    hero_html = render_hero_row_v2_html(snap)
+    attn_html = render_needs_attention_html(snap)
+    footer_html = render_ui_footer_html("v2")
+
+    # 1. Status strip parity items
+    assert "bw-v2-status-strip" in strip_html
+    assert "Last event:" in strip_html
+    assert "MODE:" in strip_html
+    assert "STOP" in strip_html
+    assert "PAUSED:" in strip_html
+    assert "ELECTION NIGHT:" in strip_html
+    if mode == "db_busy":
+        assert "DB BUSY" in strip_html
+    if mode == "stale":
+        assert "STOPPED" in strip_html
+        assert "STOP FILE PRESENT" in strip_html
+        assert "PAUSED: ACTIVE" in strip_html
+
+    # 2. Four big numbers only + thin exposure bar (when exposure available)
+    assert "bw-v2-hero-grid" in hero_html
+    assert ">BALANCE<" in hero_html
+    assert ">NET P&amp;L<" in hero_html
+    assert ">OPEN ORDERS<" in hero_html
+    assert ">EXPOSURE (USED / CAP)<" in hero_html
+    assert "LAST EVENT TIME" not in hero_html  # moved into status strip
+    if snap.hero.exposure_available:
+        assert "bw-v2-exp-bar-track" in hero_html
+
+    # 3. Needs attention box + UI v2 footer
+    assert 'data-testid="needs-attention-box"' in attn_html
+    assert "UI v2" in footer_html
+
+    # 4. Full Streamlit AppTest render in v2 mode for each state
+    if mode != "db_busy":
+        monkeypatch.setenv("BELLWETHER_DB_PATH", str(db_path))
+        monkeypatch.setenv("BELLWETHER_STATE_DIR", str(state_dir))
+        monkeypatch.delenv("BW_UI", raising=False)
+
+        app_file = Path(__file__).resolve().parents[1] / "app.py"
+        at = AppTest.from_file(str(app_file), default_timeout=30)
+        at.run(timeout=30)
+        assert not at.exception
+
+        tab_labels = [t.label for t in at.tabs]
+        assert tab_labels == [
+            "Orders & Decisions",
+            "Quotes & Exposure",
+            "Positions & History",
+            "Events",
+        ]
+
+        all_md = "\n".join(m.value for m in at.markdown)
+        assert "bw-v2-status-strip" in all_md
+        assert "bw-v2-hero-grid" in all_md
+        assert 'data-testid="needs-attention-box"' in all_md
+        assert "UI v2" in all_md
+        assert "ORDERS" in all_md
+        assert "DECISIONS" in all_md
+        assert "QUOTES" in all_md
+        assert "EXPOSURE" in all_md
+        assert "POSITIONS" in all_md
+        assert 'data-testid="panel-race-pnl"' in all_md
+        assert "SNAPSHOT HISTORY" in all_md
+        assert "EVENTS" in all_md
+
+        # Sidebar controls: 3 filters + Show all columns toggle
+        assert at.sidebar.selectbox(key="filter_race_key").value == "All"
+        assert at.sidebar.selectbox(key="filter_strategy").value == "All"
+        assert at.sidebar.selectbox(key="filter_status_verdict").value == "All"
+        show_all_toggle = at.sidebar.toggle(key="show_all_columns")
+        assert show_all_toggle.value is False
+
+        # Toggle Show all columns and verify raw IDs / venue tokens appear on normal data
+        if mode == "normal":
+            assert "mkt-pa-sen" not in all_md
+            assert "sig-992014" not in all_md
+            show_all_toggle.set_value(True).run(timeout=30)
+            assert not at.exception
+            expanded_md = "\n".join(m.value for m in at.markdown)
+            assert "mkt-pa-sen" in expanded_md
+            assert "sig-992014" in expanded_md
+    else:
+        busy_banner = render_db_busy_banner_html(snap)
+        assert "DB BUSY" in busy_banner
+
+
+def test_v2_needs_attention_lists_problems_and_shows_all_clear(tmp_path: Path) -> None:
+    """DASH-UI-SIMPLIFY: Needs attention box lists stale heartbeat, stale quote, and error event; shows All clear on healthy data."""
+    from dataclasses import replace as dc_replace
+
+    from dashboard.app import build_needs_attention_items, render_needs_attention_html
+
+    # 1. Sample 'normal' state has 1 stale quote (78s > 60s) and recent warn/error events
+    normal_dir = tmp_path / "attn_normal"
+    normal_db = create_sample_state(mode="normal", target_dir=normal_dir, now_utc=FIXED_NOW)
+    normal_snap = load_monitor_snapshot(db_path=normal_db, state_dir=normal_dir, now_utc=FIXED_NOW)
+
+    normal_items = build_needs_attention_items(normal_snap)
+    categories = [it.category for it in normal_items]
+    assert "quote_stale" in categories
+    assert "event" in categories
+    normal_html = render_needs_attention_html(normal_snap)
+    assert "NEEDS ATTENTION" in normal_html
+    assert "SIG-AZ-SEN-D" in normal_html
+
+    # 2. Stale heartbeat + STOP/PAUSED + DB BUSY + >90% exposure cap + bad JSON format
+    stale_dir = tmp_path / "attn_stale"
+    stale_db = create_sample_state(mode="stale", target_dir=stale_dir, now_utc=FIXED_NOW)
+    stale_snap = load_monitor_snapshot(db_path=stale_db, state_dir=stale_dir, now_utc=FIXED_NOW)
+    high_exp_rows = [
+        {"race_key": "SEN-PA-2026", "committed": "950.00", "cap": "1000.00", "updated_at_utc": FIXED_NOW.isoformat()}
+    ]
+    busy_stale_snap = dc_replace(
+        stale_snap,
+        db_busy=True,
+        db_busy_message="database is locked",
+        exposure_table=dc_replace(
+            stale_snap.exposure_table,
+            status="ok",
+            rows=high_exp_rows,
+            message="1 row(s)",
+        ),
+    )
+    stale_items = build_needs_attention_items(busy_stale_snap)
+    stale_cats = {it.category for it in stale_items}
+    assert "heartbeat" in stale_cats
+    assert "stop" in stale_cats
+    assert "paused" in stale_cats
+    assert "db_busy" in stale_cats
+    assert "exposure_cap" in stale_cats
+
+    # 3. Healthy snapshot -> "All clear"
+    fresh_quotes = [
+        {**r, "ts_utc": (FIXED_NOW - timedelta(seconds=5)).isoformat()}
+        for r in normal_snap.quotes_table.rows
+    ]
+    info_events = [
+        r for r in normal_snap.events_table.rows if str(r.get("level")).lower() == "info"
+    ]
+    healthy_snap = dc_replace(
+        normal_snap,
+        quotes_table=dc_replace(normal_snap.quotes_table, rows=fresh_quotes),
+        events_table=dc_replace(normal_snap.events_table, rows=info_events),
+    )
+    healthy_items = build_needs_attention_items(healthy_snap)
+    assert healthy_items == []
+    healthy_html = render_needs_attention_html(healthy_snap)
+    assert "All clear" in healthy_html
+    assert "bw-attention-clear" in healthy_html
+
+
+def test_v2_stop_flow_and_safety_nets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DASH-UI-SIMPLIFY: Verify STOP flow in v2 (Confirm/Cancel/read-only failure), BW_UI=legacy fallback, and UI error boundary."""
+    from dashboard.app import render_monitor_body, render_ui_error_banner_html, resolve_ui_mode
+
+    state_dir = tmp_path / "v2_stop_state"
+    db_path = create_sample_state(mode="normal", target_dir=state_dir, now_utc=FIXED_NOW)
+    stop_file = state_dir / STOP_FILENAME
+
+    monkeypatch.setenv("BELLWETHER_DB_PATH", str(db_path))
+    monkeypatch.setenv("BELLWETHER_STATE_DIR", str(state_dir))
+    monkeypatch.delenv("BW_UI", raising=False)
+
+    app_file = Path(__file__).resolve().parents[1] / "app.py"
+    at = AppTest.from_file(str(app_file), default_timeout=30)
+    at.run(timeout=30)
+    assert not at.exception
+    assert not stop_file.exists()
+
+    # 1. Click STOP BOT -> opens confirmation, writes nothing yet
+    stop_btns = [b for b in at.button if b.label == "STOP BOT"]
+    assert len(stop_btns) == 1
+    stop_btns[0].click().run(timeout=30)
+    assert not stop_file.exists()
+    assert bool(at.session_state["confirm_open"]) is True
+    md_open = "\n".join(m.value for m in at.markdown)
+    assert "This creates" in md_open and "bot/state/STOP" in md_open and "halts trading. Confirm?" in md_open
+
+    # 2. Click Cancel -> closes confirmation, writes nothing
+    cancel_btns = [b for b in at.button if b.label == "Cancel"]
+    assert len(cancel_btns) == 1
+    cancel_btns[0].click().run(timeout=30)
+    assert not stop_file.exists()
+    assert bool(at.session_state["confirm_open"]) is False
+
+    # 3. Click STOP BOT -> Confirm -> writes bot/state/STOP once and shows STOP ACTIVE
+    stop_btns = [b for b in at.button if b.label == "STOP BOT"]
+    stop_btns[0].click().run(timeout=30)
+    confirm_btns = [b for b in at.button if b.label == "Confirm"]
+    assert len(confirm_btns) == 1
+    confirm_btns[0].click().run(timeout=30)
+    assert stop_file.exists()
+    assert "dashboard" in stop_file.read_text(encoding="utf-8")
+    active_btns = [b for b in at.button if b.label == "STOP ACTIVE"]
+    assert len(active_btns) == 1
+    assert active_btns[0].disabled is True
+
+    # 4. Read-only folder failure in temp dir
+    ro_dir = tmp_path / "v2_ro_dir"
+    ro_dir.mkdir(parents=True, exist_ok=True)
+    ro_dir.chmod(stat.S_IREAD | stat.S_IXUSR)
+    try:
+        res = write_stop_file(state_dir=ro_dir, now_utc=FIXED_NOW)
+        assert res.ok is False
+        assert not (ro_dir / STOP_FILENAME).exists()
+    finally:
+        ro_dir.chmod(stat.S_IWRITE | stat.S_IREAD | stat.S_IXUSR)
+
+    # 5. Legacy mode fallback via BW_UI=legacy
+    monkeypatch.setenv("BW_UI", "legacy")
+    assert resolve_ui_mode() == "legacy"
+    at_legacy = AppTest.from_file(str(app_file), default_timeout=30)
+    at_legacy.run(timeout=30)
+    assert not at_legacy.exception
+    legacy_tabs = [t.label for t in at_legacy.tabs]
+    assert legacy_tabs == [
+        "LIVE MONITOR",
+        "POSITIONS, P&L & HISTORY (6H)",
+    ]
+    legacy_md = "\n".join(m.value for m in at_legacy.markdown)
+    assert "UI legacy" in legacy_md
+
+    # 6. Top-level error boundary in v2 mode renders 'UI ERROR, switch to legacy'
+    err_html = render_ui_error_banner_html(RuntimeError("synthetic v2 failure"))
+    assert "UI ERROR, switch to legacy" in err_html
+    assert "?ui=legacy" in err_html
+    assert "synthetic v2 failure" in err_html
+    assert callable(render_monitor_body)
+
