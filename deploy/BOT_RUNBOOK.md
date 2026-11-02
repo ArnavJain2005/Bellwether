@@ -1,0 +1,262 @@
+# Election-week bot runbook (BOT-EW, Ubuntu 24.04)
+
+Copy-paste commands for Arnav. Every command that touches SIG with the trade key is
+marked **LIVE**. Agents never run any of this (CLAUDE.md hard rules 1 and 8).
+
+The examples use `ArnavJain2005/Bellwether` and a server you reach as `you@host`.
+
+## 1. Server setup (once)
+
+Python 3.11 is not in Ubuntu 24.04's own archive, so it comes from the deadsnakes PPA.
+
+```bash
+sudo apt update
+sudo apt install -y software-properties-common git sqlite3 chrony
+sudo add-apt-repository -y ppa:deadsnakes/ppa
+sudo apt update
+sudo apt install -y python3.11 python3.11-venv
+timedatectl   # "System clock synchronized: yes"
+```
+
+Create the service user and its folder:
+
+```bash
+sudo useradd --system --create-home --home-dir /home/bellwether --shell /usr/sbin/nologin bellwether
+sudo mkdir -p /opt/bellwether
+sudo chown bellwether:bellwether /opt/bellwether
+```
+
+## 2. Clone the private repository (read-only token)
+
+On GitHub: Settings → Developer settings → Fine-grained tokens → generate a token for
+**this repository only**, permission **Contents: Read-only**, short expiry.
+
+The token is typed at a hidden prompt, used once, and removed from the remote URL:
+
+```bash
+read -rs GH_TOKEN && export GH_TOKEN
+sudo -u bellwether git clone "https://oauth2:${GH_TOKEN}@github.com/ArnavJain2005/Bellwether.git" /opt/bellwether
+sudo -u bellwether git -C /opt/bellwether remote set-url origin https://github.com/ArnavJain2005/Bellwether.git
+unset GH_TOKEN
+```
+
+Later updates (paste the token again at the prompt; `git pull` asks for a username,
+type `oauth2`):
+
+```bash
+sudo -u bellwether git -C /opt/bellwether pull
+```
+
+## 3. Python environment
+
+```bash
+cd /opt/bellwether
+sudo -u bellwether python3.11 -m venv .venv
+sudo -u bellwether .venv/bin/pip install --upgrade pip
+sudo -u bellwether .venv/bin/pip install -e .
+if [ -f dashboard/requirements.txt ]; then sudo -u bellwether .venv/bin/pip install -r dashboard/requirements.txt; else sudo -u bellwether .venv/bin/pip install streamlit; fi
+sudo -u bellwether mkdir -p bot/state
+```
+
+## 4. Secrets file
+
+`/etc/bellwether.env` holds the key. systemd reads it as root; nobody prints it.
+
+```bash
+sudo install -m 600 -o root -g bellwether /dev/null /etc/bellwether.env
+sudoedit /etc/bellwether.env
+```
+
+Put exactly these two lines in it (your real key after the `=`), then save:
+
+```
+SUSQ_API_KEY=paste-the-key-here
+BOT_ARGS=--dry-run
+```
+
+Check the permissions (never `cat` the file):
+
+```bash
+sudo ls -l /etc/bellwether.env   # -rw------- 1 root bellwether
+```
+
+## 5. Install the services
+
+```bash
+sudo cp /opt/bellwether/deploy/bot.service /etc/systemd/system/bellwether-bot.service
+sudo cp /opt/bellwether/deploy/dashboard.service /etc/systemd/system/bellwether-dashboard.service
+sudo systemctl daemon-reload
+```
+
+## 6. Check the reference prices (no key, no SIG)
+
+```bash
+cd /opt/bellwether && sudo -u bellwether .venv/bin/python -m bot.refs_check
+```
+
+Every approved contract should show a Kalshi bid/ask and a fair value. `bot/map.yaml`
+must have approved contracts, or the bot refuses to start.
+
+## 7. The NO-price probe (LIVE, places two 1-share orders)
+
+Pick one approved exchange id from `bot/map.yaml` (`sig_exchange_id`). The probe runs as
+the service user with the key from the env file, in your terminal:
+
+```bash
+EXCHANGE_ID=941   # replace with an approved sig_exchange_id
+sudo systemd-run --uid=bellwether --gid=bellwether --property=EnvironmentFile=/etc/bellwether.env --working-directory=/opt/bellwether --pty --wait --collect /opt/bellwether/.venv/bin/python -m bot.probe --exchange "$EXCHANGE_ID" --i-am-arnav
+```
+
+It prints a verdict. Only if it says `no_price` or `yes_price`, set that line in
+`config/risk.yaml` (`no_price_convention: ...`), and `no_orders_enabled: true` only if
+you want NO orders. Otherwise leave both as they are.
+
+## 8. Start the dry run
+
+`BOT_ARGS=--dry-run` and `mode: dry_run` in `config/risk.yaml`. Nothing is sent: every
+order the bot would make is a `would_order` decision.
+
+```bash
+sudo systemctl enable --now bellwether-bot bellwether-dashboard
+systemctl status bellwether-bot --no-pager
+```
+
+## 9. Reading what it does
+
+```bash
+journalctl -u bellwether-bot -f
+journalctl -u bellwether-bot --since "15 min ago" --no-pager
+```
+
+```bash
+cd /opt/bellwether/bot/state
+sqlite3 -readonly -header -column bellwether.db "SELECT * FROM heartbeat;"
+sqlite3 -readonly -header -column bellwether.db "SELECT id, ts_utc, race_key, strategy, verdict, side, price_side, quantity, reason FROM decisions ORDER BY id DESC LIMIT 20;"
+sqlite3 -readonly -header -column bellwether.db "SELECT key, created_utc, race_key, side, price_side, quantity, status, sig_order_id, error FROM orders WHERE status IN ('journaled','sent','resting','unknown') ORDER BY created_utc DESC;"
+sqlite3 -readonly -header -column bellwether.db "SELECT id, ts_utc, kind, message FROM events WHERE level = 'error' ORDER BY id DESC LIMIT 20;"
+cat PAUSED 2>/dev/null || echo "not paused"
+```
+
+## 10. Dashboard over an SSH tunnel
+
+On your laptop:
+
+```bash
+ssh -N -L 8501:127.0.0.1:8501 you@host
+```
+
+Then open http://localhost:8501. The dashboard listens on 127.0.0.1 only.
+
+## 11. Go live (LIVE)
+
+Both switches are needed: `mode: live` in `config/risk.yaml` and `BOT_ARGS=--live`.
+
+1. In `config/risk.yaml` set `mode: live`, `scale` (0.10 first), and `start_balance`
+   (from the SIG app) so the loss stop works:
+
+   ```bash
+   sudo -u bellwether nano /opt/bellwether/config/risk.yaml
+   ```
+
+2. In the env file change `BOT_ARGS=--dry-run` to `BOT_ARGS=--live`:
+
+   ```bash
+   sudoedit /etc/bellwether.env
+   ```
+
+3. Restart and confirm the heartbeat says `live`:
+
+   ```bash
+   sudo systemctl restart bellwether-bot
+   sqlite3 -readonly /opt/bellwether/bot/state/bellwether.db "SELECT mode, paused, balance, committed FROM heartbeat;"
+   ```
+
+On a live start the bot first cancels every open order in the tournament. Raise
+`scale` later (0.5, then 1.0) the same way: edit, then restart.
+
+Also commit the same `config/risk.yaml` change to the repository, so a later
+`git pull` does not undo it or conflict.
+
+## 12. STOP
+
+```bash
+sudo -u bellwether touch /opt/bellwether/bot/state/STOP
+```
+
+Within one loop (10 s) a live bot cancels every open order, writes a stop event and
+exits 0; systemd does not restart it. To run again:
+
+```bash
+sudo -u bellwether rm /opt/bellwether/bot/state/STOP
+sudo systemctl start bellwether-bot
+```
+
+`sudo systemctl stop bellwether-bot` also cancels everything first when live.
+
+## 13. Resume after PAUSED
+
+PAUSED means no new orders; cancels still work and the heartbeat keeps running.
+
+1. Read why:
+
+   ```bash
+   cat /opt/bellwether/bot/state/PAUSED
+   sqlite3 -readonly -header -column /opt/bellwether/bot/state/bellwether.db "SELECT id, ts_utc, kind, message FROM events WHERE level = 'error' ORDER BY id DESC LIMIT 10;"
+   ```
+
+2. If an order is `unknown`, the bot sends nothing while it stays unknown. Check that
+   order in the SIG app (open orders, fills). Then stop the bot and record what you
+   found. Use `filled` with its real fill if it traded, otherwise `cancelled`:
+
+   ```bash
+   sudo systemctl stop bellwether-bot
+   sqlite3 /opt/bellwether/bot/state/bellwether.db "UPDATE orders SET status = 'cancelled', error = coalesce(error, '') || ' | resolved by Arnav: not on SIG' WHERE key = 'THE-KEY';"
+   ```
+
+3. Remove the pause file and start (or leave running if it was not stopped):
+
+   ```bash
+   sudo -u bellwether rm /opt/bellwether/bot/state/PAUSED
+   sudo systemctl start bellwether-bot
+   ```
+
+A `reconcile` pause in live mode returns while its cause remains, for example an open
+order you placed by hand in the SIG app. Cancel or let it finish first.
+
+## 14. Laptop fallback
+
+If the server is unavailable, run the bot from the repository on a laptop that stays
+awake and online. Use the same `config/risk.yaml`. The state folder is the laptop's
+own `bot/state/`.
+
+macOS (from the repository folder, with the venv):
+
+```bash
+read -rs SUSQ_API_KEY && export SUSQ_API_KEY
+caffeinate -dimsu .venv/bin/python -m bot.main --live
+```
+
+Windows PowerShell (from the repository folder). Keep the laptop plugged in and the lid
+open; the `powercfg` lines stop sleep on AC power until you undo them:
+
+```powershell
+powercfg /change standby-timeout-ac 0
+powercfg /change hibernate-timeout-ac 0
+$s = Read-Host -AsSecureString "SUSQ_API_KEY"
+$env:SUSQ_API_KEY = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($s))
+.venv\Scripts\python -m bot.main --live
+```
+
+Afterwards restore sleep (example values):
+
+```powershell
+powercfg /change standby-timeout-ac 30
+powercfg /change hibernate-timeout-ac 60
+```
+
+Dashboard on the laptop: `.venv/bin/streamlit run dashboard/app.py` (Windows:
+`.venv\Scripts\streamlit run dashboard\app.py`). STOP on a laptop: create the file
+`bot/state/STOP`, or press Ctrl+C, which cancels everything first when live.
+
+Never run the server and the laptop live at the same time: both would trade one
+account, each blind to the other's journal.

@@ -142,3 +142,36 @@ def insert_event(conn: sqlite3.Connection, level: str, kind: str, message: str) 
     return _insert(
         conn, "events", {"ts_utc": utc_stamp(), "level": level, "kind": kind, "message": message}
     )
+
+
+def _upsert(conn: sqlite3.Connection, table: str, key: str, row: dict[str, Any]) -> None:
+    cols = ", ".join(row)
+    marks = ", ".join("?" for _ in row)
+    sets = ", ".join(f"{name} = excluded.{name}" for name in row if name != key)
+    conn.execute(
+        f"INSERT INTO {table} ({cols}) VALUES ({marks}) ON CONFLICT({key}) DO UPDATE SET {sets}",
+        tuple(row.values()),
+    )
+    conn.commit()
+
+
+def upsert_heartbeat(conn: sqlite3.Connection, **row: Any) -> None:
+    """Rewrite the single heartbeat row (id = 1)."""
+    row["id"] = 1
+    row.setdefault("ts_utc", utc_stamp())
+    _upsert(conn, "heartbeat", "id", row)
+
+
+def upsert_quote(conn: sqlite3.Connection, **row: Any) -> None:
+    row.setdefault("ts_utc", utc_stamp())
+    _upsert(conn, "quotes_latest", "sig_exchange_id", row)
+
+
+def upsert_exposure(conn: sqlite3.Connection, **row: Any) -> None:
+    row.setdefault("ts_utc", utc_stamp())
+    _upsert(conn, "exposure", "race_key", row)
+
+
+def insert_snapshot(conn: sqlite3.Connection, **row: Any) -> int:
+    row.setdefault("ts_utc", utc_stamp())
+    return _insert(conn, "snapshots", row)

@@ -25,7 +25,7 @@ import logging
 import sqlite3
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -51,6 +51,10 @@ DEFAULT_RATE_LIMIT_WAIT_S = 60.0
 NO_RESPONSE_RETRIES = 3  # Arnav's decision (b): at most 3 retries within 5 minutes
 NO_RESPONSE_WINDOW_S = 300.0
 NO_RESPONSE_BACKOFF_S = (10.0, 30.0, 60.0)
+# Decision-row market columns a caller may fill through place(context=...).
+DECISION_CONTEXT = frozenset(
+    {"party", "sig_bid", "sig_ask", "kalshi_mid", "poly_mid", "fair", "edge"}
+)
 
 
 class OrderReader(Protocol):
@@ -155,6 +159,7 @@ class OrderPath:
         live: bool = False,
         state_dir: Path = STATE_DIR,
         balance: Callable[[], Awaitable[Decimal | None]] | None = None,
+        extra_committed: Callable[[], Decimal] | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
@@ -168,11 +173,13 @@ class OrderPath:
         self._live = live
         self._state_dir = Path(state_dir)
         self._balance = balance or self._read_balance
+        self._extra_committed = extra_committed or (lambda: Decimal(0))
         self._clock = clock
         self._sleep = sleep
         self._now = now
         self._new_key = new_key
         self._lock = asyncio.Lock()
+        self._context: dict[str, Any] = {}
 
     def __repr__(self) -> str:
         return f"OrderPath(mode={self._limits.mode!r}, live={self._live})"
@@ -194,14 +201,27 @@ class OrderPath:
     # --- placement ------------------------------------------------------------------
 
     async def place(
-        self, intent: Intent, *, probe: bool = False, expiry_seconds: int | None = None
+        self,
+        intent: Intent,
+        *,
+        probe: bool = False,
+        expiry_seconds: int | None = None,
+        context: Mapping[str, Any] | None = None,
     ) -> OrderRecord:
+        """`context` fills the decision row's market columns (DECISION_CONTEXT only)."""
         async with self._lock:
-            return await self._place(intent, probe=probe, expiry_seconds=expiry_seconds)
+            self._context = {k: v for k, v in (context or {}).items() if k in DECISION_CONTEXT}
+            try:
+                return await self._place(intent, probe=probe, expiry_seconds=expiry_seconds)
+            finally:
+                self._context = {}
 
     def _decision(self, intent: Intent, verdict: str, reason: str, key: str | None = None) -> None:
+        if intent.reason and verdict != "order":
+            reason = f"{intent.reason}; {reason}"
         db.insert_decision(
             self._conn,
+            **self._context,
             race_key=intent.race_key,
             sig_exchange_id=intent.sig_exchange_id,
             strategy=intent.strategy,
@@ -228,6 +248,7 @@ class OrderPath:
             balance=balance,
             writes_last_min=self._limiter.used(RequestKind.WRITE),
             state_dir=self._state_dir,
+            extra_committed=self._extra_committed(),
         )
         result = risk.check(intent, state, probe=probe)
         if not result.allowed:
@@ -296,20 +317,20 @@ class OrderPath:
         key = row["key"]
         status_tries = in_flight = rate_limited = no_response = 0
         first_no_response: float | None = None
-        sent_once = False
+        attempts = 0  # requests sent for this key, with or without a response
         while True:
             try:
                 response = await self._writer.post_order(body)
             except SigRateBudgetError:
                 # Admission refused before sending; earlier attempts may have landed.
-                if sent_once:
+                if attempts:
                     self._unknown(key, "write admission blocked during retries")
                 else:
                     db.update_order(self._conn, key, status="rejected", error="rate budget")
                     self.pause(f"order {key}: write admission blocked")
                 return
             except WriteNoResponse as exc:
-                sent_once = True
+                attempts += 1
                 no_response += 1
                 if first_no_response is None:
                     first_no_response = self._clock()
@@ -322,9 +343,23 @@ class OrderPath:
                     return
                 await self._sleep(wait)
                 continue
-            sent_once = True
+            attempts += 1
             db.update_order(self._conn, key, http_status=response.status)
             status, code = response.status, response.code
+            retry_answer_expected = status in (200, 429, 502, 503) or (
+                status == 409 and code == "REQUEST_IN_FLIGHT"
+            )
+            if attempts > 1 and not retry_answer_expected:
+                # A retry resends the identical bytes, including an expirationDate that
+                # may now be past, so a refusal says nothing about the earlier attempt.
+                # Only a first attempt can be 'rejected'.
+                self._unknown(
+                    key,
+                    f"retry refused with HTTP {status} {code or '-'}: the earlier attempt "
+                    "may have been placed",
+                    http_status=status,
+                )
+                return
             if status == 200:
                 self._apply_success(row, response, intent, probe)
                 return
@@ -476,19 +511,24 @@ class OrderPath:
         db.insert_event(self._conn, level, "stop", f"cancel all ({reason}): {outcome}")
         await self.refresh_statuses()
 
-    async def refresh_statuses(self) -> None:
+    async def refresh_statuses(self, walk: Any = None) -> None:
         """Close journaled resting orders that SIG no longer lists as open.
 
-        Each one's fills are read; on any read failure its status is left unchanged
-        (it keeps counting as committed).
+        `walk` is an open-orders read the caller already made; without one it is read
+        here. Each closed order's fills are read; on any read failure its status is left
+        unchanged (it keeps counting as committed).
         """
-        try:
-            walk = await self._reader.read_open_orders()
-        except SigClientError as exc:
-            db.insert_event(
-                self._conn, "warn", "reconcile", f"open-orders read failed: {type(exc).__name__}"
-            )
-            return
+        if walk is None:
+            try:
+                walk = await self._reader.read_open_orders()
+            except SigClientError as exc:
+                db.insert_event(
+                    self._conn,
+                    "warn",
+                    "reconcile",
+                    f"open-orders read failed: {type(exc).__name__}",
+                )
+                return
         open_ids = {str(order.id) for order in walk.orders}
         closed = 0
         for row in db.orders_with_status(self._conn, "resting"):

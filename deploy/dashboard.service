@@ -1,0 +1,29 @@
+# Election-week dashboard (DASH-EW). Install as /etc/systemd/system/bellwether-dashboard.service.
+# Listens on 127.0.0.1 only: reach it through an SSH tunnel. It gets no API key.
+[Unit]
+Description=Bellwether election-week dashboard
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=bellwether
+Group=bellwether
+WorkingDirectory=/opt/bellwether
+# Streamlit keeps its own files under $HOME: give it a private writable directory.
+StateDirectory=bellwether-dashboard
+Environment=HOME=/var/lib/bellwether-dashboard
+ExecStart=/opt/bellwether/.venv/bin/streamlit run dashboard/app.py --server.address 127.0.0.1 --server.port 8501 --server.headless true --browser.gatherUsageStats false
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+# The dashboard reads bot/state read-only and may write only bot/state/STOP.
+ReadWritePaths=/opt/bellwether/bot/state
+
+[Install]
+WantedBy=multi-user.target

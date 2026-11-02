@@ -1,0 +1,31 @@
+# Election-week bot (BOT-EW). Install as /etc/systemd/system/bellwether-bot.service.
+# BOT_ARGS comes from /etc/bellwether.env: --dry-run (default) or --live.
+# A STOP file makes the bot cancel all and exit 0, which on-failure does not restart.
+[Unit]
+Description=Bellwether election-week bot
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=bellwether
+Group=bellwether
+WorkingDirectory=/opt/bellwether
+EnvironmentFile=/etc/bellwether.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/bellwether/.venv/bin/python -m bot.main $BOT_ARGS
+Restart=on-failure
+RestartSec=30
+# SIGTERM -> live: cancel all (repeats for up to 60 s), then exit.
+KillSignal=SIGTERM
+TimeoutStopSec=90
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/bellwether/bot/state
+
+[Install]
+WantedBy=multi-user.target

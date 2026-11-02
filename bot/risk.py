@@ -14,6 +14,14 @@ Committed (conservative where the wire is unresolved):
 - rejected orders count nothing; preexisting_committed is added once to the total.
 A probe NO order's price convention is unknown (OQ-W3), so it counts at
 max(p, 1 - p) per share.
+
+Loss stop: buying moves cash into positions, so cash alone falls with every ordinary
+buy. The loss check compares an equity proxy, balance + journal_committed (what the
+journal's own orders commit, without preexisting_committed or orders outside the
+journal), against start_balance - effective loss_stop. It is only a proxy: the journal
+counts what was paid, so it does not catch mark-to-market losses on open positions,
+nor a position that settles at zero while its filled cost still counts. The reserve and
+the per-order, per-race and total caps still use cash and committed as before.
 """
 
 from __future__ import annotations
@@ -63,6 +71,8 @@ class RiskState:
     race_committed: Decimal  # this intent's race only
     writes_last_min: int
     unknown_orders: int
+    # The journal's own orders only (no preexisting, no external): the loss-stop proxy.
+    journal_committed: Decimal
     state_dir: Path = STATE_DIR
 
 
@@ -142,17 +152,20 @@ def build_state(
     balance: Decimal | None,
     writes_last_min: int,
     state_dir: Path = STATE_DIR,
+    extra_committed: Decimal = Decimal(0),
 ) -> RiskState:
+    """`extra_committed` adds to the total only (open SIG orders not in the journal)."""
     rows = conn.execute("SELECT * FROM orders").fetchall()
     total, by_race = committed(rows, limits)
     unknown = sum(1 for row in rows if row["status"] == "unknown")
     return RiskState(
         limits=limits,
         balance=balance,
-        total_committed=total,
+        total_committed=total + extra_committed,
         race_committed=by_race.get(race_key, Decimal(0)),
         writes_last_min=writes_last_min,
         unknown_orders=unknown,
+        journal_committed=total - limits.preexisting_committed,
         state_dir=state_dir,
     )
 
@@ -207,9 +220,11 @@ def check(intent: Intent, state: RiskState, *, probe: bool = False) -> RiskResul
     if state.balance is None:
         return _deny("tournament balance is unknown: no new orders")
     loss_stop = limits.effective_cap("loss_stop")
-    if limits.start_balance is not None and state.balance < limits.start_balance - loss_stop:
+    equity = state.balance + state.journal_committed  # a proxy: see the module docstring
+    if limits.start_balance is not None and equity < limits.start_balance - loss_stop:
         return _deny(
-            f"loss stop: balance {state.balance} is below start {limits.start_balance} "
+            f"loss stop: balance {state.balance} + journal committed "
+            f"{state.journal_committed} = {equity} is below start {limits.start_balance} "
             f"minus {loss_stop}"
         )
     if state.writes_last_min >= limits.max_writes_per_min:

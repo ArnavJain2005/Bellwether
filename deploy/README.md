@@ -10,6 +10,11 @@ Roadmap track **H1** (PRD): ₹0 hosting verification and deployment preparation
 > launcher, because no real engine interface exists for one to start
 > ([`design.md` section 1](design.md#1-what-the-repository-can-run-today)).
 
+> **Election-week exception (BOT-EW, Nov 2–5, 2026).** `bot.service`, `dashboard.service`
+> and [`BOT_RUNBOOK.md`](BOT_RUNBOOK.md) run the election-week bot in `bot/`, not the
+> engine. They are covered by the CLAUDE.md exception; everything below is about the
+> engine and still applies to it.
+
 | File | What it is | Who acts on it |
 | --- | --- | --- |
 | [`hosting-evidence.md`](hosting-evidence.md) | The account evidence checklist for OQ-H1 to OQ-H4. It also holds the official documentation checked, the candidate decision table and the G-9 status | Arnav collects the evidence |
