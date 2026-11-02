@@ -142,14 +142,16 @@ def build_state(
     balance: Decimal | None,
     writes_last_min: int,
     state_dir: Path = STATE_DIR,
+    extra_committed: Decimal = Decimal(0),
 ) -> RiskState:
+    """`extra_committed` adds to the total only (open SIG orders not in the journal)."""
     rows = conn.execute("SELECT * FROM orders").fetchall()
     total, by_race = committed(rows, limits)
     unknown = sum(1 for row in rows if row["status"] == "unknown")
     return RiskState(
         limits=limits,
         balance=balance,
-        total_committed=total,
+        total_committed=total + extra_committed,
         race_committed=by_race.get(race_key, Decimal(0)),
         writes_last_min=writes_last_min,
         unknown_orders=unknown,
