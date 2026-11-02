@@ -37,3 +37,6 @@ Thumbs.db
 
 # Local SIG captures from engine/sig_client/record_fixtures.py (unreviewed; see its RECORDER.md)
 /sig_captures/
+
+# Election-week bot runtime state
+bot/state/
