@@ -13,6 +13,8 @@ dependencies = [
     "pydantic>=2",
     "pyyaml",
     "pytest",
+    # config/risk.yaml for the election-week bot (bot/limits.py).
+    "pyyaml",
     "ruff==0.16.10",
     # The realtime socket adapter (engine/sig_client/realtime_socket.py). Pinned: its
     # precision proof and protocol notes cite this exact version's source.
@@ -28,6 +30,7 @@ include-package-data = false
 # explicitly. Everything else (tests, dashboard, data, docs, config, markets) is left out.
 # namespaces = false: a folder is installed only once it has an __init__.py.
 include = [
+    "bot",
     "engine", "engine.*",
     "models", "models.*",
     "mock_exchange", "mock_exchange.*",
