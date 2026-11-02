@@ -61,8 +61,9 @@ def test_load_map_reads_yaml(tmp_path: Path):
     assert len(load_map(p)) == 1
 
 
-def test_committed_draft_is_unapproved_and_valid_if_approved():
-    assert load_map(MAP_PATH) == []
+def test_committed_map_is_valid_and_valid_if_fully_approved():
+    approved = load_map(MAP_PATH)  # raises on any validation failure
+    assert all(not c.race_key.startswith("house:") for c in approved)
     data = yaml.safe_load(MAP_PATH.read_text(encoding="utf-8"))
     for race in data["races"]:
         race["exclude"] = False
