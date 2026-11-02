@@ -1,7 +1,8 @@
-"""Bellwether Election-Week Read-Only Monitor (Tasks DASH-EW-1 & DASH-EW-2).
+"""Bellwether Election-Week Monitor (Tasks DASH-EW-1, DASH-EW-2 & DASH-EW-3).
 
-Streamlit single-screen monitor that reads ``bot/state/bellwether.db`` strictly
-in read-only mode (`mode=ro`) following ``bot/CONTRACT.md`` and ``AGENTS.md``.
+Streamlit monitor that reads ``bot/state/bellwether.db`` strictly in read-only mode
+(`mode=ro`) following ``bot/CONTRACT.md`` and ``AGENTS.md``, and provides the
+confirmation-gated ``STOP BOT`` control that atomically creates ``bot/state/STOP``.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from dashboard.db import (
     DEFAULT_HISTORY_HOURS,
     OPEN_ORDER_STATUSES,
     QUOTE_STALE_SECONDS,
+    STOP_CONTRACT_PATH,
     FilterCriteria,
     HeartbeatState,
     HeroMetrics,
@@ -32,6 +34,7 @@ from dashboard.db import (
     ParsedPnlResult,
     ParsedPositionsResult,
     SnapshotHistoryResult,
+    StopWriteResult,
     TableResult,
     collect_filter_options,
     compute_age_seconds,
@@ -45,6 +48,7 @@ from dashboard.db import (
     format_susq,
     load_monitor_snapshot,
     parse_decimal,
+    write_stop_file,
 )
 
 AUTO_REFRESH_SECONDS = 3
@@ -85,14 +89,14 @@ def render_heartbeat_banner_html(
     criteria: FilterCriteria | None = None,
 ) -> str:
     """Build the top-of-page Heartbeat Banner HTML."""
-    status_slug = hb.status.lower().replace(" ", "-")
+    status_slug = "-".join(hb.status.lower().split())
     age_text = f"AGE: {hb.age_display}"
 
     if hb.stop_file_exists or hb.db_stop_seen:
         stop_label = (
-            "STOP: FILE PRESENT"
+            "STOP FILE PRESENT"
             if hb.stop_file_exists and not hb.db_stop_seen
-            else "STOP: ACTIVE (FILE + DB)"
+            else "STOP FILE PRESENT (STOP: ACTIVE)"
             if hb.stop_file_exists and hb.db_stop_seen
             else "STOP: DB SEEN"
         )
@@ -982,6 +986,63 @@ def render_db_busy_banner_html(snapshot: MonitorSnapshot) -> str:
     )
 
 
+def render_stop_confirmation_html() -> str:
+    """Render the confirmation prompt banner shown when STOP BOT is clicked."""
+    return (
+        f'<div class="bw-stop-confirm-banner" data-testid="stop-confirm-banner">'
+        f'  <span class="bw-stop-confirm-badge">CONFIRM STOP</span>'
+        f'  <span class="bw-stop-confirm-msg">'
+        f"    This creates <code>{_esc(STOP_CONTRACT_PATH)}</code> and halts trading. Confirm?"
+        f"  </span>"
+        f'  <span class="bw-stop-confirm-note">3s AUTO-REFRESH PAUSED</span>'
+        f"</div>"
+    )
+
+
+def render_stop_result_banner_html(result: StopWriteResult) -> str:
+    """Render the success or failure result banner after a STOP write attempt."""
+    if result.ok:
+        return (
+            f'<div class="bw-stop-result-banner bw-stop-result-ok" data-testid="stop-result-banner">'
+            f'  <span><strong>STOP FILE PRESENT</strong> — Created <code>{_esc(result.stop_path)}</code> '
+            f'at <strong>{_esc(result.ts_ist)}</strong> (payload: <code>{_esc(result.content)}</code>)</span>'
+            f'  <span>MANUAL REMOVAL OF bot/state/STOP REQUIRED TO CLEAR</span>'
+            f"</div>"
+        )
+    if result.already_existed:
+        return (
+            f'<div class="bw-stop-result-banner bw-stop-result-warn" data-testid="stop-result-banner">'
+            f'  <span><strong>STOP FILE PRESENT</strong> — {_esc(result.message)}</span>'
+            f'  <span>Checked at {_esc(result.ts_ist)}</span>'
+            f"</div>"
+        )
+    return (
+        f'<div class="bw-stop-result-banner bw-stop-result-err" data-testid="stop-result-banner">'
+        f'  <span><strong>{_esc(result.message)}</strong></span>'
+        f'  <span>Target: <code>{_esc(result.stop_path)}</code> | Attempted at {_esc(result.ts_ist)}</span>'
+        f"</div>"
+    )
+
+
+def _open_stop_confirmation() -> None:
+    """Open the STOP confirmation step and pause auto-refresh without writing anything."""
+    st.session_state["confirm_open"] = True
+    st.session_state["stop_write_result"] = None
+
+
+def _cancel_stop_action() -> None:
+    """Cancel the STOP confirmation step without writing anything."""
+    st.session_state["confirm_open"] = False
+
+
+def _confirm_stop_action() -> None:
+    """Execute the confirmed STOP file creation once and store the result."""
+    if not st.session_state.get("confirm_open", False):
+        return
+    st.session_state["confirm_open"] = False
+    st.session_state["stop_write_result"] = write_stop_file()
+
+
 def _render_sidebar_filters(snapshot: MonitorSnapshot) -> FilterCriteria:
     """Render sidebar filter controls (`race_key`, `strategy`, `status/verdict`) and persist in session_state."""
     for key in ("filter_race_key", "filter_strategy", "filter_status_verdict"):
@@ -1030,17 +1091,74 @@ def render_monitor_body(
 ) -> None:
     """Render the full monitor content across Tab 1 (Live Monitor) and Tab 2 (Positions, P&L & History)."""
     active_criteria = criteria or FilterCriteria()
+    stop_result = st.session_state.get("stop_write_result")
+    stop_active = bool(
+        snapshot.heartbeat.stop_file_exists
+        or (
+            isinstance(stop_result, StopWriteResult)
+            and (stop_result.ok or stop_result.already_existed)
+            and stop_result.stop_path.is_file()
+        )
+    )
+
     if snapshot.db_busy:
         st.markdown(render_db_busy_banner_html(snapshot), unsafe_allow_html=True)
-    st.markdown(
-        render_heartbeat_banner_html(
-            snapshot.heartbeat,
-            snapshot.fetched_at_ist,
-            refresh_paused,
-            criteria=active_criteria,
-        ),
-        unsafe_allow_html=True,
-    )
+
+    banner_col, stop_col = st.columns([6.4, 1.0], gap="small")
+    with banner_col:
+        st.markdown(
+            render_heartbeat_banner_html(
+                snapshot.heartbeat,
+                snapshot.fetched_at_ist,
+                refresh_paused,
+                criteria=active_criteria,
+            ),
+            unsafe_allow_html=True,
+        )
+    with stop_col:
+        if stop_active:
+            st.button(
+                "STOP ACTIVE",
+                key="stop_bot_btn",
+                disabled=True,
+                width="stretch",
+            )
+        else:
+            st.button(
+                "STOP BOT",
+                key="stop_bot_btn",
+                disabled=refresh_paused,
+                type="primary",
+                on_click=_open_stop_confirmation,
+                width="stretch",
+            )
+
+    if refresh_paused and not stop_active:
+        msg_col, conf_col, canc_col = st.columns([4.8, 0.8, 0.8], gap="small")
+        with msg_col:
+            st.markdown(render_stop_confirmation_html(), unsafe_allow_html=True)
+        with conf_col:
+            st.button(
+                "Confirm",
+                key="confirm_stop_btn",
+                type="primary",
+                on_click=_confirm_stop_action,
+                width="stretch",
+            )
+        with canc_col:
+            st.button(
+                "Cancel",
+                key="cancel_stop_btn",
+                on_click=_cancel_stop_action,
+                width="stretch",
+            )
+
+    if isinstance(stop_result, StopWriteResult):
+        st.markdown(
+            render_stop_result_banner_html(stop_result),
+            unsafe_allow_html=True,
+        )
+
     st.markdown(render_hero_row_html(snapshot.hero), unsafe_allow_html=True)
 
     tab_live, tab_pos_hist = st.tabs(
@@ -1117,20 +1235,27 @@ def main() -> None:
 
     if "confirm_open" not in st.session_state:
         st.session_state["confirm_open"] = False
+    if "stop_write_result" not in st.session_state:
+        st.session_state["stop_write_result"] = None
 
     initial_snapshot = load_monitor_snapshot(history_hours=DEFAULT_HISTORY_HOURS)
     _render_sidebar_filters(initial_snapshot)
 
     confirm_open = bool(st.session_state.get("confirm_open", False))
+    st.session_state["_fragment_confirm_bound"] = confirm_open
     run_every = None if confirm_open else f"{AUTO_REFRESH_SECONDS}s"
 
     @st.fragment(run_every=run_every)
     def _live_monitor_fragment() -> None:
+        live_confirm = bool(st.session_state.get("confirm_open", False))
+        if st.session_state.get("_fragment_confirm_bound") != live_confirm:
+            st.session_state["_fragment_confirm_bound"] = live_confirm
+            st.rerun()
         snapshot = load_monitor_snapshot(history_hours=DEFAULT_HISTORY_HOURS)
         criteria = _current_filter_criteria()
         render_monitor_body(
             snapshot,
-            refresh_paused=confirm_open,
+            refresh_paused=live_confirm,
             criteria=criteria,
         )
 
