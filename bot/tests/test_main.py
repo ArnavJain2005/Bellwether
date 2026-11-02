@@ -442,3 +442,45 @@ def test_reads_stay_within_80_per_minute_with_120_exchanges(tmp_path):
     assert iterations >= 29  # the loop kept its pace; the limiter never had to stall it
     assert rig.sig.writes() == []
     assert isinstance(rig.bot, Bot)
+
+
+# --- one order per exchange per loop, and the loss stop on simulated buys ----------------
+
+
+def test_exchange_with_an_order_this_loop_is_skipped_by_later_evaluations(tmp_path):
+    rig = make_loop(tmp_path, races=1)
+    d, r = list(rig.bot.contracts)
+    rig.sig.quotes[d] = (D("0.35"), D("0.40"))  # complement (0.40 + 0.50) and reference on D
+    rig.sig.quotes[r] = (D("0.45"), D("0.50"))
+    rig.kalshi.quotes = {"K0-R": ("0.49", "0.51")}  # D keeps fair 0.48: reference edge on D
+
+    async def go():
+        await rig.bot.startup()
+        await rig.bot.iteration()
+
+    run(go())
+    would = rig.decisions("would_order")
+    assert [(w["strategy"], w["sig_exchange_id"]) for w in would] == [
+        ("complement", d),
+        ("complement", r),
+    ]
+    skipped = [s for s in rig.decisions("skip") if s["sig_exchange_id"] == d]
+    assert any(
+        s["strategy"] == "reference" and "exchange already has an order this loop" in s["reason"]
+        for s in skipped
+    )
+
+
+def test_simulated_buys_do_not_trip_the_loss_stop(tmp_path):
+    # 5 dry-run orders of 50 = 250 > the 200 loss stop: cash-only would trip it.
+    rig = make_loop(tmp_path, races=5, limits=make_limits(mode="dry_run", start_balance=100000))
+    with_edges(rig, 10)
+    rig.sig.balance = D(99900)  # 100 below start: 2 more simulated orders reach the stop
+
+    async def go():
+        await rig.bot.startup()
+        await rig.bot.iteration()
+
+    run(go())
+    assert len(rig.decisions("would_order")) == 5
+    assert not [x for x in rig.conn.execute("SELECT reason FROM decisions") if "loss stop" in x[0]]

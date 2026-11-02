@@ -145,6 +145,7 @@ class Bot:
         self._stop_seen = False
         self._loop_ms = 0
         self._quotes: dict[str, SigQuote] = {}
+        self._ordered_this_loop: set[str] = set()
 
     @property
     def mode(self) -> str:
@@ -406,6 +407,7 @@ class Bot:
         )
         self.loop_balance = None
         self.batch_spent = Decimal(0)
+        self._ordered_this_loop = set()
         paused = self.paused()
         sent = 0
         for ev in evaluations:
@@ -414,6 +416,10 @@ class Bot:
                 continue
             if paused:  # no reads spent on orders that risk.check would refuse
                 self._skip(ev, f"{ev.reason}; not sent: PAUSED")
+                continue
+            # Evaluations were made before this loop's orders: one order per exchange.
+            if any(leg.contract.sig_exchange_id in self._ordered_this_loop for leg in ev.legs):
+                self._skip(ev, f"{ev.reason}; not sent: exchange already has an order this loop")
                 continue
             if sent + len(ev.legs) > MAX_ORDERS_PER_LOOP:
                 self._skip(ev, f"{ev.reason}; not sent: {MAX_ORDERS_PER_LOOP} orders this loop")
@@ -454,8 +460,13 @@ class Bot:
             record = await self.path.place(intent, context=self._leg_context(ev, leg))
             if record.status != "blocked":
                 self.last_order[leg.contract.sig_exchange_id] = now
+                self._ordered_this_loop.add(leg.contract.sig_exchange_id)
                 placed += 1
-            if record.status in SENT_STATUSES or record.status == "would_order":
+            # Only journaled orders lower the balance risk sees: the journal adds the
+            # same cost back in the loss-stop proxy. A dry-run 'would_order' has no
+            # journal row, so subtracting it would make the proxy fall and trip the
+            # loss stop on simulated buys.
+            if record.status in SENT_STATUSES:
                 self.batch_spent += leg.price_side * quantity
             if record.status not in ("resting", "filled", "partial", "would_order"):
                 if index == 0 and len(ev.legs) > 1:
@@ -528,10 +539,13 @@ class Bot:
                 if not risk.check(self._intent(ev, leg, q), s).allowed:
                     return False
                 cost = leg.price_side * q
+                # The leg becomes a journaled order: cash down, journal up by the same
+                # cost, so the loss-stop proxy (balance + journal) is unchanged.
                 s = dataclasses.replace(
                     s,
                     total_committed=s.total_committed + cost,
                     race_committed=s.race_committed + cost,
+                    journal_committed=s.journal_committed + cost,
                     balance=None if s.balance is None else s.balance - cost,
                 )
             return True
