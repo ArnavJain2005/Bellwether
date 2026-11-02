@@ -1,0 +1,1711 @@
+races:
+- race_key: senate:AK
+  exclude: true
+  note: 'AK: runoff / ranked-choice risk'
+  contracts:
+  - party: D
+    sig_market_id: '377'
+    sig_exchange_id: '1066'
+    sig_title: Will the Democratic Party win the Alaska Senate?
+    kalshi_ticker: SENATEAK-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '378'
+    sig_exchange_id: '1067'
+    sig_title: Will the Republican Party win the Alaska Senate?
+    kalshi_ticker: SENATEAK-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: senate:AL
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '252'
+    sig_exchange_id: '941'
+    sig_title: Will the Democratic Party win the Alabama Senate?
+    kalshi_ticker: SENATEAL-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '253'
+    sig_exchange_id: '942'
+    sig_title: Will the Republican Party win the Alabama Senate?
+    kalshi_ticker: SENATEAL-26-R
+    polymarket_token_id: '95119856323193627993348587708417756152568014985721929036628780323821873817569'
+    approved: false
+- race_key: senate:AR
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '254'
+    sig_exchange_id: '943'
+    sig_title: Will the Democratic Party win the Arkansas Senate?
+    kalshi_ticker: SENATEAR-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '255'
+    sig_exchange_id: '944'
+    sig_title: Will the Republican Party win the Arkansas Senate?
+    kalshi_ticker: SENATEAR-26-R
+    polymarket_token_id: '48125407658537781630126353551882211313520827583468729408685633955919030034320'
+    approved: false
+- race_key: senate:CO
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '256'
+    sig_exchange_id: '945'
+    sig_title: Will the Democratic Party win the Colorado Senate?
+    kalshi_ticker: SENATECO-26-D
+    polymarket_token_id: '68194463917260305435439145066031544476540679280823247532132832363696000101185'
+    approved: false
+  - party: R
+    sig_market_id: '257'
+    sig_exchange_id: '946'
+    sig_title: Will the Republican Party win the Colorado Senate?
+    kalshi_ticker: SENATECO-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: senate:DE
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '353'
+    sig_exchange_id: '1042'
+    sig_title: Will the Democratic Party win the Delaware Senate?
+    kalshi_ticker: SENATEDE-26-D
+    polymarket_token_id: '109467029375682717672947466588331781838347232688418556926634334189471462678711'
+    approved: false
+  - party: R
+    sig_market_id: '386'
+    sig_exchange_id: '1075'
+    sig_title: Will the Republican Party win the Delaware Senate?
+    kalshi_ticker: SENATEDE-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: senate:GA
+  exclude: true
+  note: 'GA: runoff / ranked-choice risk'
+  contracts:
+  - party: D
+    sig_market_id: '258'
+    sig_exchange_id: '947'
+    sig_title: Will the Democratic Party win the Georgia Senate?
+    kalshi_ticker: SENATEGA-26-D
+    polymarket_token_id: '21024219148268989748704207701411444044468128261642675917026452687231462203167'
+    approved: false
+  - party: R
+    sig_market_id: '259'
+    sig_exchange_id: '948'
+    sig_title: Will the Republican Party win the Georgia Senate?
+    kalshi_ticker: SENATEGA-26-R
+    polymarket_token_id: '43777191461245536274027792855557351629362906569064322165760098912770293918104'
+    approved: false
+- race_key: senate:IA
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '260'
+    sig_exchange_id: '949'
+    sig_title: Will the Democratic Party win the Iowa Senate?
+    kalshi_ticker: SENATEIA-26-D
+    polymarket_token_id: '90689690530039118737607894922148077480097700217322320781526913496162509181445'
+    approved: false
+  - party: R
+    sig_market_id: '261'
+    sig_exchange_id: '950'
+    sig_title: Will the Republican Party win the Iowa Senate?
+    kalshi_ticker: SENATEIA-26-R
+    polymarket_token_id: '107844449523890311740907586041395758413047559802389895859202256336422357556837'
+    approved: false
+- race_key: senate:ID
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '262'
+    sig_exchange_id: '951'
+    sig_title: Will the Democratic Party win the Idaho Senate?
+    kalshi_ticker: SENATEID-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '263'
+    sig_exchange_id: '952'
+    sig_title: Will the Republican Party win the Idaho Senate?
+    kalshi_ticker: SENATEID-26-R
+    polymarket_token_id: '6756779810577885828704276397389282544084821591107025125954859235939281991675'
+    approved: false
+- race_key: senate:IL
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '264'
+    sig_exchange_id: '953'
+    sig_title: Will the Democratic Party win the Illinois Senate?
+    kalshi_ticker: SENATEIL-26-D
+    polymarket_token_id: '3015477455071606958014729552697672689898195807324746948280693702257424620276'
+    approved: false
+  - party: R
+    sig_market_id: '265'
+    sig_exchange_id: '954'
+    sig_title: Will the Republican Party win the Illinois Senate?
+    kalshi_ticker: SENATEIL-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: senate:KS
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '356'
+    sig_exchange_id: '1045'
+    sig_title: Will the Democratic Party win the Kansas Senate?
+    kalshi_ticker: SENATEKS-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '357'
+    sig_exchange_id: '1046'
+    sig_title: Will the Republican Party win the Kansas Senate?
+    kalshi_ticker: SENATEKS-26-R
+    polymarket_token_id: '18131974965869813060047290511060211742274666573066200470724290584768041211203'
+    approved: false
+- race_key: senate:MA
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '379'
+    sig_exchange_id: '1068'
+    sig_title: Will the Democratic Party win the Massachusetts Senate?
+    kalshi_ticker: SENATEMA-26-D
+    polymarket_token_id: '37806907368043161074949113436745462734936336037202698916361016094424427186209'
+    approved: false
+  - party: R
+    sig_market_id: '380'
+    sig_exchange_id: '1069'
+    sig_title: Will the Republican Party win the Massachusetts Senate?
+    kalshi_ticker: SENATEMA-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: senate:ME
+  exclude: true
+  note: 'ME: runoff / ranked-choice risk'
+  contracts:
+  - party: D
+    sig_market_id: '270'
+    sig_exchange_id: '959'
+    sig_title: Will the Democratic Party win the Maine Senate?
+    kalshi_ticker: SENATEME-26-D
+    polymarket_token_id: '7589880081658059374445882095611024032084645048848237404312287942463647821549'
+    approved: false
+  - party: R
+    sig_market_id: '271'
+    sig_exchange_id: '960'
+    sig_title: Will the Republican Party win the Maine Senate?
+    kalshi_ticker: SENATEME-26-R
+    polymarket_token_id: '2142948285506077695096498341598672159464223074468931276310105532825810210121'
+    approved: false
+- race_key: senate:MI
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '358'
+    sig_exchange_id: '1047'
+    sig_title: Will the Democratic Party win the Michigan Senate?
+    kalshi_ticker: SENATEMI-26-D
+    polymarket_token_id: '71772627544132140586824126381855151743830987860593343955509593715269534710061'
+    approved: false
+  - party: R
+    sig_market_id: '359'
+    sig_exchange_id: '1048'
+    sig_title: Will the Republican Party win the Michigan Senate?
+    kalshi_ticker: SENATEMI-26-R
+    polymarket_token_id: '1046980875306043125128331871114794349002409233139736033870402475326170083426'
+    approved: false
+- race_key: senate:MN
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '360'
+    sig_exchange_id: '1049'
+    sig_title: Will the Democratic Party win the Minnesota Senate?
+    kalshi_ticker: SENATEMN-26-D
+    polymarket_token_id: '5210147086444382339849101722545511095151948730486562412029285471203011774407'
+    approved: false
+  - party: R
+    sig_market_id: '361'
+    sig_exchange_id: '1050'
+    sig_title: Will the Republican Party win the Minnesota Senate?
+    kalshi_ticker: SENATEMN-26-R
+    polymarket_token_id: '70179930004460104520571721963263381325865077807861641105900318902168490512539'
+    approved: false
+- race_key: senate:MS
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '272'
+    sig_exchange_id: '961'
+    sig_title: Will the Democratic Party win the Mississippi Senate?
+    kalshi_ticker: SENATEMS-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '273'
+    sig_exchange_id: '962'
+    sig_title: Will the Republican Party win the Mississippi Senate?
+    kalshi_ticker: SENATEMS-26-R
+    polymarket_token_id: '36589074670521348842786325911391532620430247097981345860356484520500173888573'
+    approved: false
+- race_key: senate:MT
+  exclude: true
+  note: 3 SIG contracts in this race; only 2 of 3 SIG contracts mapped
+  contracts:
+  - party: D
+    sig_market_id: '274'
+    sig_exchange_id: '963'
+    sig_title: Will the Democratic Party win the Montana Senate?
+    kalshi_ticker: SENATEMT-26-D
+    polymarket_token_id: '88799262678230165893255813616837100962595819984760588859765042402182443138810'
+    approved: false
+  - party: R
+    sig_market_id: '275'
+    sig_exchange_id: '964'
+    sig_title: Will the Republican Party win the Montana Senate?
+    kalshi_ticker: SENATEMT-26-R
+    polymarket_token_id: '102325039069045369431277041414667266705633344716966967751024692805337688459829'
+    approved: false
+- race_key: senate:NC
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '277'
+    sig_exchange_id: '966'
+    sig_title: Will the Democratic Party win the North Carolina Senate?
+    kalshi_ticker: SENATENC-26-D
+    polymarket_token_id: '107151098936186723859677628536733880558851060002514795735761427447010628440047'
+    approved: false
+  - party: R
+    sig_market_id: '278'
+    sig_exchange_id: '967'
+    sig_title: Will the Republican Party win the North Carolina Senate?
+    kalshi_ticker: SENATENC-26-R
+    polymarket_token_id: '62831517509825405761763142539845746280269675872170259538293560849475982647892'
+    approved: false
+- race_key: senate:NE
+  exclude: true
+  note: 3 SIG contracts in this race; only 2 of 3 SIG contracts mapped
+  contracts:
+  - party: D
+    sig_market_id: '279'
+    sig_exchange_id: '968'
+    sig_title: Will the Democratic Party win the Nebraska Senate?
+    kalshi_ticker: SENATENE-26-D
+    polymarket_token_id: '55269299240433422758148290868724152324629587438760275683104577693660207425448'
+    approved: false
+  - party: R
+    sig_market_id: '281'
+    sig_exchange_id: '970'
+    sig_title: Will the Republican Party win the Nebraska Senate?
+    kalshi_ticker: SENATENE-26-R
+    polymarket_token_id: '92576281548134350814800877416860562553699794074017301653635964206220838638047'
+    approved: false
+- race_key: senate:NH
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '381'
+    sig_exchange_id: '1070'
+    sig_title: Will the Democratic Party win the New Hampshire Senate?
+    kalshi_ticker: SENATENH-26-D
+    polymarket_token_id: '82410058691149830741200014405570918770267839390767234397030380747995715352939'
+    approved: false
+  - party: R
+    sig_market_id: '382'
+    sig_exchange_id: '1071'
+    sig_title: Will the Republican Party win the New Hampshire Senate?
+    kalshi_ticker: SENATENH-26-R
+    polymarket_token_id: '62227089537100115269143206481757249285124282589590263790284791475153705872216'
+    approved: false
+- race_key: senate:NJ
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '282'
+    sig_exchange_id: '971'
+    sig_title: Will the Democratic Party win the New Jersey Senate?
+    kalshi_ticker: SENATENJ-26-D
+    polymarket_token_id: '57191420250913616150846676905047388827581537310894242160546701872955141155912'
+    approved: false
+  - party: R
+    sig_market_id: '283'
+    sig_exchange_id: '972'
+    sig_title: Will the Republican Party win the New Jersey Senate?
+    kalshi_ticker: SENATENJ-26-R
+    polymarket_token_id: '80469582416211324277551196813384851504222711072116234686695188046152640511225'
+    approved: false
+- race_key: senate:NM
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '284'
+    sig_exchange_id: '973'
+    sig_title: Will the Democratic Party win the New Mexico Senate?
+    kalshi_ticker: SENATENM-26-D
+    polymarket_token_id: '86827974851753312617441915824618617861250657564707166327567168877893121374182'
+    approved: false
+  - party: R
+    sig_market_id: '285'
+    sig_exchange_id: '974'
+    sig_title: Will the Republican Party win the New Mexico Senate?
+    kalshi_ticker: SENATENM-26-R
+    polymarket_token_id: '47410821361368319377218522333433306313753572972827491807608363074924233552004'
+    approved: false
+- race_key: senate:OK
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '383'
+    sig_exchange_id: '1072'
+    sig_title: Will the Democratic Party win the Oklahoma Senate?
+    kalshi_ticker: SENATEOK-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '286'
+    sig_exchange_id: '975'
+    sig_title: Will the Republican Party win the Oklahoma Senate?
+    kalshi_ticker: SENATEOK-26-R
+    polymarket_token_id: '83554519035704522672644117478876258278018394754028161940314277335853541553559'
+    approved: false
+- race_key: senate:OR
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '287'
+    sig_exchange_id: '976'
+    sig_title: Will the Democratic Party win the Oregon Senate?
+    kalshi_ticker: SENATEOR-26-D
+    polymarket_token_id: '2092757373218904768373533040846280132805161861393140519418262456097465213332'
+    approved: false
+  - party: R
+    sig_market_id: '288'
+    sig_exchange_id: '977'
+    sig_title: Will the Republican Party win the Oregon Senate?
+    kalshi_ticker: SENATEOR-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: senate:RI
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '387'
+    sig_exchange_id: '1076'
+    sig_title: Will the Democratic Party win the Rhode Island Senate?
+    kalshi_ticker: SENATERI-26-D
+    polymarket_token_id: '77004273724753899183699441849597881417275931290950171679615354396048734034984'
+    approved: false
+  - party: R
+    sig_market_id: '388'
+    sig_exchange_id: '1077'
+    sig_title: Will the Republican Party win the Rhode Island Senate?
+    kalshi_ticker: SENATERI-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: senate:SC
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '289'
+    sig_exchange_id: '978'
+    sig_title: Will the Democratic Party win the South Carolina Senate?
+    kalshi_ticker: SENATESC-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '290'
+    sig_exchange_id: '979'
+    sig_title: Will the Republican Party win the South Carolina Senate?
+    kalshi_ticker: SENATESC-26-R
+    polymarket_token_id: '84368524152268016512433556151474175385160499638069024812438264090070245734708'
+    approved: false
+- race_key: senate:SD
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '291'
+    sig_exchange_id: '980'
+    sig_title: Will the Democratic Party win the South Dakota Senate?
+    kalshi_ticker: SENATESD-26-D
+    polymarket_token_id: '67967023811721834738685695249992484419619114809767608640505747182577663027691'
+    approved: false
+  - party: R
+    sig_market_id: '292'
+    sig_exchange_id: '981'
+    sig_title: Will the Republican Party win the South Dakota Senate?
+    kalshi_ticker: SENATESD-26-R
+    polymarket_token_id: '90757273431062483956880101601137522271949785755347720675502304224330457712154'
+    approved: false
+- race_key: senate:TN
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '362'
+    sig_exchange_id: '1051'
+    sig_title: Will the Democratic Party win the Tennessee Senate?
+    kalshi_ticker: SENATETN-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '363'
+    sig_exchange_id: '1052'
+    sig_title: Will the Republican Party win the Tennessee Senate?
+    kalshi_ticker: SENATETN-26-R
+    polymarket_token_id: '23982348354062524972887126807952244605287433791462351968680411830837664790435'
+    approved: false
+- race_key: senate:TX
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '293'
+    sig_exchange_id: '982'
+    sig_title: Will the Democratic Party win the Texas Senate?
+    kalshi_ticker: SENATETX-26-D
+    polymarket_token_id: '15290572385458522370285732869432740297199321382471116558439914335588167718663'
+    approved: false
+  - party: R
+    sig_market_id: '294'
+    sig_exchange_id: '983'
+    sig_title: Will the Republican Party win the Texas Senate?
+    kalshi_ticker: SENATETX-26-R
+    polymarket_token_id: '21265207456609426291246075480390336499088453711419597084147957999650569091884'
+    approved: false
+- race_key: senate:VA
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '295'
+    sig_exchange_id: '984'
+    sig_title: Will the Democratic Party win the Virginia Senate?
+    kalshi_ticker: SENATEVA-26-D
+    polymarket_token_id: '103672405579571940023321290271521195736672061427193452636021280058761450574865'
+    approved: false
+  - party: R
+    sig_market_id: '364'
+    sig_exchange_id: '1053'
+    sig_title: Will the Republican Party win the Virginia Senate?
+    kalshi_ticker: SENATEVA-26-R
+    polymarket_token_id: '30879673422883665658998557649780314115615509792114924412311244164523672753717'
+    approved: false
+- race_key: senate:WV
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '296'
+    sig_exchange_id: '985'
+    sig_title: Will the Democratic Party win the West Virginia Senate?
+    kalshi_ticker: SENATEWV-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '297'
+    sig_exchange_id: '986'
+    sig_title: Will the Republican Party win the West Virginia Senate?
+    kalshi_ticker: SENATEWV-26-R
+    polymarket_token_id: '103563721501446582736235672026641229118201717908465299005521462931975944512517'
+    approved: false
+- race_key: senate:WY
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '365'
+    sig_exchange_id: '1054'
+    sig_title: Will the Democratic Party win the Wyoming Senate?
+    kalshi_ticker: SENATEWY-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '366'
+    sig_exchange_id: '1055'
+    sig_title: Will the Republican Party win the Wyoming Senate?
+    kalshi_ticker: SENATEWY-26-R
+    polymarket_token_id: '79928077180713102609948647660034580156932658823394290272651325523866637424642'
+    approved: false
+- race_key: governor:AK
+  exclude: true
+  note: 'AK: runoff / ranked-choice risk'
+  contracts:
+  - party: D
+    sig_market_id: '368'
+    sig_exchange_id: '1057'
+    sig_title: Will the Democratic Party win the Alaska Governor?
+    kalshi_ticker: KXGOVPARTYAK-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '369'
+    sig_exchange_id: '1058'
+    sig_title: Will the Republican Party win the Alaska Governor?
+    kalshi_ticker: KXGOVPARTYAK-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: governor:AL
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '155'
+    sig_exchange_id: '844'
+    sig_title: Will the Democratic Party win the Alabama Governor?
+    kalshi_ticker: GOVPARTYAL-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '156'
+    sig_exchange_id: '845'
+    sig_title: Will the Republican Party win the Alabama Governor?
+    kalshi_ticker: GOVPARTYAL-26-R
+    polymarket_token_id: '109054998942213692077271472955675949350077711784792442998941210738471587356514'
+    approved: false
+- race_key: governor:AR
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '157'
+    sig_exchange_id: '846'
+    sig_title: Will the Democratic Party win the Arkansas Governor?
+    kalshi_ticker: GOVPARTYAR-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '158'
+    sig_exchange_id: '847'
+    sig_title: Will the Republican Party win the Arkansas Governor?
+    kalshi_ticker: GOVPARTYAR-26-R
+    polymarket_token_id: '102338577209265315381870206199608266895858545057511455426333199851251620807909'
+    approved: false
+- race_key: governor:AZ
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '159'
+    sig_exchange_id: '848'
+    sig_title: Will the Democratic Party win the Arizona Governor?
+    kalshi_ticker: GOVPARTYAZ-26-D
+    polymarket_token_id: '48368039124533504674394545622809320495392482760644292167644042386014017726777'
+    approved: false
+  - party: R
+    sig_market_id: '160'
+    sig_exchange_id: '849'
+    sig_title: Will the Republican Party win the Arizona Governor?
+    kalshi_ticker: GOVPARTYAZ-26-R
+    polymarket_token_id: '18859933834391393264997730047904836599784455493762567366530805521273388590339'
+    approved: false
+- race_key: governor:CA
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '161'
+    sig_exchange_id: '850'
+    sig_title: Will the Democratic Party win the California Governor?
+    kalshi_ticker: GOVPARTYCA-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '162'
+    sig_exchange_id: '851'
+    sig_title: Will the Republican Party win the California Governor?
+    kalshi_ticker: GOVPARTYCA-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: governor:CO
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '163'
+    sig_exchange_id: '852'
+    sig_title: Will the Democratic Party win the Colorado Governor?
+    kalshi_ticker: GOVPARTYCO-26-D
+    polymarket_token_id: '13561110222018578357785114619723468880952494576477687978085608584743809891728'
+    approved: false
+  - party: R
+    sig_market_id: '164'
+    sig_exchange_id: '853'
+    sig_title: Will the Republican Party win the Colorado Governor?
+    kalshi_ticker: GOVPARTYCO-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: governor:CT
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '298'
+    sig_exchange_id: '987'
+    sig_title: Will the Democratic Party win the Connecticut Governor?
+    kalshi_ticker: GOVPARTYCT-26-D
+    polymarket_token_id: '94716743709853585469973889676994451123824166409123282527490222914006156870020'
+    approved: false
+  - party: R
+    sig_market_id: '165'
+    sig_exchange_id: '854'
+    sig_title: Will the Republican Party win the Connecticut Governor?
+    kalshi_ticker: GOVPARTYCT-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: governor:FL
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '299'
+    sig_exchange_id: '988'
+    sig_title: Will the Democratic Party win the Florida Governor?
+    kalshi_ticker: GOVPARTYFL-26-D
+    polymarket_token_id: '45666577334498374671436529469006420565255125221309505855441517627481607414492'
+    approved: false
+  - party: R
+    sig_market_id: '300'
+    sig_exchange_id: '989'
+    sig_title: Will the Republican Party win the Florida Governor?
+    kalshi_ticker: GOVPARTYFL-26-R
+    polymarket_token_id: '107409796822153809778143872196236532785178617102787858261374110829112218839748'
+    approved: false
+- race_key: governor:GA
+  exclude: true
+  note: 'GA: runoff / ranked-choice risk'
+  contracts:
+  - party: D
+    sig_market_id: '166'
+    sig_exchange_id: '855'
+    sig_title: Will the Democratic Party win the Georgia Governor?
+    kalshi_ticker: GOVPARTYGA-26-D
+    polymarket_token_id: '59980150909931986777748227027020522224275707387562276219060223816867188565245'
+    approved: false
+  - party: R
+    sig_market_id: '167'
+    sig_exchange_id: '856'
+    sig_title: Will the Republican Party win the Georgia Governor?
+    kalshi_ticker: GOVPARTYGA-26-R
+    polymarket_token_id: '17555504943162344098534978138053308162738914357892515623100381936995379845407'
+    approved: false
+- race_key: governor:HI
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '301'
+    sig_exchange_id: '990'
+    sig_title: Will the Democratic Party win the Hawaii Governor?
+    kalshi_ticker: GOVPARTYHI-26-D
+    polymarket_token_id: '110136962687751258520353298894226275160632723246908859759371791290370868364654'
+    approved: false
+  - party: R
+    sig_market_id: '302'
+    sig_exchange_id: '991'
+    sig_title: Will the Republican Party win the Hawaii Governor?
+    kalshi_ticker: GOVPARTYHI-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: governor:IA
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '168'
+    sig_exchange_id: '857'
+    sig_title: Will the Democratic Party win the Iowa Governor?
+    kalshi_ticker: GOVPARTYIA-26-D
+    polymarket_token_id: '45621938709469399887344165091123819127263258871102896783851049824656362940868'
+    approved: false
+  - party: R
+    sig_market_id: '169'
+    sig_exchange_id: '858'
+    sig_title: Will the Republican Party win the Iowa Governor?
+    kalshi_ticker: GOVPARTYIA-26-R
+    polymarket_token_id: '35744753605838865227961720864928711626409257515092566128191701940968999011763'
+    approved: false
+- race_key: governor:ID
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '170'
+    sig_exchange_id: '859'
+    sig_title: Will the Democratic Party win the Idaho Governor?
+    kalshi_ticker: GOVPARTYID-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '171'
+    sig_exchange_id: '860'
+    sig_title: Will the Republican Party win the Idaho Governor?
+    kalshi_ticker: GOVPARTYID-26-R
+    polymarket_token_id: '87236158376775117473663657833358313384905412589236150240764095508530872387075'
+    approved: false
+- race_key: governor:IL
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '172'
+    sig_exchange_id: '861'
+    sig_title: Will the Democratic Party win the Illinois Governor?
+    kalshi_ticker: GOVPARTYIL-26-D
+    polymarket_token_id: '23435178151774440115423538812688705649247609803850018642847000556068202005554'
+    approved: false
+  - party: R
+    sig_market_id: '173'
+    sig_exchange_id: '862'
+    sig_title: Will the Republican Party win the Illinois Governor?
+    kalshi_ticker: GOVPARTYIL-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: governor:MA
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '370'
+    sig_exchange_id: '1059'
+    sig_title: Will the Democratic Party win the Massachusetts Governor?
+    kalshi_ticker: GOVPARTYMA-26-D
+    polymarket_token_id: '86599393407315290835574565918707146460542680358932655202787183319230565551172'
+    approved: false
+  - party: R
+    sig_market_id: '371'
+    sig_exchange_id: '1060'
+    sig_title: Will the Republican Party win the Massachusetts Governor?
+    kalshi_ticker: GOVPARTYMA-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: governor:MD
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '174'
+    sig_exchange_id: '863'
+    sig_title: Will the Democratic Party win the Maryland Governor?
+    kalshi_ticker: GOVPARTYMD-26-D
+    polymarket_token_id: '21509039698927424303190259436702262868147960450053769072201076877922760800234'
+    approved: false
+  - party: R
+    sig_market_id: '175'
+    sig_exchange_id: '864'
+    sig_title: Will the Republican Party win the Maryland Governor?
+    kalshi_ticker: GOVPARTYMD-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: governor:ME
+  exclude: true
+  note: 'ME: runoff / ranked-choice risk'
+  contracts:
+  - party: D
+    sig_market_id: '176'
+    sig_exchange_id: '865'
+    sig_title: Will the Democratic Party win the Maine Governor?
+    kalshi_ticker: GOVPARTYME-26-D
+    polymarket_token_id: '92845243966002494782242842696395378111295494684532387488276103452077216171518'
+    approved: false
+  - party: R
+    sig_market_id: '177'
+    sig_exchange_id: '866'
+    sig_title: Will the Republican Party win the Maine Governor?
+    kalshi_ticker: GOVPARTYME-26-R
+    polymarket_token_id: '77900872247159891045693614974240851672235710405168744753050508553885061962390'
+    approved: false
+- race_key: governor:MI
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '305'
+    sig_exchange_id: '994'
+    sig_title: Will the Democratic Party win the Michigan Governor?
+    kalshi_ticker: GOVPARTYMI-26-D
+    polymarket_token_id: '63517706574758177502492185078056756527324898714284142778693046697324148388357'
+    approved: false
+  - party: R
+    sig_market_id: '306'
+    sig_exchange_id: '995'
+    sig_title: Will the Republican Party win the Michigan Governor?
+    kalshi_ticker: GOVPARTYMI-26-R
+    polymarket_token_id: '3091929947863726371877226324959784580013579280794631063604653957812689085396'
+    approved: false
+- race_key: governor:MN
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '307'
+    sig_exchange_id: '996'
+    sig_title: Will the Democratic Party win the Minnesota Governor?
+    kalshi_ticker: GOVPARTYMN-26-D
+    polymarket_token_id: '9126148503694470083148381233969293708563386203943196700151133094426622508276'
+    approved: false
+  - party: R
+    sig_market_id: '308'
+    sig_exchange_id: '997'
+    sig_title: Will the Republican Party win the Minnesota Governor?
+    kalshi_ticker: GOVPARTYMN-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: governor:NE
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '178'
+    sig_exchange_id: '867'
+    sig_title: Will the Democratic Party win the Nebraska Governor?
+    kalshi_ticker: GOVPARTYNE-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '179'
+    sig_exchange_id: '868'
+    sig_title: Will the Republican Party win the Nebraska Governor?
+    kalshi_ticker: GOVPARTYNE-26-R
+    polymarket_token_id: '73030731922944118546035998309915164095890033874433358499266850532352206183824'
+    approved: false
+- race_key: governor:NM
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '180'
+    sig_exchange_id: '869'
+    sig_title: Will the Democratic Party win the New Mexico Governor?
+    kalshi_ticker: GOVPARTYNM-26-D
+    polymarket_token_id: '17781069937970314001472355582427331102577624490515546410398313363226785264562'
+    approved: false
+  - party: R
+    sig_market_id: '181'
+    sig_exchange_id: '870'
+    sig_title: Will the Republican Party win the New Mexico Governor?
+    kalshi_ticker: GOVPARTYNM-26-R
+    polymarket_token_id: '66486026915087812107390926299428531209332603871609345502520740675575639289776'
+    approved: false
+- race_key: governor:NV
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '182'
+    sig_exchange_id: '871'
+    sig_title: Will the Democratic Party win the Nevada Governor?
+    kalshi_ticker: GOVPARTYNV-26-D
+    polymarket_token_id: '1246864710804983890692377994891598401616546411512113588399830364959833951829'
+    approved: false
+  - party: R
+    sig_market_id: '183'
+    sig_exchange_id: '872'
+    sig_title: Will the Republican Party win the Nevada Governor?
+    kalshi_ticker: GOVPARTYNV-26-R
+    polymarket_token_id: '26514162544090965098284473937422427465088569867873952479707540387314217381282'
+    approved: false
+- race_key: governor:NY
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '184'
+    sig_exchange_id: '873'
+    sig_title: Will the Democratic Party win the New York Governor?
+    kalshi_ticker: GOVPARTYNY-26-D
+    polymarket_token_id: '64050273355694113671090110638685043795558853994186493795797238541534244584786'
+    approved: false
+  - party: R
+    sig_market_id: '185'
+    sig_exchange_id: '874'
+    sig_title: Will the Republican Party win the New York Governor?
+    kalshi_ticker: GOVPARTYNY-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: governor:OK
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '186'
+    sig_exchange_id: '875'
+    sig_title: Will the Democratic Party win the Oklahoma Governor?
+    kalshi_ticker: GOVPARTYOK-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '374'
+    sig_exchange_id: '1063'
+    sig_title: Will the Republican Party win the Oklahoma Governor?
+    kalshi_ticker: GOVPARTYOK-26-R
+    polymarket_token_id: '12195532376431728872322429427491005809800415403259444414908025975252692275196'
+    approved: false
+- race_key: governor:OR
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '187'
+    sig_exchange_id: '876'
+    sig_title: Will the Democratic Party win the Oregon Governor?
+    kalshi_ticker: GOVPARTYOR-26-D
+    polymarket_token_id: '9755787435930070640870536823763281543938387827225853124824813626465365556107'
+    approved: false
+  - party: R
+    sig_market_id: '188'
+    sig_exchange_id: '877'
+    sig_title: Will the Republican Party win the Oregon Governor?
+    kalshi_ticker: GOVPARTYOR-26-R
+    polymarket_token_id: '60638893393471159707288518099941698438888451383700859041754575565737488871199'
+    approved: false
+- race_key: governor:PA
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '189'
+    sig_exchange_id: '878'
+    sig_title: Will the Democratic Party win the Pennsylvania Governor?
+    kalshi_ticker: GOVPARTYPA-26-D
+    polymarket_token_id: '86158564038726526008163887440654010269502827272776903587995739265573029112945'
+    approved: false
+  - party: R
+    sig_market_id: '190'
+    sig_exchange_id: '879'
+    sig_title: Will the Republican Party win the Pennsylvania Governor?
+    kalshi_ticker: GOVPARTYPA-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: governor:RI
+  exclude: true
+  note: 3 SIG contracts in this race; only 2 of 3 SIG contracts mapped
+  contracts:
+  - party: D
+    sig_market_id: '384'
+    sig_exchange_id: '1073'
+    sig_title: Will the Democratic Party win the Rhode Island Governor?
+    kalshi_ticker: GOVPARTYRI-26-D
+    polymarket_token_id: '12963869833838696349134591178892586509546549676681530057691780490969939726649'
+    approved: false
+  - party: R
+    sig_market_id: '385'
+    sig_exchange_id: '1074'
+    sig_title: Will the Republican Party win the Rhode Island Governor?
+    kalshi_ticker: GOVPARTYRI-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: governor:SC
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '192'
+    sig_exchange_id: '881'
+    sig_title: Will the Democratic Party win the South Carolina Governor?
+    kalshi_ticker: GOVPARTYSC-26-D
+    polymarket_token_id: '69673263487139231624315897585768201230841320475352635832819992690850228911127'
+    approved: false
+  - party: R
+    sig_market_id: '193'
+    sig_exchange_id: '882'
+    sig_title: Will the Republican Party win the South Carolina Governor?
+    kalshi_ticker: GOVPARTYSC-26-R
+    polymarket_token_id: '115258259561547414610995893322363332894307320697384633557391293684664191320185'
+    approved: false
+- race_key: governor:SD
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '194'
+    sig_exchange_id: '883'
+    sig_title: Will the Democratic Party win the South Dakota Governor?
+    kalshi_ticker: GOVPARTYSD-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '309'
+    sig_exchange_id: '998'
+    sig_title: Will the Republican Party win the South Dakota Governor?
+    kalshi_ticker: GOVPARTYSD-26-R
+    polymarket_token_id: '33837211479232375079024923304907620849682048653904904303440832993092201214603'
+    approved: false
+- race_key: governor:TN
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '310'
+    sig_exchange_id: '999'
+    sig_title: Will the Democratic Party win the Tennessee Governor?
+    kalshi_ticker: GOVPARTYTN-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '311'
+    sig_exchange_id: '1000'
+    sig_title: Will the Republican Party win the Tennessee Governor?
+    kalshi_ticker: GOVPARTYTN-26-R
+    polymarket_token_id: '24326213014906491852819643583064878883456155870415421965354259617491710449915'
+    approved: false
+- race_key: governor:TX
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '195'
+    sig_exchange_id: '884'
+    sig_title: Will the Democratic Party win the Texas Governor?
+    kalshi_ticker: GOVPARTYTX-26-D
+    polymarket_token_id: '48232987449750988261789196083999659380058157021032932634331257492238853387252'
+    approved: false
+  - party: R
+    sig_market_id: '196'
+    sig_exchange_id: '885'
+    sig_title: Will the Republican Party win the Texas Governor?
+    kalshi_ticker: GOVPARTYTX-26-R
+    polymarket_token_id: '54743173400191373818547682740700297683169841200363505623023527116388816282328'
+    approved: false
+- race_key: governor:VT
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '312'
+    sig_exchange_id: '1001'
+    sig_title: Will the Democratic Party win the Vermont Governor?
+    kalshi_ticker: GOVPARTYVT-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '313'
+    sig_exchange_id: '1002'
+    sig_title: Will the Republican Party win the Vermont Governor?
+    kalshi_ticker: GOVPARTYVT-26-R
+    polymarket_token_id: '41583919731714354912849507182398941127545694257513505398713274521520484370640'
+    approved: false
+- race_key: governor:WI
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '314'
+    sig_exchange_id: '1003'
+    sig_title: Will the Democratic Party win the Wisconsin Governor?
+    kalshi_ticker: GOVPARTYWI-26-D
+    polymarket_token_id: '47540146623620182724372695903724852067595146419459482790641441152489267651664'
+    approved: false
+  - party: R
+    sig_market_id: '315'
+    sig_exchange_id: '1004'
+    sig_title: Will the Republican Party win the Wisconsin Governor?
+    kalshi_ticker: GOVPARTYWI-26-R
+    polymarket_token_id: '110568426700454908727813010666782278712329569099119457880819387703511785225289'
+    approved: false
+- race_key: governor:WY
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '316'
+    sig_exchange_id: '1005'
+    sig_title: Will the Democratic Party win the Wyoming Governor?
+    kalshi_ticker: GOVPARTYWY-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '317'
+    sig_exchange_id: '1006'
+    sig_title: Will the Republican Party win the Wyoming Governor?
+    kalshi_ticker: GOVPARTYWY-26-R
+    polymarket_token_id: '110662231382210721528347530139180000273032668591469451320298639508988983810813'
+    approved: false
+- race_key: house_control
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '151'
+    sig_exchange_id: '840'
+    sig_title: Will the Democratic Party win the U.S. House?
+    kalshi_ticker: CONTROLH-2026-D
+    polymarket_token_id: '83247781037352156539108067944461291821683755894607244160607042790356561625563'
+    approved: false
+  - party: R
+    sig_market_id: '152'
+    sig_exchange_id: '841'
+    sig_title: Will the Republican Party win the U.S. House?
+    kalshi_ticker: CONTROLH-2026-R
+    polymarket_token_id: '65139230827417363158752884968303867495725894165574887635816574090175320800482'
+    approved: false
+- race_key: senate_control
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '153'
+    sig_exchange_id: '842'
+    sig_title: Will the Democratic Party win the U.S. Senate?
+    kalshi_ticker: CONTROLS-2026-D
+    polymarket_token_id: '113287701564209339913693347405685749986285999146352375265161592243948562084773'
+    approved: false
+  - party: R
+    sig_market_id: '154'
+    sig_exchange_id: '843'
+    sig_title: Will the Republican Party win the U.S. Senate?
+    kalshi_ticker: CONTROLS-2026-R
+    polymarket_token_id: '51939490109676186832507970701169130490548061087912630009168726706475001411420'
+    approved: false
+- race_key: house:AZ-01
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '197'
+    sig_exchange_id: '886'
+    sig_title: Will the Democratic Party win the AZ-01 House race?
+    kalshi_ticker: HOUSEAZ1-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '198'
+    sig_exchange_id: '887'
+    sig_title: Will the Republican Party win the AZ-01 House race?
+    kalshi_ticker: HOUSEAZ1-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:AZ-06
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '199'
+    sig_exchange_id: '888'
+    sig_title: Will the Democratic Party win the AZ-06 House race?
+    kalshi_ticker: HOUSEAZ6-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '200'
+    sig_exchange_id: '889'
+    sig_title: Will the Republican Party win the AZ-06 House race?
+    kalshi_ticker: HOUSEAZ6-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:CA-22
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '201'
+    sig_exchange_id: '890'
+    sig_title: Will the Democratic Party win the CA-22 House race?
+    kalshi_ticker: HOUSECA22-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '202'
+    sig_exchange_id: '891'
+    sig_title: Will the Republican Party win the CA-22 House race?
+    kalshi_ticker: HOUSECA22-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:CO-03
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '205'
+    sig_exchange_id: '894'
+    sig_title: Will the Democratic Party win the CO-03 House race?
+    kalshi_ticker: HOUSECO3-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '206'
+    sig_exchange_id: '895'
+    sig_title: Will the Republican Party win the CO-03 House race?
+    kalshi_ticker: HOUSECO3-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:CO-08
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '209'
+    sig_exchange_id: '898'
+    sig_title: Will the Democratic Party win the CO-08 House race?
+    kalshi_ticker: HOUSECO8-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '210'
+    sig_exchange_id: '899'
+    sig_title: Will the Republican Party win the CO-08 House race?
+    kalshi_ticker: HOUSECO8-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:FL-13
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '323'
+    sig_exchange_id: '1012'
+    sig_title: Will the Democratic Party win the FL-13 House race?
+    kalshi_ticker: HOUSEFL13-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '212'
+    sig_exchange_id: '901'
+    sig_title: Will the Republican Party win the FL-13 House race?
+    kalshi_ticker: HOUSEFL13-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:IA-01
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '213'
+    sig_exchange_id: '902'
+    sig_title: Will the Democratic Party win the IA-01 House race?
+    kalshi_ticker: HOUSEIA1-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '214'
+    sig_exchange_id: '903'
+    sig_title: Will the Republican Party win the IA-01 House race?
+    kalshi_ticker: HOUSEIA1-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:IA-03
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '217'
+    sig_exchange_id: '906'
+    sig_title: Will the Democratic Party win the IA-03 House race?
+    kalshi_ticker: HOUSEIA3-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '218'
+    sig_exchange_id: '907'
+    sig_title: Will the Republican Party win the IA-03 House race?
+    kalshi_ticker: HOUSEIA3-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:ME-02
+  exclude: true
+  note: 'ME: runoff / ranked-choice risk'
+  contracts:
+  - party: D
+    sig_market_id: '221'
+    sig_exchange_id: '910'
+    sig_title: Will the Democratic Party win the ME-02 House race?
+    kalshi_ticker: HOUSEME2-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '222'
+    sig_exchange_id: '911'
+    sig_title: Will the Republican Party win the ME-02 House race?
+    kalshi_ticker: HOUSEME2-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:MI-07
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '330'
+    sig_exchange_id: '1019'
+    sig_title: Will the Democratic Party win the MI-07 House race?
+    kalshi_ticker: HOUSEMI7-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '331'
+    sig_exchange_id: '1020'
+    sig_title: Will the Republican Party win the MI-07 House race?
+    kalshi_ticker: HOUSEMI7-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:MI-10
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '332'
+    sig_exchange_id: '1021'
+    sig_title: Will the Democratic Party win the MI-10 House race?
+    kalshi_ticker: HOUSEMI10-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '333'
+    sig_exchange_id: '1022'
+    sig_title: Will the Republican Party win the MI-10 House race?
+    kalshi_ticker: HOUSEMI10-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:MN-02
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '336'
+    sig_exchange_id: '1025'
+    sig_title: Will the Democratic Party win the MN-02 House race?
+    kalshi_ticker: HOUSEMN2-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '337'
+    sig_exchange_id: '1026'
+    sig_title: Will the Republican Party win the MN-02 House race?
+    kalshi_ticker: HOUSEMN2-26-R
+    polymarket_token_id: '11097105156238262475273771834712888925665173080240395368749303861446470757383'
+    approved: false
+- race_key: house:MT-01
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '223'
+    sig_exchange_id: '912'
+    sig_title: Will the Democratic Party win the MT-01 House race?
+    kalshi_ticker: HOUSEMT1-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '224'
+    sig_exchange_id: '913'
+    sig_title: Will the Republican Party win the MT-01 House race?
+    kalshi_ticker: HOUSEMT1-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:NE-02
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '225'
+    sig_exchange_id: '914'
+    sig_title: Will the Democratic Party win the NE-02 House race?
+    kalshi_ticker: HOUSENE2-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '226'
+    sig_exchange_id: '915'
+    sig_title: Will the Republican Party win the NE-02 House race?
+    kalshi_ticker: HOUSENE2-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:NH-01
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '375'
+    sig_exchange_id: '1064'
+    sig_title: Will the Democratic Party win the NH-01 House race?
+    kalshi_ticker: HOUSENH1-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '376'
+    sig_exchange_id: '1065'
+    sig_title: Will the Republican Party win the NH-01 House race?
+    kalshi_ticker: HOUSENH1-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:NJ-07
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '227'
+    sig_exchange_id: '916'
+    sig_title: Will the Democratic Party win the NJ-07 House race?
+    kalshi_ticker: HOUSENJ7-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '228'
+    sig_exchange_id: '917'
+    sig_title: Will the Republican Party win the NJ-07 House race?
+    kalshi_ticker: HOUSENJ7-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:NY-17
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '231'
+    sig_exchange_id: '920'
+    sig_title: Will the Democratic Party win the NY-17 House race?
+    kalshi_ticker: HOUSENY17-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '232'
+    sig_exchange_id: '921'
+    sig_title: Will the Republican Party win the NY-17 House race?
+    kalshi_ticker: HOUSENY17-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:PA-01
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '233'
+    sig_exchange_id: '922'
+    sig_title: Will the Democratic Party win the PA-01 House race?
+    kalshi_ticker: HOUSEPA1-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '234'
+    sig_exchange_id: '923'
+    sig_title: Will the Republican Party win the PA-01 House race?
+    kalshi_ticker: HOUSEPA1-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:PA-07
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '235'
+    sig_exchange_id: '924'
+    sig_title: Will the Democratic Party win the PA-07 House race?
+    kalshi_ticker: HOUSEPA7-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '236'
+    sig_exchange_id: '925'
+    sig_title: Will the Republican Party win the PA-07 House race?
+    kalshi_ticker: HOUSEPA7-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:PA-08
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '237'
+    sig_exchange_id: '926'
+    sig_title: Will the Democratic Party win the PA-08 House race?
+    kalshi_ticker: HOUSEPA8-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '238'
+    sig_exchange_id: '927'
+    sig_title: Will the Republican Party win the PA-08 House race?
+    kalshi_ticker: HOUSEPA8-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:PA-10
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '239'
+    sig_exchange_id: '928'
+    sig_title: Will the Democratic Party win the PA-10 House race?
+    kalshi_ticker: HOUSEPA10-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '240'
+    sig_exchange_id: '929'
+    sig_title: Will the Republican Party win the PA-10 House race?
+    kalshi_ticker: HOUSEPA10-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:TX-15
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '243'
+    sig_exchange_id: '932'
+    sig_title: Will the Democratic Party win the TX-15 House race?
+    kalshi_ticker: HOUSETX15-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '244'
+    sig_exchange_id: '933'
+    sig_title: Will the Republican Party win the TX-15 House race?
+    kalshi_ticker: HOUSETX15-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:TX-28
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '247'
+    sig_exchange_id: '936'
+    sig_title: Will the Democratic Party win the TX-28 House race?
+    kalshi_ticker: HOUSETX28-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '248'
+    sig_exchange_id: '937'
+    sig_title: Will the Republican Party win the TX-28 House race?
+    kalshi_ticker: HOUSETX28-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:VA-01
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '342'
+    sig_exchange_id: '1031'
+    sig_title: Will the Democratic Party win the VA-01 House race?
+    kalshi_ticker: HOUSEVA1-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '249'
+    sig_exchange_id: '938'
+    sig_title: Will the Republican Party win the VA-01 House race?
+    kalshi_ticker: HOUSEVA1-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:VA-02
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '343'
+    sig_exchange_id: '1032'
+    sig_title: Will the Democratic Party win the VA-02 House race?
+    kalshi_ticker: HOUSEVA2-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '250'
+    sig_exchange_id: '939'
+    sig_title: Will the Republican Party win the VA-02 House race?
+    kalshi_ticker: HOUSEVA2-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:VA-07
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '251'
+    sig_exchange_id: '940'
+    sig_title: Will the Democratic Party win the VA-07 House race?
+    kalshi_ticker: HOUSEVA7-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '346'
+    sig_exchange_id: '1035'
+    sig_title: Will the Republican Party win the VA-07 House race?
+    kalshi_ticker: HOUSEVA7-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:WA-03
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '347'
+    sig_exchange_id: '1036'
+    sig_title: Will the Democratic Party win the WA-03 House race?
+    kalshi_ticker: HOUSEWA3-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '348'
+    sig_exchange_id: '1037'
+    sig_title: Will the Republican Party win the WA-03 House race?
+    kalshi_ticker: HOUSEWA3-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:WI-01
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '349'
+    sig_exchange_id: '1038'
+    sig_title: Will the Democratic Party win the WI-01 House race?
+    kalshi_ticker: HOUSEWI1-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '350'
+    sig_exchange_id: '1039'
+    sig_title: Will the Republican Party win the WI-01 House race?
+    kalshi_ticker: HOUSEWI1-26-R
+    polymarket_token_id: null
+    approved: false
+- race_key: house:WI-03
+  exclude: false
+  note: ''
+  contracts:
+  - party: D
+    sig_market_id: '351'
+    sig_exchange_id: '1040'
+    sig_title: Will the Democratic Party win the WI-03 House race?
+    kalshi_ticker: HOUSEWI3-26-D
+    polymarket_token_id: null
+    approved: false
+  - party: R
+    sig_market_id: '352'
+    sig_exchange_id: '1041'
+    sig_title: Will the Republican Party win the WI-03 House race?
+    kalshi_ticker: HOUSEWI3-26-R
+    polymarket_token_id: null
+    approved: false
