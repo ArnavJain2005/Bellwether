@@ -1,12 +1,15 @@
 """Sample SQLite database generator for testing the Bellwether Streamlit monitor.
 
 Creates isolated sample databases matching ``bot/CONTRACT.md`` in a temporary
-directory for the four test states:
-- ``normal``: populated tables with an alive heartbeat (< 30s)
+directory for the test states:
+- ``normal``: populated tables with an alive heartbeat (< 30s) and 6h snapshot history
 - ``empty``: schema created, zero rows in all tables
 - ``missing``: directory without a database file
 - ``stale``: populated tables with a stale heartbeat (>= 30s), stale quotes (> 60s),
   and ``STOP`` / ``PAUSED`` control files in the temporary state directory
+- ``single_snapshot``: populated tables where ``snapshots`` has only one row
+- ``malformed_json``: populated tables where the latest ``snapshots`` row has
+  malformed / unexpected-key ``positions_json`` and ``pnl_json``
 
 Safety rule: refuses to write to the repository's ``bot/state/`` directory.
 """
@@ -166,17 +169,19 @@ def create_sample_state(
     target_dir: str | Path | None = None,
     now_utc: datetime | None = None,
 ) -> Path:
-    """Create a sample state directory for ``mode`` and return ``db_path``.
-
-    Modes:
-    - ``normal``: alive heartbeat (5s old), populated tables, mixed fresh/stale quotes
-    - ``empty``: all contract tables exist with 0 rows
-    - ``missing``: directory exists but ``bellwether.db`` does not exist
-    - ``stale``: heartbeat 95s old (`STALE`), `PAUSED` and `STOP` files present
-    """
-    valid_modes = {"normal", "empty", "missing", "stale"}
+    """Create a sample state directory for ``mode`` and return ``db_path``."""
+    valid_modes = {
+        "normal",
+        "empty",
+        "missing",
+        "stale",
+        "single_snapshot",
+        "malformed_json",
+    }
     if mode not in valid_modes:
-        raise ValueError(f"Unsupported sample mode '{mode}'. Choose from {sorted(valid_modes)}")
+        raise ValueError(
+            f"Unsupported sample mode '{mode}'. Choose from {sorted(valid_modes)}"
+        )
 
     if target_dir is None:
         base_dir = Path(tempfile.mkdtemp(prefix=f"bellwether_sample_{mode}_"))
@@ -211,10 +216,11 @@ def create_sample_state(
             return db_path
 
         current = now_utc.astimezone(UTC) if now_utc else datetime.now(UTC)
-        hb_offset = timedelta(seconds=5) if mode == "normal" else timedelta(seconds=95)
+        is_stale_mode = mode == "stale"
+        hb_offset = timedelta(seconds=95) if is_stale_mode else timedelta(seconds=5)
         hb_ts = _iso_utc(current - hb_offset)
 
-        if mode == "stale":
+        if is_stale_mode:
             paused_file.write_text("429 cooldown from SIG gateway\n", encoding="utf-8")
             stop_file.write_text("Operator emergency halt\n", encoding="utf-8")
 
@@ -229,15 +235,15 @@ def create_sample_state(
             (
                 1,
                 hb_ts,
-                "dry_run" if mode == "normal" else "live",
+                "live" if is_stale_mode else "dry_run",
                 "ew-0.4.2",
-                142 if mode == "normal" else 890,
+                890 if is_stale_mode else 142,
                 28,
                 4,
-                0 if mode == "normal" else 1,
-                None if mode == "normal" else "429 rate-limit backoff",
-                0 if mode == "normal" else 1,
-                "10482.50",
+                1 if is_stale_mode else 0,
+                "429 rate-limit backoff" if is_stale_mode else None,
+                1 if is_stale_mode else 0,
+                "9815.25" if is_stale_mode else "10482.50",
                 "10000.00",
                 "1845.00",
                 "1.00",
@@ -249,50 +255,156 @@ def create_sample_state(
             ),
         )
 
-        # Snapshots (2 rows; latest has id=2)
-        conn.execute(
-            """
-            INSERT INTO snapshots (
-                ts_utc, balance, committed, open_orders, positions_json, pnl_json
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                _iso_utc(current - timedelta(minutes=5)),
-                "10310.00",
-                "1620.00",
-                2,
-                json.dumps({"SEN-PA-2026:D": 400, "SEN-MI-2026:D": 300}),
-                json.dumps({"total": "310.00", "realized": "120.00", "unrealized": "190.00"}),
-            ),
-        )
-        conn.execute(
-            """
-            INSERT INTO snapshots (
-                ts_utc, balance, committed, open_orders, positions_json, pnl_json
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                _iso_utc(current - timedelta(seconds=8 if mode == "normal" else 100)),
-                "10482.50" if mode == "normal" else "9815.25",
-                "1845.00",
-                3,
-                json.dumps(
-                    {
-                        "SEN-PA-2026:D": 550,
-                        "SEN-MI-2026:D": 420,
-                        "GOV-PA-2026:D": 310,
-                        "HOUSE-NY-17:R": 250,
-                    }
+        # Contract-compliant positions_json & per-race pnl_json
+        valid_positions = [
+            {
+                "race_key": "SEN-PA-2026",
+                "sig_exchange_id": "SIG-PA-SEN-D",
+                "sig_market_id": "mkt-pa-sen",
+                "party": "D",
+                "side": "yes",
+                "quantity": 550,
+                "price_side": "0.535",
+                "total_cost": "294.25",
+                "committed": "540.00",
+            },
+            {
+                "race_key": "SEN-MI-2026",
+                "sig_exchange_id": "SIG-MI-SEN-D",
+                "sig_market_id": "mkt-mi-sen",
+                "party": "D",
+                "side": "yes",
+                "quantity": 420,
+                "price_side": "0.560",
+                "total_cost": "235.20",
+                "committed": "450.00",
+            },
+            {
+                "race_key": "SEN-WI-2026",
+                "sig_exchange_id": "SIG-WI-SEN-R",
+                "sig_market_id": "mkt-wi-sen",
+                "party": "R",
+                "side": "no",
+                "quantity": 320,
+                "price_side": "0.480",
+                "total_cost": "153.60",
+                "committed": "360.00",
+            },
+            {
+                "race_key": "GOV-PA-2026",
+                "sig_exchange_id": "SIG-PA-GOV-D",
+                "sig_market_id": "mkt-pa-gov",
+                "party": "D",
+                "side": "yes",
+                "quantity": 310,
+                "price_side": "0.615",
+                "total_cost": "190.65",
+                "committed": "285.00",
+            },
+            {
+                "race_key": "HOUSE-NY-17",
+                "sig_exchange_id": "SIG-NY17-R",
+                "sig_market_id": "mkt-ny17",
+                "party": "R",
+                "side": "yes",
+                "quantity": 250,
+                "price_side": "0.520",
+                "total_cost": "130.00",
+                "committed": "210.00",
+            },
+        ]
+        valid_pnl_normal = {
+            "SEN-PA-2026": "215.00",
+            "GOV-PA-2026": "160.00",
+            "SEN-MI-2026": "142.50",
+            "SEN-WI-2026": "0.00",
+            "HOUSE-NY-17": "-35.00",
+        }
+        valid_pnl_stale = {
+            "SEN-PA-2026": "-85.00",
+            "SEN-MI-2026": "-64.75",
+            "HOUSE-NY-17": "-55.00",
+            "GOV-PA-2026": "20.00",
+        }
+
+        if mode == "single_snapshot":
+            conn.execute(
+                """
+                INSERT INTO snapshots (
+                    ts_utc, balance, committed, open_orders, positions_json, pnl_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _iso_utc(current - timedelta(seconds=8)),
+                    "10482.50",
+                    "1845.00",
+                    3,
+                    json.dumps(valid_positions),
+                    json.dumps(valid_pnl_normal),
                 ),
-                json.dumps(
-                    {
-                        "total": "482.50" if mode == "normal" else "-184.75",
-                        "realized": "215.00" if mode == "normal" else "-90.00",
-                        "unrealized": "267.50" if mode == "normal" else "-94.75",
-                    }
+            )
+        elif mode == "malformed_json":
+            conn.execute(
+                """
+                INSERT INTO snapshots (
+                    ts_utc, balance, committed, open_orders, positions_json, pnl_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _iso_utc(current - timedelta(seconds=8)),
+                    "10482.50",
+                    "1845.00",
+                    3,
+                    json.dumps([{"race_key": "SEN-PA-2026", "unexpected_key": 999}]),
+                    "{malformed_json_payload",
                 ),
-            ),
-        )
+            )
+        else:
+            # 6-hour snapshot series (12 points across the last 5.5 hours)
+            history_schedule = [
+                (timedelta(hours=5, minutes=30), "10000.00", "420.00", 1),
+                (timedelta(hours=5, minutes=0), "10045.00", "680.00", 2),
+                (timedelta(hours=4, minutes=30), "10090.50", "890.00", 2),
+                (timedelta(hours=4, minutes=0), "10062.00", "1050.00", 3),
+                (timedelta(hours=3, minutes=30), "10135.25", "1180.00", 2),
+                (timedelta(hours=3, minutes=0), "10198.00", "1340.00", 3),
+                (timedelta(hours=2, minutes=30), "10240.75", "1490.00", 4),
+                (timedelta(hours=2, minutes=0), "10295.00", "1560.00", 3),
+                (timedelta(hours=1, minutes=30), "10342.50", "1680.00", 3),
+                (timedelta(hours=1, minutes=0), "10388.00", "1740.00", 2),
+                (timedelta(minutes=30), "10430.00", "1795.00", 3),
+            ]
+            for offset, bal, comm, open_cnt in history_schedule:
+                conn.execute(
+                    """
+                    INSERT INTO snapshots (
+                        ts_utc, balance, committed, open_orders, positions_json, pnl_json
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        _iso_utc(current - offset),
+                        bal,
+                        comm,
+                        open_cnt,
+                        json.dumps(valid_positions[:3]),
+                        json.dumps({"SEN-PA-2026": "120.00", "SEN-MI-2026": "85.00"}),
+                    ),
+                )
+            conn.execute(
+                """
+                INSERT INTO snapshots (
+                    ts_utc, balance, committed, open_orders, positions_json, pnl_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _iso_utc(current - timedelta(seconds=100 if is_stale_mode else 8)),
+                    "9815.25" if is_stale_mode else "10482.50",
+                    "1845.00",
+                    3,
+                    json.dumps(valid_positions),
+                    json.dumps(valid_pnl_stale if is_stale_mode else valid_pnl_normal),
+                ),
+            )
 
         # Exposure rows
         exposure_rows = [
@@ -307,7 +419,7 @@ def create_sample_state(
             exposure_rows,
         )
 
-        # Orders rows (mix of open and terminal statuses)
+        # Orders rows
         orders_rows = [
             (
                 "ord-20261103-006",
@@ -318,7 +430,7 @@ def create_sample_state(
                 "SIG-PA-SEN-D",
                 "yes",
                 "buy",
-                "yes",
+                "0.535",
                 "0.535",
                 120,
                 _iso_utc(current + timedelta(minutes=10)),
@@ -341,7 +453,7 @@ def create_sample_state(
                 "SIG-MI-SEN-D",
                 "yes",
                 "buy",
-                "yes",
+                "0.560",
                 "0.560",
                 150,
                 _iso_utc(current + timedelta(minutes=8)),
@@ -364,7 +476,7 @@ def create_sample_state(
                 "SIG-WI-SEN-R",
                 "no",
                 "buy",
-                "no",
+                "0.480",
                 "0.480",
                 80,
                 _iso_utc(current + timedelta(minutes=12)),
@@ -387,7 +499,7 @@ def create_sample_state(
                 "SIG-PA-GOV-D",
                 "yes",
                 "buy",
-                "yes",
+                "0.615",
                 "0.615",
                 200,
                 _iso_utc(current + timedelta(minutes=5)),
@@ -410,7 +522,7 @@ def create_sample_state(
                 "SIG-NY17-R",
                 "yes",
                 "buy",
-                "yes",
+                "0.520",
                 "0.520",
                 100,
                 _iso_utc(current - timedelta(minutes=1)),
@@ -433,7 +545,7 @@ def create_sample_state(
                 "SIG-AZ-SEN-D",
                 "yes",
                 "buy",
-                "yes",
+                "0.545",
                 "0.545",
                 100,
                 _iso_utc(current - timedelta(minutes=2)),
@@ -476,7 +588,7 @@ def create_sample_state(
                 "0.037",
                 "order",
                 "yes",
-                "yes",
+                "0.535",
                 120,
                 "edge +3.7c >= 3.0c floor; kalshi/poly diverge 0.4c <= 6c",
                 "ord-20261103-006",
@@ -495,7 +607,7 @@ def create_sample_state(
                 "0.035",
                 "order",
                 "yes",
-                "yes",
+                "0.560",
                 150,
                 "sum of asks D(0.560)+R(0.405)=0.965 <= 0.970 arb bound",
                 "ord-20261103-005",
@@ -514,7 +626,7 @@ def create_sample_state(
                 "-0.002",
                 "blocked",
                 "yes",
-                "yes",
+                "0.590",
                 0,
                 "venue disagreement |kalshi(0.630)-poly(0.545)|=8.5c > 6.0c limit",
                 None,
@@ -533,7 +645,7 @@ def create_sample_state(
                 "0.015",
                 "skip",
                 "yes",
-                "yes",
+                "0.615",
                 0,
                 "edge +1.5c below election-night threshold 3.0c",
                 None,
@@ -552,7 +664,7 @@ def create_sample_state(
                 "0.035",
                 "would_order",
                 "yes",
-                "yes",
+                "0.515",
                 100,
                 "dry_run: fair 0.550 vs ask 0.515 (+3.5c edge, cap ok)",
                 None,
@@ -569,13 +681,13 @@ def create_sample_state(
             list(reversed(decisions_rows)),
         )
 
-        # Quotes latest (includes fresh <60s and stale >60s quotes)
+        # Quotes latest
         quotes_rows = [
             (
                 "SIG-PA-SEN-D",
                 "SEN-PA-2026",
                 "D",
-                _iso_utc(current - timedelta(seconds=4 if mode == "normal" else 82)),
+                _iso_utc(current - timedelta(seconds=82 if is_stale_mode else 4)),
                 "0.525",
                 "0.535",
                 "0.530",
@@ -594,7 +706,7 @@ def create_sample_state(
                 "SIG-MI-SEN-D",
                 "SEN-MI-2026",
                 "D",
-                _iso_utc(current - timedelta(seconds=7 if mode == "normal" else 90)),
+                _iso_utc(current - timedelta(seconds=90 if is_stale_mode else 7)),
                 "0.550",
                 "0.560",
                 "0.555",
@@ -613,7 +725,7 @@ def create_sample_state(
                 "SIG-WI-SEN-D",
                 "SEN-WI-2026",
                 "D",
-                _iso_utc(current - timedelta(seconds=11 if mode == "normal" else 115)),
+                _iso_utc(current - timedelta(seconds=115 if is_stale_mode else 11)),
                 "0.505",
                 "0.515",
                 "0.510",
@@ -632,7 +744,7 @@ def create_sample_state(
                 "SIG-PA-GOV-D",
                 "GOV-PA-2026",
                 "D",
-                _iso_utc(current - timedelta(seconds=15 if mode == "normal" else 130)),
+                _iso_utc(current - timedelta(seconds=130 if is_stale_mode else 15)),
                 "0.605",
                 "0.615",
                 "0.610",
@@ -651,7 +763,7 @@ def create_sample_state(
                 "SIG-AZ-SEN-D",
                 "SEN-AZ-2026",
                 "D",
-                _iso_utc(current - timedelta(seconds=78)),  # > 60s -> flagged STALE
+                _iso_utc(current - timedelta(seconds=78)),
                 "0.530",
                 "0.545",
                 "0.538",
@@ -678,46 +790,46 @@ def create_sample_state(
             quotes_rows,
         )
 
-        # Events rows (info, warn, error)
+        # Events rows
         events_rows = [
             (
                 _iso_utc(current - timedelta(minutes=6)),
                 "info",
-                "startup",
+                "start",
                 "Bellwether election-week bot initialized (WAL mode, contract v1)",
             ),
             (
                 _iso_utc(current - timedelta(minutes=5)),
                 "error",
-                "rate_limit",
+                "rate_limited",
                 "SIG HTTP 429 on order ord-20261103-001 (SEN-AZ-2026); backing off 60s",
             ),
             (
                 _iso_utc(current - timedelta(minutes=2)),
                 "info",
-                "fill",
+                "reconcile",
                 "Order ord-20261103-003 filled 200 @ 0.615 SUSQ on SIG-PA-GOV-D",
             ),
             (
                 _iso_utc(current - timedelta(seconds=78)),
                 "warn",
-                "stale_quote",
+                "ref_stale",
                 "Quote SIG-AZ-SEN-D older than 60s (78s); skipping SEN-AZ-2026 decisions",
             ),
             (
                 _iso_utc(current - timedelta(seconds=12)),
                 "warn",
-                "venue_divergence",
+                "mismatch",
                 "SEN-OH-2026 blocked: Kalshi (0.630) vs Polymarket (0.545) spread 8.5c > 6.0c",
             ),
             (
                 _iso_utc(current - timedelta(seconds=6)),
-                "info" if mode == "normal" else "error",
-                "order_resting" if mode == "normal" else "halt_detected",
+                "error" if is_stale_mode else "info",
+                "stop" if is_stale_mode else "probe",
                 (
-                    "Resting BUY YES 120 @ 0.535 on SIG-PA-SEN-D (edge +3.7c)"
-                    if mode == "normal"
-                    else "STOP and PAUSED flags active; loop halted pending operator review"
+                    "STOP and PAUSED flags active; loop halted pending operator review"
+                    if is_stale_mode
+                    else "Resting BUY YES 120 @ 0.535 on SIG-PA-SEN-D (edge +3.7c)"
                 ),
             ),
         ]
@@ -739,7 +851,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=("normal", "empty", "missing", "stale"),
+        choices=(
+            "normal",
+            "empty",
+            "missing",
+            "stale",
+            "single_snapshot",
+            "malformed_json",
+        ),
         default="normal",
         help="Sample database scenario to generate.",
     )

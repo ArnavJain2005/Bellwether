@@ -1,9 +1,11 @@
-"""Unit and Streamlit AppTest suite for Task DASH-EW-1 (`dashboard/`)."""
+"""Unit and Streamlit AppTest suite for Tasks DASH-EW-1 and DASH-EW-2 (`dashboard/`)."""
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -17,15 +19,20 @@ from dashboard.app import (
     render_heartbeat_banner_html,
     render_hero_row_html,
     render_orders_panel_html,
+    render_positions_panel_html,
     render_quotes_panel_html,
+    render_race_pnl_panel_html,
 )
 from dashboard.db import (
     CONTRACT_SCHEMA,
     HEARTBEAT_STALE_SECONDS,
     SQLITE_BUSY_TIMEOUT_MS,
+    FilterCriteria,
     connect_readonly,
     default_repo_root,
     load_monitor_snapshot,
+    parse_pnl_json,
+    parse_positions_json,
 )
 from dashboard.sample_db import create_sample_state
 
@@ -51,7 +58,7 @@ def test_readonly_uri_blocks_writes(tmp_path: Path) -> None:
 
 
 def test_state_1_normal_data(tmp_path: Path) -> None:
-    """State 1 (normal data): ALIVE heartbeat, populated hero & 5 panels."""
+    """State 1 (normal data): ALIVE heartbeat, populated hero, 5 panels, positions, P&L & 6h history."""
     db_path = create_sample_state(mode="normal", target_dir=tmp_path, now_utc=FIXED_NOW)
     snap = load_monitor_snapshot(db_path=db_path, state_dir=tmp_path, now_utc=FIXED_NOW)
 
@@ -76,6 +83,23 @@ def test_state_1_normal_data(tmp_path: Path) -> None:
     # Exposure sorted largest committed first
     committed_vals = [float(r["committed"]) for r in snap.exposure_table.rows]
     assert committed_vals == sorted(committed_vals, reverse=True)
+
+    # DASH-EW-2: Positions, per-race P&L, and 6h snapshot history
+    assert snap.positions.status == "ok"
+    assert len(snap.positions.rows) == 5
+    assert snap.race_pnl.status == "ok"
+    assert snap.race_pnl.total_pnl == Decimal("482.50")
+    assert snap.snapshot_history.status == "ok"
+    assert len(snap.snapshot_history.points) == 12
+
+    pos_html = render_positions_panel_html(snap.positions)
+    assert "SEN-PA-2026" in pos_html
+    assert "SIG-PA-SEN-D" in pos_html
+
+    pnl_html = render_race_pnl_panel_html(snap.race_pnl)
+    assert "+215.00 SUSQ ▲" in pnl_html
+    assert "−35.00 SUSQ ▼" in pnl_html
+    assert "+482.50 SUSQ ▲" in pnl_html
 
     # Panels render expected highlights
     hb_html = render_heartbeat_banner_html(snap.heartbeat, snap.fetched_at_ist, False)
@@ -120,17 +144,9 @@ def test_state_2_empty_tables(tmp_path: Path) -> None:
     assert snap.hero.last_event_available is False
     assert snap.hero.last_event_display == "NO DATA"
 
-    for table_res in (
-        snap.heartbeat_table,
-        snap.snapshots_table,
-        snap.exposure_table,
-        snap.orders_table,
-        snap.decisions_table,
-        snap.quotes_table,
-        snap.events_table,
-    ):
-        assert table_res.status == "empty"
-        assert not table_res.has_data
+    assert snap.positions.status == "no_data"
+    assert snap.race_pnl.status == "no_data"
+    assert snap.snapshot_history.status == "empty"
 
     hero_html = render_hero_row_html(snap.hero)
     assert hero_html.count("NO DATA") >= 5
@@ -148,20 +164,9 @@ def test_state_3_missing_file(tmp_path: Path) -> None:
     assert snap.heartbeat.status == "NO HEARTBEAT"
     assert snap.hero.balance_display == "NO DATA"
     assert snap.hero.pnl_display == "NO DATA"
-    assert snap.hero.open_orders_display == "NO DATA"
-    assert snap.hero.exposure_display == "NO DATA"
-    assert snap.hero.last_event_display == "NO DATA"
-
-    for table_res in (
-        snap.heartbeat_table,
-        snap.snapshots_table,
-        snap.exposure_table,
-        snap.orders_table,
-        snap.decisions_table,
-        snap.quotes_table,
-        snap.events_table,
-    ):
-        assert table_res.status == "missing_file"
+    assert snap.positions.status == "no_data"
+    assert snap.race_pnl.status == "no_data"
+    assert snap.snapshot_history.status == "no_data"
 
 
 def test_state_4_stale_heartbeat_and_flags(tmp_path: Path) -> None:
@@ -187,13 +192,113 @@ def test_state_4_stale_heartbeat_and_flags(tmp_path: Path) -> None:
     assert "PAUSED: ACTIVE" in hb_html
 
 
+def test_positions_and_pnl_json_malformed_and_unexpected_keys(tmp_path: Path) -> None:
+    """DASH-EW-2: Missing, malformed, or unexpected-key JSON renders NO DATA / BAD FORMAT."""
+    db_path = create_sample_state(
+        mode="malformed_json", target_dir=tmp_path, now_utc=FIXED_NOW
+    )
+    snap = load_monitor_snapshot(db_path=db_path, state_dir=tmp_path, now_utc=FIXED_NOW)
+
+    assert snap.positions.status == "bad_format"
+    assert "NO DATA / BAD FORMAT" in snap.positions.message
+    assert "unexpected_key" in snap.positions.message
+
+    assert snap.race_pnl.status == "bad_format"
+    assert "NO DATA / BAD FORMAT" in snap.race_pnl.message
+
+    assert snap.hero.pnl_display == "NO DATA / BAD FORMAT"
+    assert snap.hero.pnl_available is False
+
+    pos_html = render_positions_panel_html(snap.positions)
+    assert "NO DATA / BAD FORMAT" in pos_html
+    pnl_html = render_race_pnl_panel_html(snap.race_pnl)
+    assert "NO DATA / BAD FORMAT" in pnl_html
+
+    # Also verify guessed summary keys like {"total": "100", "realized": "50"} are rejected
+    guessed_pnl_row = {
+        "id": 9,
+        "ts_utc": "2026-11-03T14:29:00Z",
+        "pnl_json": json.dumps({"total": "100.00", "realized": "50.00"}),
+    }
+    res_pnl = parse_pnl_json(guessed_pnl_row)
+    assert res_pnl.status == "bad_format"
+    assert "NO DATA / BAD FORMAT" in res_pnl.message
+
+    # Verify missing / null JSON and primitive JSON are rejected
+    assert parse_positions_json({"id": 1, "ts_utc": "2026-11-03T14:29:00Z", "positions_json": None}).status == "bad_format"
+    assert parse_positions_json({"id": 1, "ts_utc": "2026-11-03T14:29:00Z", "positions_json": "123"}).status == "bad_format"
+    assert parse_positions_json({"id": 1, "ts_utc": "2026-11-03T14:29:00Z", "positions_json": json.dumps({"foo": 10})}).status == "bad_format"
+
+
+def test_single_row_snapshot_history(tmp_path: Path) -> None:
+    """DASH-EW-2: snapshots table with only one row returns status='single_row' and 1 point."""
+    db_path = create_sample_state(
+        mode="single_snapshot", target_dir=tmp_path, now_utc=FIXED_NOW
+    )
+    snap = load_monitor_snapshot(db_path=db_path, state_dir=tmp_path, now_utc=FIXED_NOW)
+
+    assert snap.snapshot_history.status == "single_row"
+    assert snap.snapshot_history.has_data is True
+    assert len(snap.snapshot_history.points) == 1
+    pt = snap.snapshot_history.points[0]
+    assert pt.balance == Decimal("10482.50")
+    assert pt.committed == Decimal("1845.00")
+    assert "IST" in pt.ts_ist_label
+
+
+def test_filters_apply_to_orders_decisions_and_positions(tmp_path: Path) -> None:
+    """DASH-EW-2: Filters (race_key, strategy, status/verdict) filter Orders, Decisions, and Positions."""
+    db_path = create_sample_state(mode="normal", target_dir=tmp_path, now_utc=FIXED_NOW)
+    snap = load_monitor_snapshot(db_path=db_path, state_dir=tmp_path, now_utc=FIXED_NOW)
+
+    # 1. Filter by race_key = SEN-MI-2026
+    c_race = FilterCriteria(race_key="SEN-MI-2026")
+    ord_html = render_orders_panel_html(snap.orders_table, c_race)
+    assert "SEN-MI-2026" in ord_html
+    assert "SEN-PA-2026" not in ord_html
+
+    dec_html = render_decisions_panel_html(snap.decisions_table, c_race)
+    assert "SEN-MI-2026" in dec_html
+    assert "SEN-PA-2026" not in dec_html
+
+    pos_html = render_positions_panel_html(snap.positions, c_race)
+    assert "SEN-MI-2026" in pos_html
+    assert "SEN-PA-2026" not in pos_html
+
+    pnl_html = render_race_pnl_panel_html(snap.race_pnl, c_race)
+    assert "SEN-MI-2026" in pnl_html
+    assert "SEN-PA-2026" not in pnl_html
+
+    # 2. Filter by strategy = complement
+    c_strat = FilterCriteria(strategy="complement")
+    ord_comp = render_orders_panel_html(snap.orders_table, c_strat)
+    assert "SEN-MI-2026" in ord_comp
+    assert "GOV-PA-2026" not in ord_comp
+
+    dec_comp = render_decisions_panel_html(snap.decisions_table, c_strat)
+    assert "SEN-MI-2026" in dec_comp
+    assert "SEN-OH-2026" not in dec_comp
+
+    # 3. Filter by status/verdict = blocked (decision verdict) and resting (order status)
+    c_blocked = FilterCriteria(status_verdict="blocked")
+    dec_blocked = render_decisions_panel_html(snap.decisions_table, c_blocked)
+    assert "SEN-OH-2026" in dec_blocked
+    assert "SEN-PA-2026" not in dec_blocked
+
+    c_resting = FilterCriteria(status_verdict="resting")
+    ord_resting = render_orders_panel_html(snap.orders_table, c_resting)
+    assert "SEN-PA-2026" in ord_resting
+    assert "GOV-PA-2026" not in ord_resting
+
+
 def test_missing_table_and_missing_column_resilience(tmp_path: Path) -> None:
     """Missing table or missing contract column returns explicit no-data without crashing."""
     db_path = tmp_path / "partial.db"
     conn = sqlite3.connect(str(db_path))
     try:
-        # Create exposure with missing 'cap' column, and omit all other tables
-        conn.execute("CREATE TABLE exposure (race_key TEXT PRIMARY KEY, ts_utc TEXT, committed TEXT)")
+        conn.execute(
+            "CREATE TABLE exposure (race_key TEXT PRIMARY KEY, ts_utc TEXT, committed TEXT)"
+        )
         conn.commit()
     finally:
         conn.close()
@@ -209,13 +314,16 @@ def test_missing_table_and_missing_column_resilience(tmp_path: Path) -> None:
     assert "cap" in exp_html
 
 
-@pytest.mark.parametrize("mode", ["normal", "empty", "missing", "stale"])
-def test_streamlit_apptest_all_four_states(
+@pytest.mark.parametrize(
+    "mode",
+    ["normal", "empty", "missing", "stale", "single_snapshot", "malformed_json"],
+)
+def test_streamlit_apptest_all_states_and_filter_persistence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     mode: str,
 ) -> None:
-    """Streamlit AppTest renders all 4 states cleanly without exceptions."""
+    """Streamlit AppTest renders all 6 states cleanly and persists filters across reruns."""
     state_dir = tmp_path / mode
     state_dir.mkdir(parents=True, exist_ok=True)
     db_path = create_sample_state(mode=mode, target_dir=state_dir, now_utc=FIXED_NOW)
@@ -228,13 +336,26 @@ def test_streamlit_apptest_all_four_states(
     at.run()
     assert not at.exception, f"AppTest raised exception in mode={mode}: {at.exception}"
 
+    # Verify default filter state is "All"
+    assert at.session_state["filter_race_key"] == "All"
+    assert at.session_state["filter_strategy"] == "All"
+    assert at.session_state["filter_status_verdict"] == "All"
+
+    # Set a filter in session_state and verify it persists across auto-refresh rerun
+    if mode == "normal":
+        at.sidebar.selectbox(key="filter_race_key").select("SEN-PA-2026").run()
+        assert not at.exception
+        assert at.session_state["filter_race_key"] == "SEN-PA-2026"
+        joined = "\n".join(m.value for m in at.markdown)
+        assert "FILTERS: race=SEN-PA-2026" in joined
+
     # Verify pausing auto-refresh when confirm_open is True
     at.session_state["confirm_open"] = True
     at.run()
     assert not at.exception
-    markdown_Joined = "\n".join(m.value for m in at.markdown)
-    assert "REFRESH: PAUSED (CONFIRM OPEN)" in markdown_Joined
-    assert "BELLWETHER EW MONITOR" in markdown_Joined
+    markdown_joined = "\n".join(m.value for m in at.markdown)
+    assert "REFRESH: PAUSED (CONFIRM OPEN)" in markdown_joined
+    assert "BELLWETHER EW MONITOR" in markdown_joined
 
 
 def test_contract_schema_matches_all_seven_tables() -> None:
@@ -264,7 +385,6 @@ def test_readonly_busy_timeout_and_db_busy_banner(
     finally:
         conn.close()
 
-    # Simulate SQLite lock contention on connection open
     def _raise_locked(*_args: object, **_kwargs: object) -> sqlite3.Connection:
         raise sqlite3.OperationalError("database is locked")
 

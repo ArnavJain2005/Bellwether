@@ -5,13 +5,15 @@ Follows ``bot/CONTRACT.md`` and ``AGENTS.md``:
 - Uses the exact table and column names from ``bot/CONTRACT.md``.
 - Never creates, modifies, or deletes database or state files.
 - Never imports ``engine/`` or ``bot/``, never reads ``.env``, and makes no network calls.
-- Returns explicit ``no data`` states when the file, a table, a column, or rows are missing.
+- Returns explicit ``no data`` / ``bad format`` states when the file, a table, a column,
+  rows, or JSON payloads are missing or malformed.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, timezone
@@ -28,10 +30,61 @@ from urllib.parse import quote
 HEARTBEAT_STALE_SECONDS: float = 30.0
 QUOTE_STALE_SECONDS: float = 60.0
 SQLITE_BUSY_TIMEOUT_MS: int = 2000
+DEFAULT_HISTORY_HOURS: float = 6.0
+DEFAULT_SNAPSHOT_HISTORY_LIMIT: int = 360
 IST_TZ = timezone(timedelta(hours=5, minutes=30), name="IST")
 
 OPEN_ORDER_STATUSES: frozenset[str] = frozenset(
     {"journaled", "sent", "resting", "partial"}
+)
+ALL_ORDER_STATUSES: tuple[str, ...] = (
+    "journaled",
+    "sent",
+    "resting",
+    "filled",
+    "partial",
+    "cancelled",
+    "expired",
+    "rejected",
+    "unknown",
+)
+ALL_DECISION_VERDICTS: tuple[str, ...] = (
+    "order",
+    "would_order",
+    "blocked",
+    "skip",
+)
+ALL_STRATEGIES: tuple[str, ...] = (
+    "complement",
+    "reference",
+    "probe",
+)
+
+# Exact position fields from `bot/CONTRACT.md` (no guessed keys).
+ALLOWED_POSITION_KEYS: frozenset[str] = frozenset(
+    {
+        "race_key",
+        "sig_exchange_id",
+        "sig_market_id",
+        "party",
+        "side",
+        "quantity",
+        "price_side",
+        "total_cost",
+        "committed",
+    }
+)
+ALLOWED_PARTIES: frozenset[str] = frozenset({"D", "R", "I"})
+ALLOWED_SIDES: frozenset[str] = frozenset({"yes", "no"})
+
+# Valid `race_key` patterns per `bot/CONTRACT.md` (`senate:PA`, `governor:AZ`,
+# `house:PA-08`, `house_control`, `senate_control`, or `SEN-PA-2026` style).
+_RACE_KEY_RE = re.compile(
+    r"^(?:"
+    r"(?:senate|governor|house):[A-Za-z0-9_-]+"
+    r"|(?:house|senate)_control"
+    r"|(?:SEN|GOV|HOUSE)-[A-Z0-9-]+"
+    r")$"
 )
 
 CONTRACT_SCHEMA: dict[str, tuple[str, ...]] = {
@@ -204,6 +257,97 @@ class HeroMetrics:
 
 
 @dataclass(frozen=True)
+class PositionRow:
+    """Validated position entry from ``snapshots.positions_json``."""
+
+    race_key: str
+    sig_exchange_id: str
+    sig_market_id: str
+    party: str
+    side: str
+    quantity: Decimal
+    price_side: Decimal | None
+    total_cost: Decimal | None
+    committed: Decimal | None
+
+
+@dataclass(frozen=True)
+class ParsedPositionsResult:
+    """Result of parsing ``snapshots.positions_json`` against ``bot/CONTRACT.md``."""
+
+    status: str  # "ok" | "empty" | "no_data" | "bad_format"
+    rows: list[PositionRow] = field(default_factory=list)
+    snapshot_id: int | None = None
+    snapshot_ts_ist: str = "—"
+    message: str = ""
+
+    @property
+    def has_data(self) -> bool:
+        return self.status == "ok" and len(self.rows) > 0
+
+
+@dataclass(frozen=True)
+class RacePnlRow:
+    """Validated per-race P&L entry from ``snapshots.pnl_json``."""
+
+    race_key: str
+    pnl: Decimal
+
+
+@dataclass(frozen=True)
+class ParsedPnlResult:
+    """Result of parsing ``snapshots.pnl_json`` against ``bot/CONTRACT.md``."""
+
+    status: str  # "ok" | "empty" | "no_data" | "bad_format"
+    rows: list[RacePnlRow] = field(default_factory=list)
+    total_pnl: Decimal | None = None
+    snapshot_id: int | None = None
+    snapshot_ts_ist: str = "—"
+    message: str = ""
+
+    @property
+    def has_data(self) -> bool:
+        return self.status == "ok" and len(self.rows) > 0
+
+
+@dataclass(frozen=True)
+class SnapshotHistoryPoint:
+    """One chronological point from ``snapshots`` for the history chart."""
+
+    id: int
+    ts_utc: str
+    ts_dt_utc: datetime
+    ts_ist_dt: datetime
+    ts_ist_label: str
+    balance: Decimal
+    committed: Decimal
+    open_orders: int | None
+
+
+@dataclass(frozen=True)
+class SnapshotHistoryResult:
+    """Time-series history of balance and committed exposure from ``snapshots``."""
+
+    status: str  # "ok" | "single_row" | "empty" | "no_data" | "bad_format"
+    points: list[SnapshotHistoryPoint] = field(default_factory=list)
+    window_hours: float = DEFAULT_HISTORY_HOURS
+    message: str = ""
+
+    @property
+    def has_data(self) -> bool:
+        return self.status in {"ok", "single_row"} and len(self.points) > 0
+
+
+@dataclass(frozen=True)
+class FilterCriteria:
+    """Active user filter selections applied to Orders, Decisions, and Positions."""
+
+    race_key: str = "All"
+    strategy: str = "All"
+    status_verdict: str = "All"
+
+
+@dataclass(frozen=True)
 class MonitorSnapshot:
     """Complete read-only snapshot of all tables and derived dashboard states."""
 
@@ -220,6 +364,15 @@ class MonitorSnapshot:
     events_table: TableResult
     heartbeat: HeartbeatState
     hero: HeroMetrics
+    positions: ParsedPositionsResult = field(
+        default_factory=lambda: ParsedPositionsResult(status="no_data")
+    )
+    race_pnl: ParsedPnlResult = field(
+        default_factory=lambda: ParsedPnlResult(status="no_data")
+    )
+    snapshot_history: SnapshotHistoryResult = field(
+        default_factory=lambda: SnapshotHistoryResult(status="no_data")
+    )
     db_busy: bool = False
     db_busy_message: str | None = None
 
@@ -332,7 +485,7 @@ def compute_age_seconds(value: Any, now_utc: datetime) -> float | None:
 
 def parse_decimal(value: Any) -> Decimal | None:
     """Safely parse a string/number into a ``Decimal``, returning ``None`` on invalid input."""
-    if value is None or isinstance(value, bool):
+    if value is None or isinstance(value, (bool, list, dict)):
         return None
     raw = str(value).strip()
     if not raw:
@@ -344,6 +497,18 @@ def parse_decimal(value: Any) -> Decimal | None:
     if not dec.is_finite():
         return None
     return dec
+
+
+def is_valid_race_key(value: Any, known_race_keys: set[str] | None = None) -> bool:
+    """Return True if ``value`` is a valid ``race_key`` per ``bot/CONTRACT.md``."""
+    if not isinstance(value, str):
+        return False
+    key = value.strip()
+    if not key:
+        return False
+    if known_race_keys and key in known_race_keys:
+        return True
+    return bool(_RACE_KEY_RE.match(key))
 
 
 def format_susq(value: Any, *, decimals: int = 2, with_unit: bool = True) -> str:
@@ -396,6 +561,536 @@ def format_edge(value: Any) -> tuple[str, str]:
     if dec < 0:
         return f"−{abs(dec):.3f} (−{abs(cents)}¢) ▼", "negative"
     return "0.000 (0.0¢)", "neutral"
+
+
+def parse_positions_json(
+    snapshot_row: dict[str, Any] | None,
+    known_race_keys: set[str] | None = None,
+) -> ParsedPositionsResult:
+    """Parse ``snapshots.positions_json`` strictly following ``bot/CONTRACT.md``.
+
+    Never guesses undocumented keys: any unexpected object key or invalid value
+    returns ``status="bad_format"`` with a ``NO DATA / BAD FORMAT`` message.
+    """
+    if snapshot_row is None:
+        return ParsedPositionsResult(
+            status="no_data",
+            message="NO DATA — No snapshots row available",
+        )
+
+    snap_id_raw = snapshot_row.get("id")
+    snap_id = int(snap_id_raw) if isinstance(snap_id_raw, int) else None
+    snap_ts_ist = format_ist_timestamp(snapshot_row.get("ts_utc"))
+    raw = snapshot_row.get("positions_json")
+
+    if raw is None or not str(raw).strip():
+        return ParsedPositionsResult(
+            status="bad_format",
+            snapshot_id=snap_id,
+            snapshot_ts_ist=snap_ts_ist,
+            message="NO DATA / BAD FORMAT — positions_json is missing or empty",
+        )
+
+    try:
+        parsed = json.loads(str(raw))
+    except (ValueError, TypeError):
+        return ParsedPositionsResult(
+            status="bad_format",
+            snapshot_id=snap_id,
+            snapshot_ts_ist=snap_ts_ist,
+            message="NO DATA / BAD FORMAT — positions_json is malformed JSON",
+        )
+
+    if not isinstance(parsed, (list, dict)):
+        return ParsedPositionsResult(
+            status="bad_format",
+            snapshot_id=snap_id,
+            snapshot_ts_ist=snap_ts_ist,
+            message="NO DATA / BAD FORMAT — positions_json must be a JSON array or object",
+        )
+
+    if len(parsed) == 0:
+        return ParsedPositionsResult(
+            status="empty",
+            rows=[],
+            snapshot_id=snap_id,
+            snapshot_ts_ist=snap_ts_ist,
+            message="NO DATA — No positions recorded in latest snapshot",
+        )
+
+    rows: list[PositionRow] = []
+
+    def _validate_dict_item(
+        item: dict[str, Any],
+        fallback_race_key: str = "",
+        fallback_party: str = "",
+        fallback_exchange_id: str = "",
+    ) -> PositionRow | str:
+        if not item:
+            return "NO DATA / BAD FORMAT — Empty position object in positions_json"
+        unexpected = set(item.keys()) - ALLOWED_POSITION_KEYS
+        if unexpected:
+            bad_list = ", ".join(sorted(str(k) for k in unexpected))
+            return f"NO DATA / BAD FORMAT — Unexpected keys in positions_json: {bad_list}"
+
+        if "quantity" not in item:
+            return "NO DATA / BAD FORMAT — Position object missing required 'quantity' key"
+        qty_dec = parse_decimal(item.get("quantity"))
+        if qty_dec is None:
+            return "NO DATA / BAD FORMAT — Invalid 'quantity' value in positions_json"
+
+        race_val = str(item.get("race_key") or fallback_race_key).strip()
+        exch_val = str(item.get("sig_exchange_id") or fallback_exchange_id).strip()
+        mkt_val = str(item.get("sig_market_id") or "").strip()
+        party_val = str(item.get("party") or fallback_party).strip()
+        side_val = str(item.get("side") or "").strip().lower()
+
+        if not race_val and not exch_val:
+            return "NO DATA / BAD FORMAT — Position requires 'race_key' or 'sig_exchange_id'"
+        if race_val and not is_valid_race_key(race_val, known_race_keys):
+            return f"NO DATA / BAD FORMAT — Invalid race_key '{race_val}' in positions_json"
+        if party_val and party_val not in ALLOWED_PARTIES:
+            return f"NO DATA / BAD FORMAT — Invalid party '{party_val}' in positions_json"
+        if side_val and side_val not in ALLOWED_SIDES:
+            return f"NO DATA / BAD FORMAT — Invalid side '{side_val}' in positions_json"
+
+        price_dec: Decimal | None = None
+        if item.get("price_side") is not None and str(item.get("price_side")).strip():
+            price_dec = parse_decimal(item.get("price_side"))
+            if price_dec is None or price_dec < 0 or price_dec > 1:
+                return "NO DATA / BAD FORMAT — Invalid 'price_side' in positions_json"
+
+        cost_dec: Decimal | None = None
+        if item.get("total_cost") is not None and str(item.get("total_cost")).strip():
+            cost_dec = parse_decimal(item.get("total_cost"))
+            if cost_dec is None:
+                return "NO DATA / BAD FORMAT — Invalid 'total_cost' in positions_json"
+
+        comm_dec: Decimal | None = None
+        if item.get("committed") is not None and str(item.get("committed")).strip():
+            comm_dec = parse_decimal(item.get("committed"))
+            if comm_dec is None:
+                return "NO DATA / BAD FORMAT — Invalid 'committed' in positions_json"
+
+        return PositionRow(
+            race_key=race_val or "—",
+            sig_exchange_id=exch_val or "—",
+            sig_market_id=mkt_val or "—",
+            party=party_val or "—",
+            side=side_val.upper() if side_val else "—",
+            quantity=qty_dec,
+            price_side=price_dec,
+            total_cost=cost_dec,
+            committed=comm_dec,
+        )
+
+    if isinstance(parsed, list):
+        for elem in parsed:
+            if not isinstance(elem, dict):
+                return ParsedPositionsResult(
+                    status="bad_format",
+                    snapshot_id=snap_id,
+                    snapshot_ts_ist=snap_ts_ist,
+                    message="NO DATA / BAD FORMAT — positions_json array items must be objects",
+                )
+            res = _validate_dict_item(elem)
+            if isinstance(res, str):
+                return ParsedPositionsResult(
+                    status="bad_format",
+                    snapshot_id=snap_id,
+                    snapshot_ts_ist=snap_ts_ist,
+                    message=res,
+                )
+            rows.append(res)
+    else:
+        # Dict payload: check if it looks like a single record with contract keys
+        if any(k in ALLOWED_POSITION_KEYS for k in parsed):
+            res = _validate_dict_item(parsed)
+            if isinstance(res, str):
+                return ParsedPositionsResult(
+                    status="bad_format",
+                    snapshot_id=snap_id,
+                    snapshot_ts_ist=snap_ts_ist,
+                    message=res,
+                )
+            rows.append(res)
+        else:
+            # Map of `{race_key[:party] | sig_exchange_id -> quantity | dict}`
+            for map_key, val in parsed.items():
+                key_str = str(map_key).strip()
+                inferred_race = ""
+                inferred_party = ""
+                inferred_exch = ""
+
+                if ":" in key_str:
+                    parts = key_str.rsplit(":", 1)
+                    if parts[1] in ALLOWED_PARTIES and is_valid_race_key(
+                        parts[0], known_race_keys
+                    ):
+                        inferred_race = parts[0]
+                        inferred_party = parts[1]
+                    elif is_valid_race_key(key_str, known_race_keys):
+                        inferred_race = key_str
+                elif is_valid_race_key(key_str, known_race_keys):
+                    inferred_race = key_str
+                elif key_str.startswith("SIG-") or key_str.isdigit():
+                    inferred_exch = key_str
+
+                if isinstance(val, dict):
+                    if not inferred_race and not inferred_exch and "race_key" not in val and "sig_exchange_id" not in val:
+                        return ParsedPositionsResult(
+                            status="bad_format",
+                            snapshot_id=snap_id,
+                            snapshot_ts_ist=snap_ts_ist,
+                            message=f"NO DATA / BAD FORMAT — Unexpected key '{key_str}' in positions_json",
+                        )
+                    res = _validate_dict_item(
+                        val,
+                        fallback_race_key=inferred_race,
+                        fallback_party=inferred_party,
+                        fallback_exchange_id=inferred_exch,
+                    )
+                    if isinstance(res, str):
+                        return ParsedPositionsResult(
+                            status="bad_format",
+                            snapshot_id=snap_id,
+                            snapshot_ts_ist=snap_ts_ist,
+                            message=res,
+                        )
+                    rows.append(res)
+                else:
+                    if not inferred_race and not inferred_exch:
+                        return ParsedPositionsResult(
+                            status="bad_format",
+                            snapshot_id=snap_id,
+                            snapshot_ts_ist=snap_ts_ist,
+                            message=f"NO DATA / BAD FORMAT — Unexpected key '{key_str}' in positions_json",
+                        )
+                    qty_dec = parse_decimal(val)
+                    if qty_dec is None:
+                        return ParsedPositionsResult(
+                            status="bad_format",
+                            snapshot_id=snap_id,
+                            snapshot_ts_ist=snap_ts_ist,
+                            message=f"NO DATA / BAD FORMAT — Invalid quantity for '{key_str}' in positions_json",
+                        )
+                    rows.append(
+                        PositionRow(
+                            race_key=inferred_race or "—",
+                            sig_exchange_id=inferred_exch or "—",
+                            sig_market_id="—",
+                            party=inferred_party or "—",
+                            side="—",
+                            quantity=qty_dec,
+                            price_side=None,
+                            total_cost=None,
+                            committed=None,
+                        )
+                    )
+
+    rows.sort(key=lambda r: (abs(r.quantity), r.race_key), reverse=True)
+    return ParsedPositionsResult(
+        status="ok",
+        rows=rows,
+        snapshot_id=snap_id,
+        snapshot_ts_ist=snap_ts_ist,
+        message=f"{len(rows)} position(s) in snapshot #{snap_id}",
+    )
+
+
+def parse_pnl_json(
+    snapshot_row: dict[str, Any] | None,
+    known_race_keys: set[str] | None = None,
+) -> ParsedPnlResult:
+    """Parse ``snapshots.pnl_json`` as a per-race P&L table following ``bot/CONTRACT.md``.
+
+    Requires a JSON object mapping valid ``race_key`` strings to finite decimal P&L
+    strings/numbers (or a JSON array of ``{"race_key": ..., "pnl": ...}`` objects).
+    Never guesses summary keys (`total`, `realized`, `unrealized`, etc.); unexpected
+    keys or malformed values return ``status="bad_format"``.
+    """
+    if snapshot_row is None:
+        return ParsedPnlResult(
+            status="no_data",
+            message="NO DATA — No snapshots row available",
+        )
+
+    snap_id_raw = snapshot_row.get("id")
+    snap_id = int(snap_id_raw) if isinstance(snap_id_raw, int) else None
+    snap_ts_ist = format_ist_timestamp(snapshot_row.get("ts_utc"))
+    raw = snapshot_row.get("pnl_json")
+
+    if raw is None or not str(raw).strip():
+        return ParsedPnlResult(
+            status="bad_format",
+            snapshot_id=snap_id,
+            snapshot_ts_ist=snap_ts_ist,
+            message="NO DATA / BAD FORMAT — pnl_json is missing or empty",
+        )
+
+    try:
+        parsed = json.loads(str(raw))
+    except (ValueError, TypeError):
+        return ParsedPnlResult(
+            status="bad_format",
+            snapshot_id=snap_id,
+            snapshot_ts_ist=snap_ts_ist,
+            message="NO DATA / BAD FORMAT — pnl_json is malformed JSON",
+        )
+
+    if not isinstance(parsed, dict):
+        return ParsedPnlResult(
+            status="bad_format",
+            snapshot_id=snap_id,
+            snapshot_ts_ist=snap_ts_ist,
+            message="NO DATA / BAD FORMAT — pnl_json must be a JSON object keyed by race_key",
+        )
+
+    if len(parsed) == 0:
+        return ParsedPnlResult(
+            status="empty",
+            rows=[],
+            total_pnl=None,
+            snapshot_id=snap_id,
+            snapshot_ts_ist=snap_ts_ist,
+            message="NO DATA — No per-race P&L entries in latest snapshot",
+        )
+
+    rows: list[RacePnlRow] = []
+    for key, val in parsed.items():
+        race_str = str(key).strip()
+        if not is_valid_race_key(race_str, known_race_keys):
+            return ParsedPnlResult(
+                status="bad_format",
+                snapshot_id=snap_id,
+                snapshot_ts_ist=snap_ts_ist,
+                message=f"NO DATA / BAD FORMAT — Unexpected key '{race_str}' in pnl_json",
+            )
+        pnl_dec = parse_decimal(val)
+        if pnl_dec is None:
+            return ParsedPnlResult(
+                status="bad_format",
+                snapshot_id=snap_id,
+                snapshot_ts_ist=snap_ts_ist,
+                message=f"NO DATA / BAD FORMAT — Invalid P&L value for '{race_str}' in pnl_json",
+            )
+        rows.append(RacePnlRow(race_key=race_str, pnl=pnl_dec))
+
+    rows.sort(key=lambda r: (abs(r.pnl), r.race_key), reverse=True)
+    total_pnl = sum((r.pnl for r in rows), Decimal(0))
+    return ParsedPnlResult(
+        status="ok",
+        rows=rows,
+        total_pnl=total_pnl,
+        snapshot_id=snap_id,
+        snapshot_ts_ist=snap_ts_ist,
+        message=f"{len(rows)} race(s) in snapshot #{snap_id}",
+    )
+
+
+def build_snapshot_history(
+    snapshots_table: TableResult,
+    window_hours: float = DEFAULT_HISTORY_HOURS,
+) -> SnapshotHistoryResult:
+    """Build chronological balance and exposure history from the last N snapshots."""
+    if not snapshots_table.has_data:
+        return SnapshotHistoryResult(
+            status="no_data" if snapshots_table.status != "empty" else "empty",
+            points=[],
+            window_hours=window_hours,
+            message=snapshots_table.message or "NO DATA — No snapshots available",
+        )
+
+    valid_points: list[SnapshotHistoryPoint] = []
+    for row in snapshots_table.rows:
+        dt_utc = parse_utc_timestamp(row.get("ts_utc"))
+        bal_dec = parse_decimal(row.get("balance"))
+        comm_dec = parse_decimal(row.get("committed"))
+        if dt_utc is None or bal_dec is None or comm_dec is None:
+            continue
+        ist_dt = dt_utc.astimezone(IST_TZ)
+        open_raw = row.get("open_orders")
+        open_int: int | None = None
+        if open_raw is not None and not isinstance(open_raw, bool):
+            try:
+                open_int = int(open_raw)
+            except (ValueError, TypeError):
+                open_int = None
+        valid_points.append(
+            SnapshotHistoryPoint(
+                id=int(row.get("id") or 0),
+                ts_utc=str(row.get("ts_utc")),
+                ts_dt_utc=dt_utc,
+                ts_ist_dt=ist_dt,
+                ts_ist_label=ist_dt.strftime("%H:%M:%S IST"),
+                balance=bal_dec,
+                committed=comm_dec,
+                open_orders=open_int,
+            )
+        )
+
+    if not valid_points:
+        return SnapshotHistoryResult(
+            status="bad_format",
+            points=[],
+            window_hours=window_hours,
+            message="NO DATA / BAD FORMAT — Snapshots missing valid ts_utc, balance, or committed",
+        )
+
+    valid_points.sort(key=lambda p: (p.ts_dt_utc, p.id))
+    latest_ts = valid_points[-1].ts_dt_utc
+    cutoff = latest_ts - timedelta(hours=max(0.1, window_hours))
+    windowed = [p for p in valid_points if p.ts_dt_utc >= cutoff]
+    if not windowed:
+        windowed = [valid_points[-1]]
+
+    if len(windowed) == 1:
+        return SnapshotHistoryResult(
+            status="single_row",
+            points=windowed,
+            window_hours=window_hours,
+            message="1 snapshot recorded in window (awaiting additional 60s snapshots for trend line)",
+        )
+
+    return SnapshotHistoryResult(
+        status="ok",
+        points=windowed,
+        window_hours=window_hours,
+        message=f"{len(windowed)} snapshots over last {window_hours:g}h (IST axis)",
+    )
+
+
+def collect_filter_options(
+    snapshot: MonitorSnapshot,
+    current_criteria: FilterCriteria | None = None,
+) -> tuple[list[str], list[str], list[str]]:
+    """Return ``(race_options, strategy_options, status_verdict_options)`` starting with ``'All'``."""
+    races: set[str] = set()
+    for tbl in (
+        snapshot.exposure_table,
+        snapshot.orders_table,
+        snapshot.decisions_table,
+        snapshot.quotes_table,
+    ):
+        for row in tbl.rows:
+            rk = str(row.get("race_key") or "").strip()
+            if rk:
+                races.add(rk)
+    for pos in snapshot.positions.rows:
+        if pos.race_key and pos.race_key != "—":
+            races.add(pos.race_key)
+    for rp in snapshot.race_pnl.rows:
+        if rp.race_key:
+            races.add(rp.race_key)
+
+    strategies: set[str] = set(ALL_STRATEGIES)
+    for tbl in (snapshot.orders_table, snapshot.decisions_table):
+        for row in tbl.rows:
+            st_val = str(row.get("strategy") or "").strip()
+            if st_val:
+                strategies.add(st_val)
+
+    status_verdicts: list[str] = [
+        "All",
+        "OPEN (orders)",
+        *ALL_ORDER_STATUSES,
+        *ALL_DECISION_VERDICTS,
+    ]
+
+    if current_criteria is not None:
+        if current_criteria.race_key and current_criteria.race_key != "All":
+            races.add(current_criteria.race_key)
+        if current_criteria.strategy and current_criteria.strategy != "All":
+            strategies.add(current_criteria.strategy)
+        if (
+            current_criteria.status_verdict
+            and current_criteria.status_verdict not in status_verdicts
+        ):
+            status_verdicts.append(current_criteria.status_verdict)
+
+    return (
+        ["All", *sorted(races)],
+        ["All", *sorted(strategies)],
+        status_verdicts,
+    )
+
+
+def filter_orders_rows(
+    rows: list[dict[str, Any]],
+    criteria: FilterCriteria,
+) -> list[dict[str, Any]]:
+    """Filter ``orders`` rows by ``race_key``, ``strategy``, and ``status_verdict``."""
+    filtered = rows
+    if criteria.race_key != "All":
+        filtered = [
+            r for r in filtered if str(r.get("race_key") or "").strip() == criteria.race_key
+        ]
+    if criteria.strategy != "All":
+        filtered = [
+            r for r in filtered if str(r.get("strategy") or "").strip() == criteria.strategy
+        ]
+    sv = criteria.status_verdict
+    if sv != "All":
+        if sv == "OPEN (orders)":
+            filtered = [
+                r
+                for r in filtered
+                if str(r.get("status") or "").strip().lower() in OPEN_ORDER_STATUSES
+            ]
+        elif sv in ALL_ORDER_STATUSES or sv not in ALL_DECISION_VERDICTS:
+            filtered = [
+                r
+                for r in filtered
+                if str(r.get("status") or "").strip().lower() == sv.lower()
+            ]
+    return filtered
+
+
+def filter_decisions_rows(
+    rows: list[dict[str, Any]],
+    criteria: FilterCriteria,
+) -> list[dict[str, Any]]:
+    """Filter ``decisions`` rows by ``race_key``, ``strategy``, and ``status_verdict``."""
+    filtered = rows
+    if criteria.race_key != "All":
+        filtered = [
+            r for r in filtered if str(r.get("race_key") or "").strip() == criteria.race_key
+        ]
+    if criteria.strategy != "All":
+        filtered = [
+            r for r in filtered if str(r.get("strategy") or "").strip() == criteria.strategy
+        ]
+    sv = criteria.status_verdict
+    if sv != "All" and (
+        sv in ALL_DECISION_VERDICTS
+        or (sv != "OPEN (orders)" and sv not in ALL_ORDER_STATUSES)
+    ):
+        filtered = [
+            r
+            for r in filtered
+            if str(r.get("verdict") or "").strip().lower() == sv.lower()
+        ]
+    return filtered
+
+
+def filter_position_rows(
+    rows: list[PositionRow],
+    criteria: FilterCriteria,
+) -> list[PositionRow]:
+    """Filter ``PositionRow`` entries by ``race_key``."""
+    if criteria.race_key == "All":
+        return rows
+    return [r for r in rows if r.race_key == criteria.race_key]
+
+
+def filter_race_pnl_rows(
+    rows: list[RacePnlRow],
+    criteria: FilterCriteria,
+) -> list[RacePnlRow]:
+    """Filter ``RacePnlRow`` entries by ``race_key``."""
+    if criteria.race_key == "All":
+        return rows
+    return [r for r in rows if r.race_key == criteria.race_key]
 
 
 def _read_paused_file_reason(paused_path: Path) -> str | None:
@@ -592,62 +1287,16 @@ def _evaluate_heartbeat(
     )
 
 
-def _extract_pnl_from_snapshot(
-    snapshot_row: dict[str, Any],
-    heartbeat_row: dict[str, Any] | None,
-) -> tuple[Decimal | None, str]:
-    """Extract P&L from ``snapshots.pnl_json`` or ``balance - start_balance``."""
-    raw_pnl_json = snapshot_row.get("pnl_json")
-    if raw_pnl_json is not None and str(raw_pnl_json).strip():
-        try:
-            parsed = json.loads(str(raw_pnl_json))
-        except (ValueError, TypeError):
-            parsed = None
-
-        if isinstance(parsed, (int, float, str)):
-            dec = parse_decimal(parsed)
-            if dec is not None:
-                return dec, "from snapshots.pnl_json"
-        elif isinstance(parsed, dict) and parsed:
-            for key in ("total", "total_pnl", "pnl", "net", "net_pnl"):
-                if key in parsed:
-                    dec = parse_decimal(parsed[key])
-                    if dec is not None:
-                        return dec, f"from snapshots.pnl_json[{key}]"
-            if "realized" in parsed or "unrealized" in parsed:
-                r_dec = parse_decimal(parsed.get("realized")) or Decimal(0)
-                u_dec = parse_decimal(parsed.get("unrealized")) or Decimal(0)
-                if (
-                    parse_decimal(parsed.get("realized")) is not None
-                    or parse_decimal(parsed.get("unrealized")) is not None
-                ):
-                    return r_dec + u_dec, "realized + unrealized"
-            numeric_vals = [parse_decimal(v) for v in parsed.values()]
-            valid_vals = [v for v in numeric_vals if v is not None]
-            if valid_vals and len(valid_vals) == len(parsed):
-                return sum(valid_vals, Decimal(0)), f"sum across {len(valid_vals)} races"
-
-    snap_bal = parse_decimal(snapshot_row.get("balance"))
-    start_bal = (
-        parse_decimal(heartbeat_row.get("start_balance"))
-        if heartbeat_row is not None
-        else None
-    )
-    if snap_bal is not None and start_bal is not None:
-        return snap_bal - start_bal, f"vs start {format_susq(start_bal)}"
-
-    return None, "pnl_json empty & no start_balance"
-
-
 def _compute_hero_metrics(
     snapshots_table: TableResult,
     heartbeat_table: TableResult,
     exposure_table: TableResult,
     orders_table: TableResult,
     events_table: TableResult,
+    parsed_pnl: ParsedPnlResult,
     now_utc: datetime,
 ) -> HeroMetrics:
-    """Compute the 5 hero cards without fabricating zeros for missing data."""
+    """Compute the 5 hero cards without fabricating zeros or guessing keys."""
     hb_row = heartbeat_table.rows[0] if heartbeat_table.has_data else None
     snap_row = snapshots_table.rows[0] if snapshots_table.has_data else None
 
@@ -664,16 +1313,30 @@ def _compute_hero_metrics(
             balance_sub = f"Snapshot #{snap_row.get('id')} balance null"
             balance_available = False
 
-        pnl_dec, pnl_source = _extract_pnl_from_snapshot(snap_row, hb_row)
-        if pnl_dec is not None:
-            pnl_display, pnl_direction = format_signed_susq(pnl_dec)
-            pnl_sub = pnl_source
+        if parsed_pnl.status == "ok" and parsed_pnl.total_pnl is not None:
+            pnl_display, pnl_direction = format_signed_susq(parsed_pnl.total_pnl)
+            pnl_sub = f"sum across {len(parsed_pnl.rows)} race(s) in pnl_json"
             pnl_available = True
-        else:
-            pnl_display = "NO DATA"
+        elif parsed_pnl.status == "bad_format":
+            pnl_display = "NO DATA / BAD FORMAT"
             pnl_direction = "no_data"
-            pnl_sub = pnl_source
+            pnl_sub = parsed_pnl.message
             pnl_available = False
+        else:
+            start_bal = (
+                parse_decimal(hb_row.get("start_balance"))
+                if hb_row is not None
+                else None
+            )
+            if bal_dec is not None and start_bal is not None:
+                pnl_display, pnl_direction = format_signed_susq(bal_dec - start_bal)
+                pnl_sub = f"vs start {format_susq(start_bal)}"
+                pnl_available = True
+            else:
+                pnl_display = "NO DATA"
+                pnl_direction = "no_data"
+                pnl_sub = parsed_pnl.message or "pnl_json empty & no start_balance"
+                pnl_available = False
     else:
         balance_display = "NO DATA"
         balance_sub = snapshots_table.message or "No snapshots row"
@@ -703,7 +1366,9 @@ def _compute_hero_metrics(
     if snap_open_count is not None:
         open_orders_display = str(snap_open_count)
         if live_open_count is not None:
-            open_orders_sub = f"Snapshot: {snap_open_count} | Orders table open: {live_open_count}"
+            open_orders_sub = (
+                f"Snapshot: {snap_open_count} | Orders table open: {live_open_count}"
+            )
         else:
             open_orders_sub = f"From snapshot #{snap_row.get('id')}"
         open_orders_available = True
@@ -713,11 +1378,15 @@ def _compute_hero_metrics(
         open_orders_available = True
     else:
         open_orders_display = "NO DATA"
-        open_orders_sub = snapshots_table.message or orders_table.message or "No order data"
+        open_orders_sub = (
+            snapshots_table.message or orders_table.message or "No order data"
+        )
         open_orders_available = False
 
     # 4. Total exposure
-    cap_total_dec = parse_decimal(hb_row.get("cap_total")) if hb_row is not None else None
+    cap_total_dec = (
+        parse_decimal(hb_row.get("cap_total")) if hb_row is not None else None
+    )
     if exposure_table.status == "ok":
         exp_decimals = [parse_decimal(r.get("committed")) for r in exposure_table.rows]
         valid_exp = [d for d in exp_decimals if d is not None]
@@ -725,7 +1394,9 @@ def _compute_hero_metrics(
             total_exp = sum(valid_exp, Decimal(0))
             exposure_display = format_susq(total_exp)
             if cap_total_dec is not None and cap_total_dec > 0:
-                pct = (total_exp / cap_total_dec * Decimal(100)).quantize(Decimal("0.1"))
+                pct = (total_exp / cap_total_dec * Decimal(100)).quantize(
+                    Decimal("0.1")
+                )
                 exposure_sub = f"{len(valid_exp)} race(s) | Cap {format_susq(cap_total_dec)} ({pct}%)"
             else:
                 exposure_sub = f"Across {len(valid_exp)} active race(s)"
@@ -792,9 +1463,11 @@ def load_monitor_snapshot(
     order_limit: int = 50,
     decision_limit: int = 50,
     event_limit: int = 60,
+    snapshot_history_limit: int = DEFAULT_SNAPSHOT_HISTORY_LIMIT,
+    history_hours: float = DEFAULT_HISTORY_HOURS,
     busy_timeout_ms: int = SQLITE_BUSY_TIMEOUT_MS,
 ) -> MonitorSnapshot:
-    """Load all contract tables and compute banner & hero states in read-only mode."""
+    """Load all contract tables and compute banner, hero, positions, P&L, and history states."""
     resolved_db, resolved_state = resolve_paths(db_path=db_path, state_dir=state_dir)
     current_utc = now_utc.astimezone(UTC) if now_utc else datetime.now(UTC)
     fetched_ist = current_utc.astimezone(IST_TZ).strftime("%H:%M:%S IST")
@@ -806,12 +1479,18 @@ def load_monitor_snapshot(
             for name in CONTRACT_SCHEMA
         }
         hb_state = _evaluate_heartbeat(tables["heartbeat"], resolved_state, current_utc)
+        empty_pos = ParsedPositionsResult(status="no_data", message=missing_msg)
+        empty_pnl = ParsedPnlResult(status="no_data", message=missing_msg)
+        empty_hist = SnapshotHistoryResult(
+            status="no_data", window_hours=history_hours, message=missing_msg
+        )
         hero_state = _compute_hero_metrics(
             tables["snapshots"],
             tables["heartbeat"],
             tables["exposure"],
             tables["orders"],
             tables["events"],
+            empty_pnl,
             current_utc,
         )
         return MonitorSnapshot(
@@ -828,6 +1507,9 @@ def load_monitor_snapshot(
             events_table=tables["events"],
             heartbeat=hb_state,
             hero=hero_state,
+            positions=empty_pos,
+            race_pnl=empty_pnl,
+            snapshot_history=empty_hist,
             db_busy=False,
             db_busy_message=None,
         )
@@ -847,12 +1529,18 @@ def load_monitor_snapshot(
             for name in CONTRACT_SCHEMA
         }
         hb_state = _evaluate_heartbeat(tables["heartbeat"], resolved_state, current_utc)
+        empty_pos = ParsedPositionsResult(status="no_data", message=err_msg)
+        empty_pnl = ParsedPnlResult(status="no_data", message=err_msg)
+        empty_hist = SnapshotHistoryResult(
+            status="no_data", window_hours=history_hours, message=err_msg
+        )
         hero_state = _compute_hero_metrics(
             tables["snapshots"],
             tables["heartbeat"],
             tables["exposure"],
             tables["orders"],
             tables["events"],
+            empty_pnl,
             current_utc,
         )
         return MonitorSnapshot(
@@ -869,6 +1557,9 @@ def load_monitor_snapshot(
             events_table=tables["events"],
             heartbeat=hb_state,
             hero=hero_state,
+            positions=empty_pos,
+            race_pnl=empty_pnl,
+            snapshot_history=empty_hist,
             db_busy=is_busy,
             db_busy_message=err_msg if is_busy else None,
         )
@@ -882,7 +1573,8 @@ def load_monitor_snapshot(
         snapshots_table = _inspect_and_query_table(
             conn,
             "snapshots",
-            "SELECT * FROM snapshots ORDER BY id DESC LIMIT 1",
+            "SELECT * FROM snapshots ORDER BY id DESC LIMIT ?",
+            (snapshot_history_limit,),
         )
         exposure_table = _inspect_and_query_table(
             conn,
@@ -928,6 +1620,30 @@ def load_monitor_snapshot(
     db_busy = len(busy_tables) > 0
     db_busy_message = busy_tables[0].message if busy_tables else None
 
+    known_races: set[str] = set()
+    for tbl in (exposure_table, orders_table, decisions_table, quotes_table):
+        for r in tbl.rows:
+            rk = str(r.get("race_key") or "").strip()
+            if rk:
+                known_races.add(rk)
+
+    latest_snap = snapshots_table.rows[0] if snapshots_table.has_data else None
+    positions_res = (
+        parse_positions_json(latest_snap, known_race_keys=known_races)
+        if latest_snap is not None
+        else ParsedPositionsResult(
+            status="no_data", message=snapshots_table.message or "No snapshots row"
+        )
+    )
+    pnl_res = (
+        parse_pnl_json(latest_snap, known_race_keys=known_races)
+        if latest_snap is not None
+        else ParsedPnlResult(
+            status="no_data", message=snapshots_table.message or "No snapshots row"
+        )
+    )
+    history_res = build_snapshot_history(snapshots_table, window_hours=history_hours)
+
     hb_state = _evaluate_heartbeat(heartbeat_table, resolved_state, current_utc)
     hero_state = _compute_hero_metrics(
         snapshots_table,
@@ -935,6 +1651,7 @@ def load_monitor_snapshot(
         exposure_table,
         orders_table,
         events_table,
+        pnl_res,
         current_utc,
     )
 
@@ -952,6 +1669,9 @@ def load_monitor_snapshot(
         events_table=events_table,
         heartbeat=hb_state,
         hero=hero_state,
+        positions=positions_res,
+        race_pnl=pnl_res,
+        snapshot_history=history_res,
         db_busy=db_busy,
         db_busy_message=db_busy_message,
     )

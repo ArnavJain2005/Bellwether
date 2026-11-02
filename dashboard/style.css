@@ -38,15 +38,63 @@ footer,
 }
 
 .block-container {
-    padding-top: 0.45rem !important;
-    padding-bottom: 0.35rem !important;
+    padding-top: 0.42rem !important;
+    padding-bottom: 0.30rem !important;
     padding-left: 0.85rem !important;
     padding-right: 0.85rem !important;
     max-width: 100% !important;
 }
 
 div[data-testid="stVerticalBlock"] > div {
-    gap: 0.35rem !important;
+    gap: 0.32rem !important;
+}
+
+/* Compact Sidebar Filter Dock */
+section[data-testid="stSidebar"] {
+    width: 205px !important;
+    min-width: 205px !important;
+    max-width: 205px !important;
+    background-color: #090B0E !important;
+    border-right: 1px solid var(--bw-border) !important;
+}
+
+section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {
+    padding-top: 0.65rem !important;
+    padding-left: 0.65rem !important;
+    padding-right: 0.65rem !important;
+}
+
+section[data-testid="stSidebar"] h3 {
+    color: var(--bw-amber) !important;
+    font-size: 0.74rem !important;
+    font-weight: 800 !important;
+    letter-spacing: 0.08em !important;
+    text-transform: uppercase !important;
+    margin-bottom: 0.15rem !important;
+}
+
+section[data-testid="stSidebar"] label p {
+    color: var(--bw-amber) !important;
+    font-size: 0.66rem !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.05em !important;
+    text-transform: uppercase !important;
+}
+
+/* Compact Streamlit Tabs */
+div[data-testid="stTabs"] button[data-baseweb="tab"] {
+    padding-top: 0.16rem !important;
+    padding-bottom: 0.16rem !important;
+    height: 28px !important;
+    font-family: var(--bw-font-mono) !important;
+    font-size: 0.72rem !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.06em !important;
+    text-transform: uppercase !important;
+}
+
+div[data-testid="stTabs"] div[data-baseweb="tab-panel"] {
+    padding-top: 0.25rem !important;
 }
 
 /* Heartbeat Banner */
@@ -58,8 +106,8 @@ div[data-testid="stVerticalBlock"] > div {
     border: 1px solid var(--bw-border);
     border-left: 4px solid var(--bw-nohb);
     border-radius: 4px;
-    padding: 0.42rem 0.85rem;
-    margin-bottom: 0.35rem;
+    padding: 0.38rem 0.85rem;
+    margin-bottom: 0.30rem;
     font-variant-numeric: tabular-nums;
 }
 
@@ -90,10 +138,10 @@ div[data-testid="stVerticalBlock"] > div {
     border: 1px solid var(--bw-amber);
     border-left: 4px solid var(--bw-amber);
     border-radius: 4px;
-    padding: 0.36rem 0.85rem;
-    margin-bottom: 0.35rem;
+    padding: 0.34rem 0.85rem;
+    margin-bottom: 0.30rem;
     color: var(--bw-amber);
-    font-size: 0.78rem;
+    font-size: 0.76rem;
     font-weight: 700;
     letter-spacing: 0.04em;
 }
@@ -101,7 +149,7 @@ div[data-testid="stVerticalBlock"] > div {
 .bw-hb-left {
     display: flex;
     align-items: center;
-    gap: 0.75rem;
+    gap: 0.70rem;
     flex-wrap: wrap;
 }
 
@@ -117,10 +165,10 @@ div[data-testid="stVerticalBlock"] > div {
     display: inline-flex;
     align-items: center;
     gap: 0.4rem;
-    font-size: 1.02rem;
+    font-size: 0.98rem;
     font-weight: 800;
     letter-spacing: 0.06em;
-    padding: 0.14rem 0.62rem;
+    padding: 0.12rem 0.58rem;
     border-radius: 3px;
     text-transform: uppercase;
 }
@@ -150,27 +198,27 @@ div[data-testid="stVerticalBlock"] > div {
 }
 
 .bw-hb-age {
-    font-size: 0.92rem;
+    font-size: 0.88rem;
     font-weight: 700;
     color: var(--bw-text);
     background: #11151B;
     border: 1px solid var(--bw-border);
-    padding: 0.14rem 0.52rem;
+    padding: 0.12rem 0.48rem;
     border-radius: 3px;
 }
 
 .bw-hb-flags {
     display: flex;
     align-items: center;
-    gap: 0.45rem;
+    gap: 0.42rem;
     flex-wrap: wrap;
 }
 
 .bw-flag-pill {
-    font-size: 0.72rem;
+    font-size: 0.70rem;
     font-weight: 700;
     letter-spacing: 0.05em;
-    padding: 0.14rem 0.48rem;
+    padding: 0.12rem 0.44rem;
     border-radius: 3px;
     text-transform: uppercase;
     border: 1px solid var(--bw-border);
@@ -196,8 +244,8 @@ div[data-testid="stVerticalBlock"] > div {
 .bw-hb-meta {
     display: flex;
     align-items: center;
-    gap: 0.8rem;
-    font-size: 0.72rem;
+    gap: 0.75rem;
+    font-size: 0.70rem;
     color: var(--bw-text-muted);
 }
 
@@ -209,8 +257,8 @@ div[data-testid="stVerticalBlock"] > div {
 .bw-hero-grid {
     display: grid;
     grid-template-columns: repeat(5, minmax(0, 1fr));
-    gap: 0.5rem;
-    margin-bottom: 0.4rem;
+    gap: 0.48rem;
+    margin-bottom: 0.28rem;
 }
 
 .bw-hero-card {
@@ -218,8 +266,8 @@ div[data-testid="stVerticalBlock"] > div {
     backdrop-filter: blur(6px);
     border: 1px solid var(--bw-border);
     border-radius: 4px;
-    padding: 0.42rem 0.68rem;
-    min-height: 66px;
+    padding: 0.38rem 0.64rem;
+    min-height: 62px;
     display: flex;
     flex-direction: column;
     justify-content: space-between;
@@ -227,26 +275,26 @@ div[data-testid="stVerticalBlock"] > div {
 
 .bw-hero-label {
     color: var(--bw-amber);
-    font-size: 0.68rem;
+    font-size: 0.66rem;
     font-weight: 700;
     letter-spacing: 0.08em;
     text-transform: uppercase;
 }
 
 .bw-hero-value {
-    font-size: 1.06rem;
+    font-size: 1.02rem;
     font-weight: 800;
     color: var(--bw-text);
     font-variant-numeric: tabular-nums;
-    line-height: 1.25;
-    margin: 0.1rem 0;
+    line-height: 1.22;
+    margin: 0.08rem 0;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
 }
 
 .bw-hero-sub {
-    font-size: 0.66rem;
+    font-size: 0.64rem;
     color: var(--bw-text-muted);
     white-space: nowrap;
     overflow: hidden;
@@ -278,18 +326,26 @@ div[data-testid="stVerticalBlock"] > div {
     background: var(--bw-panel);
     border: 1px solid var(--bw-border);
     border-radius: 4px;
-    padding: 0.42rem 0.58rem;
+    padding: 0.38rem 0.56rem;
     display: flex;
     flex-direction: column;
     box-sizing: border-box;
 }
 
 .bw-panel-row1 {
-    height: 382px;
+    height: 362px;
 }
 
 .bw-panel-row2 {
-    height: 405px;
+    height: 382px;
+}
+
+.bw-panel-tab2-top {
+    height: 358px;
+}
+
+.bw-panel-tab2-bottom {
+    height: 386px;
 }
 
 .bw-panel-header {
@@ -297,8 +353,8 @@ div[data-testid="stVerticalBlock"] > div {
     align-items: center;
     justify-content: space-between;
     border-bottom: 1px solid var(--bw-border);
-    padding-bottom: 0.28rem;
-    margin-bottom: 0.32rem;
+    padding-bottom: 0.26rem;
+    margin-bottom: 0.28rem;
     flex-shrink: 0;
 }
 
@@ -311,7 +367,7 @@ div[data-testid="stVerticalBlock"] > div {
 }
 
 .bw-panel-meta {
-    font-size: 0.66rem;
+    font-size: 0.65rem;
     color: var(--bw-text-muted);
 }
 
@@ -469,18 +525,18 @@ table.bw-table tbody tr.bw-row-error td {
     background: var(--bw-amber);
 }
 
-/* Empty / No Data State inside panel */
+/* Empty / No Data / Bad Format State inside panel */
 .bw-nodata-box {
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
     height: 100%;
-    min-height: 180px;
+    min-height: 160px;
     border: 1px dashed var(--bw-border-strong);
     border-radius: 3px;
     background: #0A0C0F;
-    padding: 1rem;
+    padding: 0.9rem;
     text-align: center;
 }
 
@@ -496,4 +552,22 @@ table.bw-table tbody tr.bw-row-error td {
 .bw-nodata-msg {
     color: var(--bw-text-muted);
     font-size: 0.7rem;
+}
+
+.bw-single-snap-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: #10141C;
+    border: 1px solid var(--bw-border-strong);
+    border-left: 3px solid var(--bw-alive);
+    border-radius: 3px;
+    padding: 0.26rem 0.65rem;
+    margin-bottom: 0.22rem;
+    font-size: 0.68rem;
+    color: var(--bw-text-muted);
+}
+
+.bw-single-snap-banner strong {
+    color: var(--bw-text);
 }
