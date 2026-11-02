@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
     "httpx",
     "pydantic>=2",
+    "pyyaml",
     "pytest",
     "ruff==0.16.10",
     # The realtime socket adapter (engine/sig_client/realtime_socket.py). Pinned: its
@@ -35,7 +36,7 @@ include = [
 namespaces = false
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "bot/tests"]
 
 [tool.ruff]
 target-version = "py311"
