@@ -1,0 +1,30 @@
+# Owner: Arnav only. Agents never edit this file.
+mode: dry_run                 # dry_run | live (live also needs --live on the command line)
+tournament_id: bda92870-621e-47b0-bc3c-3602c5c26f55
+scale: 0.10                   # multiplies every cap; 0.10 first live hours, then 0.5, then 1.0
+caps:                         # SUSQies of cost (price x shares)
+  per_order: 500
+  per_race: 2000
+  total_committed: 10000      # filled + resting + unknown orders, all races
+  min_cash_reserve: 90000
+  loss_stop: 2000             # no new orders if balance < start_balance - loss_stop
+start_balance: null           # fill from the SIG app before going live
+preexisting_committed: 0      # cost of positions you already hold from manual trading
+max_writes_per_min: 20
+order_expiry_seconds: 120
+no_orders_enabled: false      # true only after the probe gives a clear answer
+no_price_convention: unknown  # unknown | yes_price | no_price (from the probe)
+loop_seconds: 10
+strategies:
+  complement:
+    enabled: true
+    max_sum_ask: 0.97         # buy YES on D and R if their asks sum to this or less
+    min_sum_bid: 1.03         # buy NO on both if bids sum to this or more
+  reference:
+    enabled: true
+    edge: 0.04
+    edge_election_night: 0.06
+    election_night_from_utc: "2026-11-03T23:00:00Z"   # Nov 4, 04:30 IST
+    max_ref_spread: 0.04
+    max_ref_age_s: 30
+    max_venue_disagreement: 0.03

@@ -117,3 +117,12 @@ are not confirmed requirements. Engine protections never depend on the dashboard
 - Pipelines only; raw data files are git-ignored
 - Every dataset gets a validation script that checks totals or counts against a
   published source
+
+## Election-week dashboard (Nov 2–5, 2026, approved by Arnav)
+
+Antigravity builds `dashboard/` (tasks DASH-EW-1 to DASH-EW-3): a Streamlit monitor for
+the election-week bot. It reads `bot/state/bellwether.db` read-only, following
+`bot/CONTRACT.md`. It never imports `engine/` or `bot/`, never reads keys or `.env`,
+makes no network calls, and writes nothing except the file `bot/state/STOP`
+(DASH-EW-3). Antigravity may also do read-only reviews of `bot/` pull requests;
+reviews never edit files.

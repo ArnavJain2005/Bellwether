@@ -1,5 +1,23 @@
 # CLAUDE.md — bellwether
 
+## Election-week exception (Nov 2–5, 2026, approved by Arnav)
+
+Track `BOT-EW` builds `bot/`: a minimal, buy-only trading bot for the last days of the
+competition. It reuses `engine/sig_client` reads and `engine/config.py`.
+
+- Gates G-1 to G-11 and the PRD roadmap do not apply to `bot/` until Nov 5.
+  `bot/CONTRACT.md` is binding for `bot/` and `dashboard/`.
+- Hard rules 2, 3, 4, 6, 7 and 8 apply in full. Rule 5 is tightened: `bot/` never sells.
+- Rule 1 still applies to agents (tests use fakes only). Arnav alone runs `bot/` live.
+- Rule 9: limits live in `config/risk.yaml`, which only Arnav edits.
+- Arnav's decisions for `bot/` only: (a) NO orders stay disabled until Arnav sets
+  `no_price_convention` in `config/risk.yaml` from the probe result (OQ-W3);
+  (b) after a timeout with no response, retry the identical request with the same key
+  at most 3 times within 5 minutes; still unknown → pause all new orders and wait for
+  Arnav (OQ-W10).
+- Ownership: `bot/` → Claude Code. `dashboard/` → Antigravity, read-only access to
+  `bot/state/`, may write only `bot/state/STOP`.
+
 Rules and context for Claude Code. Read this first in every session.
 
 ## What this project is
