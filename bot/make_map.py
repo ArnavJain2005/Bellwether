@@ -136,7 +136,30 @@ def render_review(races: list[dict[str, Any]]) -> str:
     return "\n".join(out)
 
 
+def _refuse_to_erase_approvals() -> None:
+    """Regeneration must not reset Arnav's manually approved contracts."""
+    if not MAP_PATH.exists():
+        return
+    try:
+        existing = yaml.safe_load(MAP_PATH.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise ValueError("existing bot/map.yaml is invalid; refusing to overwrite it") from exc
+    if not isinstance(existing, dict) or not isinstance(existing.get("races"), list):
+        raise ValueError("existing bot/map.yaml is invalid; refusing to overwrite it")
+    for race in existing["races"]:
+        if not isinstance(race, dict) or not isinstance(race.get("contracts"), list):
+            raise ValueError("existing bot/map.yaml is invalid; refusing to overwrite it")
+        for contract in race["contracts"]:
+            if not isinstance(contract, dict) or not isinstance(contract.get("approved"), bool):
+                raise ValueError("existing bot/map.yaml is invalid; refusing to overwrite it")
+            if contract["approved"]:
+                raise ValueError(
+                    "bot/map.yaml contains manual approvals; refusing to regenerate and erase them"
+                )
+
+
 def main() -> None:
+    _refuse_to_erase_approvals()
     candidates = json.loads(CANDIDATES_PATH.read_text(encoding="utf-8"))
     races = build_map(candidates)
     public = [{k: v for k, v in r.items() if k != "_review"} for r in races]
