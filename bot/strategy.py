@@ -12,6 +12,13 @@ to the 0.005 grid in the less aggressive direction: a buy is floored.
   election_night_from_utc. Ask <= fair - edge -> buy YES at the ask. Bid >= fair + edge
   -> buy NO at 1 - bid (NO orders enabled only).
 - Size: min(risk max_quantity, book depth at the price); below 1 share -> skip.
+- Exit (BOT-EW-5, reduce-only, config/exits.yaml): for a holding on side S with fair
+  f_S (f for YES, 1 - f for NO) and SIG's best bid for S, b_S (YES: bid; NO: 1 - ask),
+  exit when b_S >= f_S + exit_edge (exit_edge_election_night from
+  election_night_from_utc). The exit is a complement buy at 1 - b_S, floored, which
+  nets against the holding (bot/exits.py). Same fair-value checks, one-live-order and
+  cooldown rules as the reference strategy. Size: min(held x
+  max_exit_quantity_fraction, book depth at the price), whole shares.
 """
 
 from __future__ import annotations
@@ -22,6 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
+from bot.exits import ExitSettings
 from bot.limits import Limits
 from bot.mapping import MappedContract
 from bot.refs import RefQuote, RefSettings, RefSnapshot, fair_value
@@ -65,6 +73,7 @@ class Evaluation:
     poly_mid: Decimal | None = None
     fair: Decimal | None = None
     edge: Decimal | None = None
+    exit_of_side: str | None = None  # exits only: the held side the legs close
 
     @property
     def is_skip(self) -> bool:
@@ -201,6 +210,115 @@ def evaluate_reference(
         f"no edge: SIG {fmt(sig.bid)}/{fmt(sig.ask)} vs fair {fmt(fair)} +/- {fmt(edge)} {refs}",
         fair=fair,
     )
+
+
+# --- exit -------------------------------------------------------------------------------
+
+
+def other_side(side: str) -> str:
+    return "no" if side == "yes" else "yes"
+
+
+def current_exit_edge(settings: ExitSettings, limits: Limits, now: datetime) -> Decimal:
+    if is_election_night(limits, now):
+        return settings.exit_edge_election_night
+    return settings.exit_edge
+
+
+def evaluate_exit(
+    contract: MappedContract,
+    sig: SigQuote | None,
+    kalshi: RefQuote | None,
+    poly: RefQuote | None,
+    held_side: str | None,
+    held_qty: Decimal | None,
+    settings: ExitSettings | None,
+    limits: Limits,
+    now: datetime,
+    *,
+    busy: Iterable[str] = (),
+    last_order: Mapping[str, datetime] | None = None,
+) -> Evaluation:
+    """Whether to close a holding. A leg is the complement buy that nets against it."""
+    base = {
+        "strategy": "exit",
+        "race_key": contract.race_key,
+        "subject": f"exit:{contract.sig_exchange_id}",
+        "party": contract.party,
+        "sig_exchange_id": contract.sig_exchange_id,
+        "sig_bid": sig.bid if sig else None,
+        "sig_ask": sig.ask if sig else None,
+        "kalshi_mid": kalshi.mid if kalshi else None,
+        "poly_mid": poly.mid if poly else None,
+        "exit_of_side": held_side,
+    }
+
+    def skip(reason: str, **extra: object) -> Evaluation:
+        return Evaluation(legs=(), reason=f"exit: {reason}", **base, **extra)  # type: ignore[arg-type]
+
+    if settings is None or not settings.enabled:
+        return skip("exits disabled")
+    if held_side not in ("yes", "no") or held_qty is None or held_qty < 1:
+        return skip("nothing held")
+    if held_side not in settings.sides:
+        return skip(f"exits on {held_side.upper()} holdings are not enabled (sides)")
+    blocked = exchange_blocked(contract.sig_exchange_id, busy, last_order or {}, now)
+    if blocked:
+        return skip(blocked)
+    if sig is None:
+        return skip("no SIG quote")
+    fair, why = fair_value(kalshi, poly, ref_settings(limits), now)
+    refs = _ref_text(kalshi, poly)
+    if fair is None:
+        return skip(f"no fair value: {why} {refs}")
+    edge = current_exit_edge(settings, limits, now)
+    if held_side == "yes":
+        if sig.bid is None:
+            return skip(f"no SIG bid for the YES held {refs}", fair=fair)
+        fair_side, bid_side = fair, sig.bid
+        text = f"SIG bid {fmt(sig.bid)} >= fair {fmt(fair)} + {fmt(edge)} {refs}"
+        miss = f"SIG bid {fmt(sig.bid)} < fair {fmt(fair)} + {fmt(edge)} {refs}"
+    else:
+        if sig.ask is None:
+            return skip(f"no SIG ask for the NO held {refs}", fair=fair)
+        fair_side, bid_side = 1 - fair, 1 - sig.ask
+        text = (
+            f"SIG NO bid {fmt(bid_side)} (1 - ask {fmt(sig.ask)}) >= NO fair "
+            f"{fmt(fair_side)} + {fmt(edge)} {refs}"
+        )
+        miss = (
+            f"SIG NO bid {fmt(bid_side)} (1 - ask {fmt(sig.ask)}) < NO fair "
+            f"{fmt(fair_side)} + {fmt(edge)} {refs}"
+        )
+    if bid_side < fair_side + edge:
+        return skip(f"hold: {miss}", fair=fair, edge=bid_side - fair_side)
+    side = other_side(held_side)
+    if side == "no" and not no_orders_enabled(limits):
+        return skip(f"{text}, but NO orders are disabled", fair=fair, edge=bid_side - fair_side)
+    # Floored: the complement buy pays at most 1 - b_S, so the shares close at >= b_S.
+    price = buy_price(1 - bid_side)
+    if price is None:
+        return skip(
+            f"complement price {fmt(1 - bid_side)} is outside the tradable range", fair=fair
+        )
+    return Evaluation(
+        legs=(Leg(contract, side, price),),
+        reason=f"exit {held_side.upper()}: {text}",
+        fair=fair,
+        edge=bid_side - fair_side,
+        **base,  # type: ignore[arg-type]
+    )
+
+
+def exit_quantity(held_qty: Decimal, fraction: Decimal, depth: Decimal) -> int:
+    """min(held x fraction, depth at the price), floored to whole shares; 0 means skip."""
+    if held_qty <= 0 or depth <= 0:
+        return 0
+    return max(0, math.floor(min(held_qty * fraction, depth)))
+
+
+def exit_text(leg: Leg, quantity: int, held_side: str) -> str:
+    return f"{order_text(leg, quantity)} to close {quantity} {held_side.upper()}"
 
 
 # --- complement -------------------------------------------------------------------------

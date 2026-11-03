@@ -2,12 +2,27 @@
 
 import ast
 import asyncio
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
+from bot import risk
+from bot.risk import HeldPosition
 from bot.tests.kit import make_intent, make_limits, make_rig
+from bot.tests.test_exits import (
+    HELD,
+    _exit,
+    _row,
+    exit_intent,
+    exit_rig,
+    place_exit,
+    run,
+    settings,
+)
+
+D = Decimal
 
 BOT_DIR = Path(__file__).resolve().parent.parent
 ALLOWED_CALLERS = {"orders.py", "probe.py"}
@@ -161,3 +176,96 @@ def test_every_order_is_checked_against_the_active_step(tmp_path, monkeypatch):
     run(go())
     assert checked and all(s is b is p is a for s, b, p, a in checked)
     assert posted_steps[0] == "L0" and "L0" != posted_steps[-1]
+
+
+# --- exits (BOT-EW-5): no exit reaches POST /orders without risk.check_exit -----------
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        "stop",
+        "paused",
+        "ladder_hold",
+        "unknown",
+        "snapshot",
+        "gone",
+        "flipped",
+        "too_many",
+        "live_exit",
+        "disabled",
+        "side_off",
+        "sell",
+        "not_exit",
+        "probe_two",
+    ],
+)
+def test_refused_exit_makes_zero_requests(tmp_path, setup):
+    rig = exit_rig(tmp_path, [])
+    intent, held, s, probe = exit_intent(), HELD, settings(), False
+    if setup in ("stop", "paused"):
+        (rig.state_dir / setup.upper()).write_text("x")
+    elif setup == "ladder_hold":
+        (rig.state_dir / "LADDER_HOLD").write_text("x")
+    elif setup == "unknown":
+        _row(rig.conn, "u", status="unknown", exchange="99")
+    elif setup == "snapshot":
+        held = replace(HELD, fresh=False)
+    elif setup == "gone":
+        held = None
+    elif setup == "flipped":
+        held = HeldPosition("36", "no", D(10), fresh=True)
+    elif setup == "too_many":
+        intent = exit_intent(quantity=11)
+    elif setup == "live_exit":
+        _exit(rig.conn, "live", price="0.48", status="resting", traded="0", quantity=4)
+    elif setup == "disabled":
+        s = settings(enabled="false")
+    elif setup == "side_off":
+        s = settings(sides="no")
+    elif setup == "sell":
+        intent = exit_intent(action="sell")
+    elif setup == "not_exit":
+        intent = exit_intent(strategy="reference")
+    elif setup == "probe_two":
+        intent, probe = exit_intent(strategy="exit_probe", quantity=2), True
+    before = len(rig.rows())
+    record = place_exit(rig, intent, held=held, s=s, probe=probe)
+    assert record.status == "blocked"
+    assert rig.sig.seen == []
+    assert len(rig.rows()) == before
+    verdicts = [r["verdict"] for r in rig.conn.execute("SELECT verdict FROM decisions")]
+    assert verdicts == ["blocked"]
+
+
+def test_exit_strategy_through_place_is_refused(tmp_path):
+    rig = exit_rig(tmp_path, [])
+    record = run(rig.path.place(exit_intent()))
+    assert record.status == "blocked" and rig.sig.seen == []
+
+
+def _calls(func: ast.AST) -> list[str]:
+    out = []
+    for node in ast.walk(func):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            target = node.func.value
+            prefix = target.id + "." if isinstance(target, ast.Name) else ""
+            out.append(prefix + node.func.attr)
+    return out
+
+
+def test_every_send_is_behind_check_or_check_exit():
+    tree = ast.parse((Path(risk.__file__).parent / "orders.py").read_text(encoding="utf-8"))
+    funcs = {
+        n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+    callers = {name: {c.split(".")[-1] for c in _calls(f)} for name, f in funcs.items()}
+    assert {n for n, c in callers.items() if "_send" in c} == {"_journal_and_send"}
+    assert {n for n, c in callers.items() if "post_order" in c} == {"_send"}
+    assert {n for n, c in callers.items() if "_journal_and_send" in c} == {
+        "_place",
+        "_place_exit",
+    }
+    assert "risk.check" in _calls(funcs["_place"])
+    assert "risk.check_exit" in _calls(funcs["_place_exit"])
+    assert "risk.check" not in _calls(funcs["_place_exit"])

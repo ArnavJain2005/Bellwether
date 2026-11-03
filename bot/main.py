@@ -19,10 +19,16 @@ Each loop (every loop_seconds):
      runs, and only here (bot/ladder.py); the new Limits go to risk and the order path
      together.
   b. SIG bulk prices (<= 100 ids per call) and reference quotes, concurrently.
-  c. quotes_latest and exposure; strategies; at most 5 orders per loop.
+     config/exits.yaml is re-read here too (bot/exits.py): no file or an invalid one
+     means no exits.
+  c. quotes_latest and exposure; exits (reduce-only, before buys so freed cash is
+     counted), then strategies; at most 5 orders per loop. An exit's holding comes from
+     a positions read taken in this stage (live); buys on an exchange wait
+     reentry_block_minutes after an exit there.
   d. every 60 s: balance, positions, open orders -> snapshot; reconcile the journal;
-     cancel our resting orders older than order_expiry_seconds + 30 s. Anything that
-     cannot be explained -> PAUSED (reason 'reconcile').
+     cancel our resting orders older than order_expiry_seconds + 30 s. On an exchange
+     with exits, the SIG position must match the journal's fills (exits shrink it);
+     anything that cannot be explained -> PAUSED (reason 'reconcile').
   e. every 300 s: tournament markets; a market no longer open stops trading.
   f. heartbeat, every loop, whatever happened.
 An unexpected exception in a loop writes an error event and creates PAUSED; the loop
@@ -49,24 +55,26 @@ from typing import Any
 
 from bot import db, risk, strategy
 from bot.db import STATE_DIR
+from bot.exits import DEFAULT_PATH as EXITS_PATH
+from bot.exits import ExitsConfig, ExitSettings
 from bot.ladder import DEFAULT_PATH as LADDER_PATH
 from bot.ladder import LadderController, LoadedLadder, load_ladder
 from bot.limits import Limits, LimitsError, load_limits
 from bot.mapping import MappedContract, MappingError, load_map
 from bot.orders import OrderPath
 from bot.refs import RefCollector, RefSnapshot, fair_value
-from bot.risk import Intent
+from bot.risk import EXIT_STRATEGIES, HeldPosition, Intent
 from bot.sig_writer import SigWriter
 from bot.strategy import Evaluation, Leg, SigQuote
 from engine.config import MIDTERM_ELECTIONS, ConfigError, load_sig_config
-from engine.sig_client.account_reads import PositionsRead
+from engine.sig_client.account_reads import PositionsRead, UnvaluedHoldingsRead
 from engine.sig_client.errors import SigClientError
 from engine.sig_client.rate_limiter import RateLimiter, RequestKind
 from engine.sig_client.rest import SigRestClient
 
 logger = logging.getLogger(__name__)
 
-VERSION = "bot-ew-4"
+VERSION = "bot-ew-5"
 MAX_ORDERS_PER_LOOP = 5
 PRICE_CHUNK = 100  # GET /exchanges/prices takes at most 100 ids
 ACCOUNT_EVERY_S = 60.0
@@ -93,6 +101,33 @@ def _json(value: Any) -> str:
     return json.dumps(value, default=str, sort_keys=True)
 
 
+def signed_positions(
+    read: PositionsRead | UnvaluedHoldingsRead,
+) -> tuple[dict[str, Decimal], set[str]] | None:
+    """(signed quantity per exchange, exchanges with a settled row); None if unvalued.
+
+    Positive = YES shares, negative = NO shares (W5-a). Rows for one exchange are summed.
+    """
+    if not isinstance(read, PositionsRead):
+        return None
+    signed: dict[str, Decimal] = {}
+    settled: set[str] = set()
+    for row in read.rows:
+        if row.settled:
+            settled.add(row.exchangeId)
+            continue
+        signed[row.exchangeId] = signed.get(row.exchangeId, Decimal(0)) + Decimal(row.quantity)
+    return signed, settled
+
+
+def holdings(signed: dict[str, Decimal], *, fresh: bool) -> dict[str, HeldPosition]:
+    return {
+        exchange_id: HeldPosition(exchange_id, "yes" if q > 0 else "no", abs(q), fresh)
+        for exchange_id, q in signed.items()
+        if q != 0
+    }
+
+
 class Bot:
     def __init__(
         self,
@@ -111,6 +146,7 @@ class Bot:
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         ladder: LoadedLadder | None = None,
         ladder_path: Path = LADDER_PATH,
+        exits_path: Path = EXITS_PATH,
     ) -> None:
         self.limits = limits
         self.contracts = {c.sig_exchange_id: c for c in contracts}
@@ -155,6 +191,10 @@ class Bot:
         self._quotes: dict[str, SigQuote] = {}
         self._ordered_this_loop: set[str] = set()
         self._was_paused: bool | None = None
+        self.exits = ExitsConfig(Path(exits_path))
+        self.held: dict[str, HeldPosition] = {}  # from the last account cycle (snapshot)
+        self._position_offset: dict[str, Decimal] = {}  # SIG position - journal fills
+        self._exit_at: dict[str, datetime] = {}  # exits this run, dry run included
         self.ladder = (
             None
             if ladder is None
@@ -254,8 +294,7 @@ class Bot:
         self.event(
             "info",
             "start",
-            f"{VERSION} started in {self.mode} with {len(self.contracts)} approved contracts"
-            f"{held}",
+            f"{VERSION} started in {self.mode} with {len(self.contracts)} approved contracts{held}",
         )
 
     def _resolve_interrupted_rows(self) -> None:
@@ -301,6 +340,7 @@ class Bot:
                 await self.stop("signal")
                 return False
             self.ladder_tick()  # before any strategy: caps never change mid-loop
+            self.exits_tick()
             if self.clock() >= self._next_markets:
                 await self.markets_cycle()
             quotes, refs = await self.read_quotes()
@@ -353,6 +393,20 @@ class Bot:
             return
         if limits is not None:
             self.apply_limits(limits)
+
+    def exits_tick(self) -> None:
+        """Re-read config/exits.yaml; a failure only turns exits off."""
+        try:
+            self.exits.tick(lambda message: self.event("error", "exit", message))
+        except Exception as exc:
+            logger.exception("exits re-read failed")
+            self.exits.settings = None
+            self.event(
+                "error",
+                "exit",
+                f"exits off: re-read failed: {self._redacted(exc)}",
+                throttle="exits:failed",
+            )
 
     async def stop(self, reason: str) -> None:
         if self.live:
@@ -471,6 +525,11 @@ class Bot:
     async def act(self, quotes: dict[str, SigQuote], refs: RefSnapshot) -> None:
         now = self.now()
         self._quotes = quotes
+        self.loop_balance = None
+        self.batch_spent = Decimal(0)
+        self._ordered_this_loop = set()
+        paused = self.paused()
+        sent = await self.exit_stage(quotes, refs, now, paused)  # before buys
         evaluations = strategy.evaluate_all(
             list(self.contracts.values()),
             quotes,
@@ -480,17 +539,26 @@ class Bot:
             busy=self.busy_exchanges(),
             last_order=self.last_order,
         )
-        self.loop_balance = None
-        self.batch_spent = Decimal(0)
-        self._ordered_this_loop = set()
-        paused = self.paused()
-        sent = 0
+        reentry = self.reentry_blocked(now)
         for ev in evaluations:
             if ev.is_skip:
                 self._skip(ev)
                 continue
             if paused:  # no reads spent on orders that risk.check would refuse
                 self._skip(ev, f"{ev.reason}; not sent: PAUSED")
+                continue
+            held_back = [
+                (leg.contract.sig_exchange_id, reentry[leg.contract.sig_exchange_id])
+                for leg in ev.legs
+                if leg.contract.sig_exchange_id in reentry
+            ]
+            if held_back:
+                exchange_id, until = held_back[0]
+                self._skip(
+                    ev,
+                    f"{ev.reason}; not sent: re-entry block after an exit on exchange "
+                    f"{exchange_id} until {db.utc_stamp(until)}",
+                )
                 continue
             # Evaluations were made before this loop's orders: one order per exchange.
             if any(leg.contract.sig_exchange_id in self._ordered_this_loop for leg in ev.legs):
@@ -568,6 +636,242 @@ class Bot:
                     )
                 break
         return placed
+
+    # --- exits ----------------------------------------------------------------------
+
+    def _ref_quotes(self, refs: RefSnapshot, c: MappedContract) -> tuple[Any, Any]:
+        kalshi = refs.kalshi.get(c.kalshi_ticker)
+        poly = refs.polymarket.get(c.polymarket_token_id) if c.polymarket_token_id else None
+        return kalshi, poly
+
+    async def exit_stage(
+        self, quotes: dict[str, SigQuote], refs: RefSnapshot, now: datetime, paused: bool
+    ) -> int:
+        """Reduce-only exits. Returns the orders placed or simulated.
+
+        Exits disabled (or no exits.yaml): nothing is read, evaluated or written.
+        Candidates come from the account snapshot; live, their holdings are then re-read
+        once (one positions read) and every exit is sized and checked on that fresh read.
+        """
+        settings = self.exits.settings
+        if settings is None or not settings.enabled:
+            return 0
+        busy = self.busy_exchanges()
+
+        def evaluate(c: MappedContract, held: HeldPosition | None) -> Evaluation:
+            kalshi, poly = self._ref_quotes(refs, c)
+            return strategy.evaluate_exit(
+                c,
+                quotes.get(c.sig_exchange_id),
+                kalshi,
+                poly,
+                held.side if held else None,
+                held.quantity if held else None,
+                settings,
+                self.limits,
+                now,
+                busy=busy,
+                last_order=self.last_order,
+            )
+
+        candidates: list[tuple[MappedContract, Evaluation]] = []
+        for c in self.contracts.values():
+            held = self.held.get(c.sig_exchange_id)
+            if held is None:
+                continue
+            ev = evaluate(c, held)
+            if ev.is_skip:
+                self._skip(ev)
+            else:
+                candidates.append((c, ev))
+        if not candidates:
+            return 0
+        # No reads spent on exits that risk.check_exit would refuse.
+        held_back = (
+            "PAUSED"
+            if paused
+            else "LADDER_HOLD"
+            if (self.state_dir / "LADDER_HOLD").exists()
+            else "an order is unknown"
+            if db.any_unknown(self.conn)
+            else None
+        )
+        if held_back:
+            for _, ev in candidates:
+                self._skip(ev, f"{ev.reason}; not sent: {held_back}")
+            return 0
+        current = self.held
+        if self.live:
+            fresh = await self._fresh_holdings(candidates)
+            if fresh is None:
+                return 0
+            current = fresh
+        sent = 0
+        for c, first in candidates:
+            held = current.get(c.sig_exchange_id)
+            if held is None:
+                self._skip(first, f"{first.reason}; not sent: the fresh read shows nothing held")
+                continue
+            ev = evaluate(c, held)
+            if ev.is_skip:
+                self._skip(ev)
+                continue
+            if sent >= MAX_ORDERS_PER_LOOP:
+                self._skip(ev, f"{ev.reason}; not sent: {MAX_ORDERS_PER_LOOP} orders this loop")
+                continue
+            if self.limiter.used(RequestKind.READ) + 3 > READ_HEADROOM:
+                self._skip(ev, f"{ev.reason}; not sent: SIG read budget nearly used")
+                continue
+            sent += await self.send_exit(ev, held, settings, now)
+        return sent
+
+    async def _fresh_holdings(
+        self, candidates: Sequence[tuple[MappedContract, Evaluation]]
+    ) -> dict[str, HeldPosition] | None:
+        """One positions read for this loop's exits, reconciled first; None = no exits."""
+
+        def skip_all(why: str) -> None:
+            for _, ev in candidates:
+                self._skip(ev, f"{ev.reason}; not sent: {why}")
+
+        if self.limiter.used(RequestKind.READ) + 1 > READ_HEADROOM:
+            skip_all("SIG read budget nearly used")
+            return None
+        try:
+            read = await self.rest.read_tournament_positions()
+        except SigClientError as exc:
+            skip_all(f"positions read failed ({type(exc).__name__})")
+            return None
+        parsed = signed_positions(read)
+        if parsed is None:
+            skip_all("positions read returned unvalued holdings (409)")
+            return None
+        signed, settled = parsed
+        problems = await self.checked_positions(
+            signed, settled, watch=[c.sig_exchange_id for c, _ in candidates]
+        )
+        if problems:
+            self._reconcile_pause(problems)
+            skip_all("positions do not match the journal")
+            return None
+        return holdings(signed, fresh=True)
+
+    async def send_exit(
+        self, ev: Evaluation, held: HeldPosition, settings: ExitSettings, now: datetime
+    ) -> int:
+        leg = ev.legs[0]
+        exchange_id = leg.contract.sig_exchange_id
+        try:
+            book = await self.rest.get_exchange_orderbook(exchange_id, depth=BOOK_DEPTH)
+        except SigClientError as exc:
+            self._skip(ev, f"{ev.reason}; not sent: orderbook read failed ({type(exc).__name__})")
+            return 0
+        depth = strategy.depth_at(
+            [(lvl.price, lvl.quantity) for lvl in book.bids],
+            [(lvl.price, lvl.quantity) for lvl in book.asks],
+            leg,
+        )
+        quantity = strategy.exit_quantity(held.quantity, settings.max_exit_quantity_fraction, depth)
+        if quantity < 1:
+            self._skip(
+                ev, f"{ev.reason}; not sent: under 1 share (held {held.quantity}, depth {depth})"
+            )
+            return 0
+        c = leg.contract
+        intent = Intent(
+            race_key=c.race_key,
+            sig_market_id=c.sig_market_id,
+            sig_exchange_id=exchange_id,
+            side=leg.side,
+            price_side=leg.price_side,
+            quantity=quantity,
+            strategy="exit",
+            reason=f"{ev.reason} -> {strategy.exit_text(leg, quantity, held.side)}",
+            exit_of_side=held.side,
+        )
+        record = await self.path.place_exit(
+            intent, held=held, settings=settings, context=self._leg_context(ev, leg)
+        )
+        if record.status == "blocked":
+            return 0
+        self.last_order[exchange_id] = now
+        self._ordered_this_loop.add(exchange_id)
+        self._exit_at[exchange_id] = now
+        return 1
+
+    def reentry_blocked(self, now: datetime) -> dict[str, datetime]:
+        """Exchanges whose buys wait after an exit there: exchange id -> until when."""
+        minutes = self.exits.reentry_minutes()
+        if not minutes:
+            return {}
+        times = dict(self._exit_at)
+        rows = self.conn.execute(
+            "SELECT sig_exchange_id, created_utc FROM orders "
+            "WHERE strategy IN ('exit', 'exit_probe') AND status != 'rejected'"
+        ).fetchall()
+        for row in rows:
+            created = datetime.fromisoformat(row["created_utc"])
+            exchange_id = row["sig_exchange_id"]
+            times[exchange_id] = max(created, times.get(exchange_id, created))
+        block = timedelta(minutes=minutes)
+        return {e: t + block for e, t in times.items() if now < t + block}
+
+    async def checked_positions(
+        self, signed: dict[str, Decimal], settled: set[str], *, watch: Sequence[str] = ()
+    ) -> list[str]:
+        """position_problems, after re-reading market statuses if there are any: a market
+        that settled since the last markets cycle (its row gone) drops out, no pause."""
+        problems = self.position_problems(signed, settled, watch=watch)
+        if problems:
+            await self.markets_cycle()
+            problems = self.position_problems(signed, settled, watch=watch)
+        return problems
+
+    def position_problems(
+        self, signed: dict[str, Decimal], settled: set[str], *, watch: Sequence[str] = ()
+    ) -> list[str]:
+        """SIG positions that the journal cannot explain, on exchanges with exits.
+
+        Watched: every exchange with an exit in the journal, plus `watch` (this loop's
+        exit candidates). The first quiet read of an exchange (no live order there)
+        fixes its offset, SIG position minus journal fills, which covers holdings from
+        before the journal or this run. From then on the SIG position must lie within
+        offset + journal fills + what live orders could still fill: a fill, an exit
+        included, moves both alike. A settled or no longer traded market is not checked.
+        """
+        rows = self.conn.execute("SELECT * FROM orders").fetchall()
+        exchanges = set(watch) | set(self._position_offset)
+        exchanges |= {
+            str(r["sig_exchange_id"])
+            for r in rows
+            if r["strategy"] in EXIT_STRATEGIES and r["status"] != "rejected"
+        }
+        problems = []
+        for exchange_id in sorted(exchanges):
+            if exchange_id in settled or exchange_id not in self.contracts:
+                self._position_offset.pop(exchange_id, None)
+                continue
+            filled, low, high = risk.journal_position(rows, exchange_id)
+            actual = signed.get(exchange_id, Decimal(0))
+            offset = self._position_offset.get(exchange_id)
+            if offset is None:
+                if low == high == 0:
+                    self._position_offset[exchange_id] = actual - filled
+                continue
+            lo, hi = offset + filled + low, offset + filled + high
+            if not lo <= actual <= hi:
+                problems.append(
+                    f"position on exchange {exchange_id} is {actual}; the journal explains "
+                    f"{lo}..{hi}"
+                )
+        return problems
+
+    def _reconcile_pause(self, problems: Sequence[str]) -> None:
+        if self.paused():
+            return
+        text = "; ".join(problems)[:500]
+        self.event("error", "reconcile", text)
+        self.pause(f"reconcile: {text}", kind="reconcile")
 
     def _leg_context(self, ev: Evaluation, leg: Leg) -> dict[str, Any]:
         """Decision columns for one leg: the evaluation's, with this leg's SIG quote."""
@@ -656,8 +960,17 @@ class Bot:
                 throttle="account",
             )
             return
+        # Positions are compared with the journal before refresh_statuses: an order SIG
+        # filled since is still live here, so its fill is within the tolerance.
+        parsed = signed_positions(positions)
+        position_problems: list[str] = []
+        if parsed is None:
+            self.held = {}
+        else:
+            position_problems = await self.checked_positions(*parsed)
+            self.held = holdings(parsed[0], fresh=False)
         await self.path.refresh_statuses(walk)
-        self.reconcile(walk.orders)
+        self.reconcile(walk.orders, position_problems)
         await self.cancel_stale(walk.orders)
         total, _ = self.committed()
         if isinstance(positions, PositionsRead):
@@ -675,11 +988,11 @@ class Bot:
         )
         self.write_exposure()
 
-    def reconcile(self, open_orders: Sequence[Any]) -> None:
+    def reconcile(self, open_orders: Sequence[Any], position_problems: Sequence[str] = ()) -> None:
         rows = self.conn.execute("SELECT * FROM orders").fetchall()
         by_id = {row["sig_order_id"]: row for row in rows if row["sig_order_id"]}
         foreign = [o for o in open_orders if str(o.id) not in by_id]
-        problems = []
+        problems = list(position_problems)
         for order in open_orders:
             row = by_id.get(str(order.id))
             if row is None:
@@ -710,10 +1023,8 @@ class Bot:
                 problems.append(message)
             else:
                 self.event("warn", "reconcile", message, throttle="foreign")
-        if problems and not self.paused():
-            text = "; ".join(problems)[:500]
-            self.event("error", "reconcile", text)
-            self.pause(f"reconcile: {text}", kind="reconcile")
+        if problems:
+            self._reconcile_pause(problems)
 
     async def cancel_stale(self, open_orders: Sequence[Any]) -> None:
         if not self.live:
