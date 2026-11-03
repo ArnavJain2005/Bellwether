@@ -113,13 +113,39 @@ you want NO orders. Otherwise leave both as they are.
 
 ## 8. Start the dry run
 
-`BOT_ARGS=--dry-run` and `mode: dry_run` in `config/risk.yaml`. Nothing is sent: every
-order the bot would make is a `would_order` decision.
+After the one-time setup above, run this **one command on the server** from any
+directory:
 
 ```bash
-sudo systemctl enable --now bellwether-bot bellwether-dashboard
-systemctl status bellwether-bot --no-pager
+bash /opt/bellwether/deploy/botctl.sh start
 ```
+
+It checks the approved map, requires `mode: dry_run`, refuses to clear a STOP or
+PAUSED file, and enables/starts the systemd bot service. It verifies an active
+service, boot enablement and a fresh, unpaused dry-run heartbeat before reporting
+success. It never turns on live mode. Keep `BOT_ARGS=--dry-run` in
+`/etc/bellwether.env` (check privately in an editor; never print the key).
+The bot itself requires both switches for live mode.
+
+The service runs independently of your terminal: closing SSH does not stop it.
+`Restart=on-failure` retries a crash, up to five starts per ten minutes; a
+deliberate STOP exits cleanly and does not restart. A persistent PAUSED file
+prevents new orders after a reboot. Startup and reconciliation can still fail;
+the heartbeat check makes that visible rather than silently claiming success.
+Systemd cannot keep the bot running through a host outage or lost network.
+
+Check it later with:
+
+```bash
+bash /opt/bellwether/deploy/botctl.sh status
+bash /opt/bellwether/deploy/botctl.sh logs
+```
+
+`status` exits nonzero for a missing/stale heartbeat, pause, STOP, inactive or
+disabled service, or a mode mismatch. If it fails, inspect `logs` and the
+PAUSED/STOP cause; do not remove either file just to make it green. To start the
+dashboard too (optional), run `sudo systemctl enable --now bellwether-dashboard`
+once and use the SSH tunnel in section 10.
 
 ## 9. Reading what it does
 
