@@ -1,3 +1,6 @@
+import pytest
+
+from bot import make_map
 from bot.make_map import build_map, party_from_title, render_review
 
 
@@ -75,3 +78,20 @@ def test_review_order_and_content():
                                              "house:AZ-01")]
     assert order == sorted(order)
     assert "approve? set approved: true in bot/map.yaml" in text
+
+
+def test_regeneration_preserves_existing_manual_approvals(tmp_path, monkeypatch):
+    map_path = tmp_path / "map.yaml"
+    review_path = tmp_path / "map_review.md"
+    original = "races:\\n- race_key: senate:PA\\n  contracts:\\n  - approved: true\\n"
+    map_path.write_text(original.replace("\\n", "\n"), encoding="utf-8")
+    review_path.write_text("reviewed by Arnav", encoding="utf-8")
+    monkeypatch.setattr(make_map, "MAP_PATH", map_path)
+    monkeypatch.setattr(make_map, "REVIEW_PATH", review_path)
+    monkeypatch.setattr(make_map, "CANDIDATES_PATH", tmp_path / "absent.json")
+
+    with pytest.raises(ValueError, match="manual approvals"):
+        make_map.main()
+
+    assert map_path.read_text(encoding="utf-8") == original.replace("\\n", "\n")
+    assert review_path.read_text(encoding="utf-8") == "reviewed by Arnav"
