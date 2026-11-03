@@ -12,6 +12,34 @@ settlement-equivalent counterpart has been **verified by a human reviewer**.
 Commands are in [`data/r1_mapping/README.md`](../data/r1_mapping/README.md). The latest
 generated status is [`R1_REPORT.md`](R1_REPORT.md).
 
+## Relationship to the election-week bot map (3 Nov 2026)
+
+The bot's [`map.yaml`](../bot/map.yaml) is a narrower, independently approved
+**trading selection**, not the R1 settlement-equivalence ledger. Its `approved: true`
+flag permits a contract in the election-week bot's map; it is not an R1
+`verified_match` decision for Kalshi or Polymarket. The bot map records proposed
+venue identifiers but does not contain reviewed SIG Info-tab text, criterion-by-criterion
+comparisons or R1 reviewer provenance. Do not copy its approvals into
+`r1_mapping.json` without the R1 evidence and review workflow below.
+
+| Recorded state | Count |
+| --- | ---: |
+| SIG contracts in the 9 Oct R1 inventory | 237 |
+| Those contracts represented in the bot map | 190 (95 races) |
+| Bot contracts flagged `approved: true` | 114 (57 races; none in an excluded race) |
+| Bot contracts flagged `approved: false` | 76 |
+| R1 inventory contracts absent from the bot map | 47 |
+| R1 reviewed SIG Info-tab texts | 0 |
+| R1 verified Polymarket / Kalshi matches | 0 / 0 |
+
+The 114 approved bot entries all match an R1 market and exchange ID. Of these,
+114 carry a Kalshi ticker and 78 carry a Polymarket token ID; those identifiers are
+**candidate reference links**, not R1 equivalence findings. The 10 excluded bot
+races contain no approved contracts. These counts describe committed files at
+[`af48722b`](https://github.com/ArnavJain2005/Bellwether/commit/af48722b78d3372ef27c5ece5c304d48ee876659),
+not a current SIG inventory or a new human review. The generated
+[`R1_REPORT.md`](R1_REPORT.md) remains the source of truth for formal R1 status.
+
 ## Files
 
 | File | Written by | What it holds |
