@@ -1,0 +1,25 @@
+# Owner: Arnav only. Agents never edit this file.
+# Absent file = the bot behaves exactly as before (risk.yaml only).
+max_step: L3              # highest step the bot may climb to; lower it to freeze
+steps:
+  - name: L1              # 16:00 IST
+    not_before_utc: "2026-11-03T10:30:00Z"
+    require_live: true
+    clean_minutes: 45     # no error events, mismatches or unknown orders for this long
+    min_fills: 1          # filled or partial live orders since the bot went live
+    scale: 0.5
+    caps: {per_order: 500, per_race: 2000, total_committed: 10000, min_cash_reserve: 90000, loss_stop: 2000}
+  - name: L2              # 18:00 IST
+    not_before_utc: "2026-11-03T12:30:00Z"
+    require_live: true
+    clean_minutes: 60
+    min_fills: 3
+    scale: 1.0
+    caps: {per_order: 1000, per_race: 3500, total_committed: 35000, min_cash_reserve: 60000, loss_stop: 7000}
+  - name: L3              # 04:00 IST Nov 4, 30 min before the first polls close
+    not_before_utc: "2026-11-03T22:30:00Z"
+    require_live: true
+    clean_minutes: 60
+    min_fills: 3
+    scale: 1.0
+    caps: {per_order: 1000, per_race: 5000, total_committed: 65000, min_cash_reserve: 30000, loss_stop: 12000}

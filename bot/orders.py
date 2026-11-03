@@ -184,6 +184,19 @@ class OrderPath:
     def __repr__(self) -> str:
         return f"OrderPath(mode={self._limits.mode!r}, live={self._live})"
 
+    @property
+    def limits(self) -> Limits:
+        return self._limits
+
+    def set_limits(self, limits: Limits) -> None:
+        """Swap in the active ladder step's Limits (bot/main.py, at the start of a loop).
+
+        Refused while a placement holds the lock, so caps never change mid-order.
+        """
+        if self._lock.locked():
+            raise RuntimeError("limits cannot change while an order is being placed")
+        self._limits = limits
+
     # --- pauses and events ----------------------------------------------------------
 
     def pause(self, reason: str, kind: str = "pause") -> None:

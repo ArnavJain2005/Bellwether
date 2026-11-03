@@ -414,7 +414,7 @@ races:
     polymarket_token_id: null
     approved: true
 - race_key: senate:RI
-  exclude: false
+  exclude: true
   note: ''
   contracts:
   - party: D

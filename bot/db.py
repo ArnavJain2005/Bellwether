@@ -34,7 +34,11 @@ CREATE TABLE IF NOT EXISTS heartbeat (
   paused INTEGER CHECK (paused IN (0,1)), pause_reason TEXT,
   stop_seen INTEGER CHECK (stop_seen IN (0,1)), balance TEXT, start_balance TEXT,
   committed TEXT, scale TEXT, cap_total TEXT, cap_per_race TEXT, min_cash_reserve TEXT,
-  edge_now TEXT, election_night INTEGER CHECK (election_night IN (0,1))
+  edge_now TEXT, election_night INTEGER CHECK (election_night IN (0,1)), ladder_step TEXT
+);
+CREATE TABLE IF NOT EXISTS ladder_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1), step TEXT NOT NULL, since_utc TEXT NOT NULL,
+  ladder_sha256 TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS orders (
   key TEXT PRIMARY KEY, created_utc TEXT NOT NULL, updated_utc TEXT NOT NULL,
@@ -93,6 +97,10 @@ def connect(path: Path = DB_PATH) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(_SCHEMA)
+    # A database made before BOT-EW-4 has no heartbeat.ladder_step: add it in place.
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(heartbeat)")}
+    if "ladder_step" not in columns:
+        conn.execute("ALTER TABLE heartbeat ADD COLUMN ladder_step TEXT")
     conn.commit()
     return conn
 
@@ -138,9 +146,13 @@ def insert_decision(conn: sqlite3.Connection, **row: Any) -> int:
     return _insert(conn, "decisions", row)
 
 
-def insert_event(conn: sqlite3.Connection, level: str, kind: str, message: str) -> int:
+def insert_event(
+    conn: sqlite3.Connection, level: str, kind: str, message: str, *, ts_utc: str | None = None
+) -> int:
     return _insert(
-        conn, "events", {"ts_utc": utc_stamp(), "level": level, "kind": kind, "message": message}
+        conn,
+        "events",
+        {"ts_utc": ts_utc or utc_stamp(), "level": level, "kind": kind, "message": message},
     )
 
 
@@ -175,3 +187,19 @@ def upsert_exposure(conn: sqlite3.Connection, **row: Any) -> None:
 def insert_snapshot(conn: sqlite3.Connection, **row: Any) -> int:
     row.setdefault("ts_utc", utc_stamp())
     return _insert(conn, "snapshots", row)
+
+
+def get_ladder_state(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT step, since_utc, ladder_sha256 FROM ladder_state WHERE id = 1"
+    ).fetchone()
+
+
+def set_ladder_state(conn: sqlite3.Connection, *, step: str, since_utc: str, sha: str) -> None:
+    """Rewrite the single ladder_state row (id = 1)."""
+    _upsert(
+        conn,
+        "ladder_state",
+        "id",
+        {"id": 1, "step": step, "since_utc": since_utc, "ladder_sha256": sha},
+    )

@@ -15,6 +15,9 @@ orders; heartbeat and a start event.
 
 Each loop (every loop_seconds):
   a. bot/state/STOP -> live: cancel all; stop event; stop_seen = 1; exit 0.
+     With config/ladder.yaml: the ladder step may change here, before any strategy
+     runs, and only here (bot/ladder.py); the new Limits go to risk and the order path
+     together.
   b. SIG bulk prices (<= 100 ids per call) and reference quotes, concurrently.
   c. quotes_latest and exposure; strategies; at most 5 orders per loop.
   d. every 60 s: balance, positions, open orders -> snapshot; reconcile the journal;
@@ -46,6 +49,8 @@ from typing import Any
 
 from bot import db, risk, strategy
 from bot.db import STATE_DIR
+from bot.ladder import DEFAULT_PATH as LADDER_PATH
+from bot.ladder import LadderController, LoadedLadder, load_ladder
 from bot.limits import Limits, LimitsError, load_limits
 from bot.mapping import MappedContract, MappingError, load_map
 from bot.orders import OrderPath
@@ -61,7 +66,7 @@ from engine.sig_client.rest import SigRestClient
 
 logger = logging.getLogger(__name__)
 
-VERSION = "bot-ew-3"
+VERSION = "bot-ew-4"
 MAX_ORDERS_PER_LOOP = 5
 PRICE_CHUNK = 100  # GET /exchanges/prices takes at most 100 ids
 ACCOUNT_EVERY_S = 60.0
@@ -69,6 +74,7 @@ MARKETS_EVERY_S = 300.0
 STALE_GRACE_S = 30
 SKIP_EVERY_S = 60.0  # skip decisions at most once per subject per minute
 EVENT_EVERY_S = 60.0  # repeated warnings at most once per minute
+LADDER_REASON_EVERY_S = 600.0  # each reason for not climbing at most once per 10 minutes
 READ_HEADROOM = 70  # no optional (orderbook) read once this many reads are in the window
 BOOK_DEPTH = 20
 LIVE_STATUSES = ("journaled", "sent", "resting", "unknown")
@@ -103,6 +109,8 @@ class Bot:
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
+        ladder: LoadedLadder | None = None,
+        ladder_path: Path = LADDER_PATH,
     ) -> None:
         self.limits = limits
         self.contracts = {c.sig_exchange_id: c for c in contracts}
@@ -146,6 +154,19 @@ class Bot:
         self._loop_ms = 0
         self._quotes: dict[str, SigQuote] = {}
         self._ordered_this_loop: set[str] = set()
+        self._was_paused: bool | None = None
+        self.ladder = (
+            None
+            if ladder is None
+            else LadderController(
+                ladder,
+                conn=conn,
+                state_dir=self.state_dir,
+                live=self.live,
+                event=self._ladder_event,
+                path=ladder_path,
+            )
+        )
 
     @property
     def mode(self) -> str:
@@ -159,14 +180,30 @@ class Bot:
         except TimeoutError:
             pass
 
-    def event(self, level: str, kind: str, message: str, *, throttle: str | None = None) -> None:
-        """Write an event; with `throttle`, at most once per minute for that key."""
+    def event(
+        self,
+        level: str,
+        kind: str,
+        message: str,
+        *,
+        throttle: str | None = None,
+        every: float = EVENT_EVERY_S,
+    ) -> None:
+        """Write an event; with `throttle`, at most once per `every` seconds for that key."""
         if throttle is not None:
             last = self._event_logged.get(throttle)
-            if last is not None and self.clock() - last < EVENT_EVERY_S:
+            if last is not None and self.clock() - last < every:
                 return
             self._event_logged[throttle] = self.clock()
-        db.insert_event(self.conn, level, kind, message)
+        db.insert_event(self.conn, level, kind, message, ts_utc=db.utc_stamp(self.now()))
+
+    def _ladder_event(self, level: str, message: str, *, throttle: str | None = None) -> None:
+        self.event(level, "ladder", message, throttle=throttle, every=LADDER_REASON_EVERY_S)
+
+    def apply_limits(self, limits: Limits) -> None:
+        """The one place the active Limits change: risk, sizing, caps and the order path."""
+        self.path.set_limits(limits)
+        self.limits = limits
 
     def paused(self) -> bool:
         return (self.state_dir / "PAUSED").exists()
@@ -205,14 +242,20 @@ class Bot:
         self._resolve_interrupted_rows()
         if self.live:
             await self.path.cancel_all("startup")
+        if self.ladder is not None:
+            self.apply_limits(self.ladder.start(self.now()))
         await self.account_cycle()
         if self.limits.start_balance is None:
             self.event("warn", "start", "start_balance is not set: the loss stop is disabled")
         self.write_heartbeat()
+        # With a ladder, the start event records PAUSED for its live-time count.
+        self._was_paused = self.paused()
+        held = " while PAUSED" if self.ladder is not None and self._was_paused else ""
         self.event(
             "info",
             "start",
-            f"{VERSION} started in {self.mode} with {len(self.contracts)} approved contracts",
+            f"{VERSION} started in {self.mode} with {len(self.contracts)} approved contracts"
+            f"{held}",
         )
 
     def _resolve_interrupted_rows(self) -> None:
@@ -257,6 +300,7 @@ class Bot:
             if self.stopping.is_set():
                 await self.stop("signal")
                 return False
+            self.ladder_tick()  # before any strategy: caps never change mid-loop
             if self.clock() >= self._next_markets:
                 await self.markets_cycle()
             quotes, refs = await self.read_quotes()
@@ -282,6 +326,33 @@ class Bot:
             except Exception:
                 logger.exception("heartbeat write failed")
         return True
+
+    def ladder_tick(self) -> None:
+        """Pause bookkeeping for the ladder's live time, then at most one step change.
+
+        A failure here keeps the current step (and its caps) and never pauses trading.
+        """
+        if self.ladder is None:
+            return
+        paused = self.paused()
+        if paused != self._was_paused:
+            if paused:
+                self.event("info", "pause", "PAUSED file present: ladder live time stops counting")
+            else:
+                self.event("info", "resume", "resumed: the PAUSED file was removed")
+            self._was_paused = paused
+        try:
+            limits = self.ladder.tick(self.now())
+        except Exception as exc:
+            logger.exception("ladder evaluation failed")
+            self._ladder_event(
+                "error",
+                f"ladder evaluation failed, holding at {self.ladder.step}: {self._redacted(exc)}",
+                throttle="ladder:failed",
+            )
+            return
+        if limits is not None:
+            self.apply_limits(limits)
 
     async def stop(self, reason: str) -> None:
         if self.live:
@@ -595,6 +666,7 @@ class Bot:
             positions_json = _json({"unvalued": [dataclasses.asdict(m) for m in positions.missing]})
         db.insert_snapshot(
             self.conn,
+            ts_utc=db.utc_stamp(self.now()),
             balance=_text(self.balance),
             committed=str(total),
             open_orders=len(walk.orders),
@@ -710,6 +782,7 @@ class Bot:
             min_cash_reserve=str(self.limits.effective_cap("min_cash_reserve")),
             edge_now=str(strategy.current_edge(self.limits, now)),
             election_night=int(strategy.is_election_night(self.limits, now)),
+            ladder_step=None if self.ladder is None else self.ladder.step,
         )
 
 
@@ -724,6 +797,7 @@ def _install_signals(bot: Bot) -> None:
 
 async def _main(live_flag: bool) -> int:
     limits = load_limits()
+    ladder = load_ladder(limits)  # None when config/ladder.yaml is absent
     contracts = load_map()
     live = live_flag and limits.mode == "live"
     if live_flag and not live:
@@ -743,6 +817,7 @@ async def _main(live_flag: bool) -> int:
         refs=refs,
         limiter=limiter,
         live=live,
+        ladder=ladder,
     )
     _install_signals(bot)
     try:

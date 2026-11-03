@@ -14,6 +14,7 @@ from urllib.parse import parse_qs
 import httpx
 
 from bot import db
+from bot.ladder import LoadedLadder
 from bot.limits import Limits
 from bot.main import Bot
 from bot.mapping import MappedContract
@@ -333,6 +334,8 @@ def make_loop(
     limits: Limits | None = None,
     live: bool = False,
     sig_contracts: list[MappedContract] | None = None,
+    ladder: LoadedLadder | None = None,
+    ladder_path: Path | None = None,
 ) -> LoopRig:
     time = FakeTime()
     start = time.t
@@ -385,5 +388,7 @@ def make_loop(
         clock=time.clock,
         sleep=time.sleep,
         now=now,
+        ladder=ladder,
+        **({} if ladder_path is None else {"ladder_path": ladder_path}),
     )
     return LoopRig(bot, sig, kalshi, time, conn, state_dir)
