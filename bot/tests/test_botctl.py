@@ -9,7 +9,6 @@ import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-
 SCRIPT = Path(__file__).resolve().parents[2] / "deploy/botctl.sh"
 
 
