@@ -137,6 +137,80 @@ sqlite3 -readonly -header -column bellwether.db "SELECT id, ts_utc, kind, messag
 cat PAUSED 2>/dev/null || echo "not paused"
 ```
 
+## 9a. Record a server dry-run and reboot rehearsal (Arnav only)
+
+This is evidence for the **election-week bot**, not proof that the full PRD engine
+passed G-10. Run only with both `BOT_ARGS=--dry-run` and `mode: dry_run`.
+Keep the trade key, raw account screenshots, server address and unredacted logs
+outside GitHub. Record the UTC start/end times, deployed commit, host provider and
+instance type, and a private evidence reference. An observed run, including an
+incident or pause, is useful evidence; do not label it a pass by omission.
+
+Before the run, check the deployed revision, the two dry-run switches and the
+service state. Read the env file only in your editor; do not print it or include
+its contents in the evidence:
+
+```bash
+git -C /opt/bellwether rev-parse HEAD
+grep '^mode:' /opt/bellwether/config/risk.yaml
+systemctl status bellwether-bot --no-pager
+date -u +%FT%TZ
+```
+
+Confirm `BOT_ARGS=--dry-run` privately in `/etc/bellwether.env`. In the SIG
+website, record the tournament's open-order IDs and any fills at the start and
+end. A count alone cannot identify which orders changed. Note any other process
+or manual trading using the same account during the interval.
+
+During and after the run, save dated, redacted output from these read-only
+checks. The single-row heartbeat is only the latest state; snapshots and
+service logs establish the time span. The database may contain older orders or
+events, so filter the records to the chosen UTC interval when evaluating them:
+
+```bash
+sqlite3 -readonly -header -column /opt/bellwether/bot/state/bellwether.db "SELECT ts_utc, mode, paused, pause_reason, balance, committed FROM heartbeat;"
+sqlite3 -readonly -header -column /opt/bellwether/bot/state/bellwether.db "SELECT min(ts_utc) AS first, max(ts_utc) AS last, count(*) AS samples FROM snapshots;"
+sqlite3 -readonly -header -column /opt/bellwether/bot/state/bellwether.db "SELECT verdict, count(*) FROM decisions GROUP BY verdict;"
+sqlite3 -readonly -header -column /opt/bellwether/bot/state/bellwether.db "SELECT status, count(*) FROM orders GROUP BY status;"
+sqlite3 -readonly -header -column /opt/bellwether/bot/state/bellwether.db "SELECT ts_utc, level, kind, message FROM events ORDER BY id DESC LIMIT 50;"
+journalctl -u bellwether-bot --since "YYYY-MM-DD HH:MM:SS UTC" --until "YYYY-MM-DD HH:MM:SS UTC" --no-pager
+```
+
+Replace both journal timestamps with the recorded interval. Check the output
+for secrets before storing or sharing it. A `would_order` decision demonstrates
+a dry-run decision, while unchanged SIG orders and no new journaled bot orders
+are independent checks. These queries **do not prove that zero placement HTTP
+requests were attempted**; that stronger claim requires request-level evidence.
+
+For a reboot check, first verify both dry-run switches again. Record the
+pre-reboot boot ID (`cat /proc/sys/kernel/random/boot_id`), heartbeat, latest
+snapshot time, service status, and SIG open-order inventory. Reboot the server
+yourself. Record the new boot ID and the same observations, plus
+`journalctl -b -1 -u bellwether-bot --no-pager` and
+`sqlite3 -readonly /opt/bellwether/bot/state/bellwether.db "PRAGMA integrity_check;"`.
+A new PID alone is not proof of state continuity: compare the snapshot and
+order-journal records across the reboot, confirm the mode stayed `dry_run`,
+and report any pause, missing data or change in SIG orders.
+
+Use this evidence index; keep raw files private and commit only the redacted
+status, date and reference after review:
+
+| Check | Private evidence reference | Observed result | Status |
+| --- | --- | --- | --- |
+| Deployed commit, host and two dry-run switches | | | unknown |
+| Start/end UTC; heartbeat, snapshots, decisions and events | | | unknown |
+| SIG open-order IDs/fills before and after; other account activity | | | unknown |
+| Reboot boot IDs, service logs, SQLite integrity and journal continuity | | | unknown |
+| Hosting account eligibility, billing controls and exhaustion | See `hosting-evidence.md` | | unknown |
+| Tiny SIG order/cancel and expiry behavior | See `docs/design/order-wire-contracts.md` | | unknown |
+
+The SIG order/cancel checks are separate live-platform actions by Arnav. Inventory
+all tournament open orders before any cancel-all check; the bot's live startup
+currently cancels the entire tournament, including unrelated orders. Do not use
+a live bot restart as a substitute for an isolated check. Account-specific hosting
+evidence must satisfy `hosting-evidence.md`; a running VM alone does not prove ₹0
+cost or acceptable behavior when its allowance runs out.
+
 ## 10. Dashboard over an SSH tunnel
 
 On your laptop:
