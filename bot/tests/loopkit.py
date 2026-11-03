@@ -368,7 +368,10 @@ def make_loop(
     )
     state_dir = tmp_path / "state"
     conn = db.connect(state_dir / "bellwether.db")
-    limits = limits or make_limits(mode="live" if live else "dry_run")
+    limits = limits or make_limits(
+        mode="live" if live else "dry_run",
+        start_balance=100000 if live else None,
+    )
     bot = Bot(
         limits=limits,
         contracts=mapped,
