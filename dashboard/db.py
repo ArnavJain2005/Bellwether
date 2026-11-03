@@ -36,6 +36,10 @@ STOP_CONTRACT_PATH: str = "bot/state/STOP"
 # threshold, so this 30.0s constant is the authoritative threshold.
 HEARTBEAT_STALE_SECONDS: float = 30.0
 QUOTE_STALE_SECONDS: float = 60.0
+# A `quotes_latest` row not refreshed for this long belongs to a contract the bot no
+# longer evaluates (excluded from the map, closed, or left from an earlier run). Such
+# rows are summarised as one attention item instead of one item per contract.
+QUOTE_INACTIVE_SECONDS: float = 3600.0
 SQLITE_BUSY_TIMEOUT_MS: int = 2000
 DEFAULT_HISTORY_HOURS: float = 6.0
 DEFAULT_SNAPSHOT_HISTORY_LIMIT: int = 360
@@ -65,6 +69,8 @@ ALL_STRATEGIES: tuple[str, ...] = (
     "complement",
     "reference",
     "probe",
+    "exit",
+    "exit_probe",
 )
 
 # Exact position fields from `bot/CONTRACT.md` (no guessed keys).
@@ -79,6 +85,28 @@ ALLOWED_POSITION_KEYS: frozenset[str] = frozenset(
         "price_side",
         "total_cost",
         "committed",
+    }
+)
+# What the bot actually writes today (`bot/main.py`): each element of
+# `positions_json` is SIG's `TournamentPosition` row dumped as sent
+# (`engine/sig_client/wire.py`). `quantity`: positive = YES shares, negative = NO.
+# Units of the money fields are unresolved upstream, so they are shown as sent.
+SIG_POSITION_KEYS: frozenset[str] = frozenset(
+    {
+        "exchangeId",
+        "marketId",
+        "marketTitle",
+        "option",
+        "settled",
+        "quantity",
+        "avgCost",
+        "currentPrice",
+        "marketValue",
+        "costBasis",
+        "unrealizedPnl",
+        "unrealizedPnlPct",
+        "moneyEarned",
+        "lots",
     }
 )
 ALLOWED_PARTIES: frozenset[str] = frozenset({"D", "R", "I"})
@@ -276,6 +304,8 @@ class PositionRow:
     price_side: Decimal | None
     total_cost: Decimal | None
     committed: Decimal | None
+    market_value: Decimal | None = None
+    unrealized_pnl: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -311,6 +341,7 @@ class ParsedPnlResult:
     snapshot_id: int | None = None
     snapshot_ts_ist: str = "—"
     message: str = ""
+    source: str = "pnl_json"  # "pnl_json" | "positions_unrealized"
 
     @property
     def has_data(self) -> bool:
@@ -722,11 +753,18 @@ def format_edge(value: Any) -> tuple[str, str]:
 def parse_positions_json(
     snapshot_row: dict[str, Any] | None,
     known_race_keys: set[str] | None = None,
+    exchange_lookup: dict[str, tuple[str, str]] | None = None,
 ) -> ParsedPositionsResult:
     """Parse ``snapshots.positions_json`` strictly following ``bot/CONTRACT.md``.
 
     Never guesses undocumented keys: any unexpected object key or invalid value
     returns ``status="bad_format"`` with a ``NO DATA / BAD FORMAT`` message.
+
+    Two shapes are accepted: the snake_case contract fields, and SIG's
+    ``TournamentPosition`` rows exactly as ``bot/main.py`` writes them (keys in
+    ``SIG_POSITION_KEYS``). For SIG rows, ``exchange_lookup`` maps an exchange id to
+    ``(race_key, party)`` from the bot's own tables. ``{"unvalued": [...]}`` (SIG's
+    409 for holdings without a valuation) is reported as no data, not bad format.
     """
     if snapshot_row is None:
         return ParsedPositionsResult(
@@ -774,7 +812,51 @@ def parse_positions_json(
             message="NO DATA — No positions recorded in latest snapshot",
         )
 
+    if isinstance(parsed, dict) and set(parsed.keys()) == {"unvalued"}:
+        unvalued = parsed.get("unvalued")
+        count = len(unvalued) if isinstance(unvalued, list) else 0
+        return ParsedPositionsResult(
+            status="no_data",
+            snapshot_id=snap_id,
+            snapshot_ts_ist=snap_ts_ist,
+            message=(
+                f"NO DATA — SIG reported {count} holding(s) without a valuation "
+                "(positions read returned 409)"
+            ),
+        )
+
     rows: list[PositionRow] = []
+    lookup = exchange_lookup or {}
+
+    def _validate_sig_item(item: dict[str, Any]) -> PositionRow | None | str:
+        """Map one SIG ``TournamentPosition`` row; ``None`` skips a closed row."""
+        unexpected = set(item.keys()) - SIG_POSITION_KEYS
+        if unexpected:
+            bad_list = ", ".join(sorted(str(k) for k in unexpected))
+            return f"NO DATA / BAD FORMAT — Unexpected keys in SIG positions_json: {bad_list}"
+        qty_signed = parse_decimal(item.get("quantity"))
+        if qty_signed is None:
+            return "NO DATA / BAD FORMAT — Invalid 'quantity' value in positions_json"
+        exch_val = str(item.get("exchangeId") or "").strip()
+        if not exch_val:
+            return "NO DATA / BAD FORMAT — SIG position row missing 'exchangeId'"
+        if qty_signed == 0 or item.get("settled") is True:
+            return None
+        race_val, party_val = lookup.get(exch_val, ("", ""))
+        avg_cost = parse_decimal(item.get("avgCost"))
+        return PositionRow(
+            race_key=race_val or "—",
+            sig_exchange_id=exch_val,
+            sig_market_id=str(item.get("marketId") or "").strip() or "—",
+            party=party_val or "—",
+            side="YES" if qty_signed > 0 else "NO",
+            quantity=abs(qty_signed),
+            price_side=avg_cost if avg_cost is not None and 0 <= avg_cost <= 1 else None,
+            total_cost=parse_decimal(item.get("costBasis")),
+            committed=None,
+            market_value=parse_decimal(item.get("marketValue")),
+            unrealized_pnl=parse_decimal(item.get("unrealizedPnl")),
+        )
 
     def _validate_dict_item(
         item: dict[str, Any],
@@ -849,6 +931,18 @@ def parse_positions_json(
                     snapshot_ts_ist=snap_ts_ist,
                     message="NO DATA / BAD FORMAT — positions_json array items must be objects",
                 )
+            if "exchangeId" in elem:
+                sig_res = _validate_sig_item(elem)
+                if isinstance(sig_res, str):
+                    return ParsedPositionsResult(
+                        status="bad_format",
+                        snapshot_id=snap_id,
+                        snapshot_ts_ist=snap_ts_ist,
+                        message=sig_res,
+                    )
+                if sig_res is not None:
+                    rows.append(sig_res)
+                continue
             res = _validate_dict_item(elem)
             if isinstance(res, str):
                 return ParsedPositionsResult(
@@ -944,6 +1038,15 @@ def parse_positions_json(
                         )
                     )
 
+    if not rows:
+        return ParsedPositionsResult(
+            status="empty",
+            rows=[],
+            snapshot_id=snap_id,
+            snapshot_ts_ist=snap_ts_ist,
+            message="NO DATA — No open positions in latest snapshot",
+        )
+
     rows.sort(key=lambda r: (abs(r.quantity), r.race_key), reverse=True)
     return ParsedPositionsResult(
         status="ok",
@@ -977,11 +1080,13 @@ def parse_pnl_json(
     raw = snapshot_row.get("pnl_json")
 
     if raw is None or not str(raw).strip():
+        # The bot writes pnl_json = NULL today (bot/main.py); that is absent data,
+        # not a malformed payload.
         return ParsedPnlResult(
-            status="bad_format",
+            status="no_data",
             snapshot_id=snap_id,
             snapshot_ts_ist=snap_ts_ist,
-            message="NO DATA / BAD FORMAT — pnl_json is missing or empty",
+            message="NO DATA — pnl_json not written by the bot",
         )
 
     try:
@@ -1041,6 +1146,34 @@ def parse_pnl_json(
         snapshot_id=snap_id,
         snapshot_ts_ist=snap_ts_ist,
         message=f"{len(rows)} race(s) in snapshot #{snap_id}",
+    )
+
+
+def derive_pnl_from_positions(positions: ParsedPositionsResult) -> ParsedPnlResult | None:
+    """Per-race unrealized P&L from SIG's ``unrealizedPnl`` on each position row.
+
+    Used only when ``pnl_json`` is absent. Returns ``None`` unless every open position
+    carries an ``unrealizedPnl`` value (no partial sums). Rows without a known
+    race are grouped under ``#<exchange id>``.
+    """
+    if not positions.has_data:
+        return None
+    if any(r.unrealized_pnl is None for r in positions.rows):
+        return None
+    by_race: dict[str, Decimal] = {}
+    for r in positions.rows:
+        key = r.race_key if r.race_key != "—" else f"#{r.sig_exchange_id}"
+        by_race[key] = by_race.get(key, Decimal(0)) + (r.unrealized_pnl or Decimal(0))
+    rows = [RacePnlRow(race_key=k, pnl=v) for k, v in by_race.items()]
+    rows.sort(key=lambda r: (abs(r.pnl), r.race_key), reverse=True)
+    return ParsedPnlResult(
+        status="ok",
+        rows=rows,
+        total_pnl=sum((r.pnl for r in rows), Decimal(0)),
+        snapshot_id=positions.snapshot_id,
+        snapshot_ts_ist=positions.snapshot_ts_ist,
+        message=f"unrealized P&L from {len(positions.rows)} SIG position(s)",
+        source="positions_unrealized",
     )
 
 
@@ -1471,7 +1604,12 @@ def _compute_hero_metrics(
 
         if parsed_pnl.status == "ok" and parsed_pnl.total_pnl is not None:
             pnl_display, pnl_direction = format_signed_susq(parsed_pnl.total_pnl)
-            pnl_sub = f"sum across {len(parsed_pnl.rows)} race(s) in pnl_json"
+            if parsed_pnl.source == "positions_unrealized":
+                pnl_sub = (
+                    f"Unrealized, SIG-reported, {len(parsed_pnl.rows)} race(s)"
+                )
+            else:
+                pnl_sub = f"sum across {len(parsed_pnl.rows)} race(s) in pnl_json"
             pnl_available = True
         elif parsed_pnl.status == "bad_format":
             pnl_display = "NO DATA / BAD FORMAT"
@@ -1783,9 +1921,22 @@ def load_monitor_snapshot(
             if rk:
                 known_races.add(rk)
 
+    exchange_lookup: dict[str, tuple[str, str]] = {}
+    for tbl in (orders_table, decisions_table, quotes_table):
+        for r in tbl.rows:
+            exch = str(r.get("sig_exchange_id") or "").strip()
+            rk = str(r.get("race_key") or "").strip()
+            if not exch or not rk:
+                continue
+            party = str(r.get("party") or "").strip()
+            prev_party = exchange_lookup.get(exch, ("", ""))[1]
+            exchange_lookup[exch] = (rk, party or prev_party)
+
     latest_snap = snapshots_table.rows[0] if snapshots_table.has_data else None
     positions_res = (
-        parse_positions_json(latest_snap, known_race_keys=known_races)
+        parse_positions_json(
+            latest_snap, known_race_keys=known_races, exchange_lookup=exchange_lookup
+        )
         if latest_snap is not None
         else ParsedPositionsResult(
             status="no_data", message=snapshots_table.message or "No snapshots row"
@@ -1798,6 +1949,10 @@ def load_monitor_snapshot(
             status="no_data", message=snapshots_table.message or "No snapshots row"
         )
     )
+    if pnl_res.status in {"no_data", "empty"}:
+        derived = derive_pnl_from_positions(positions_res)
+        if derived is not None:
+            pnl_res = derived
     history_res = build_snapshot_history(snapshots_table, window_hours=history_hours)
 
     hb_state = _evaluate_heartbeat(heartbeat_table, resolved_state, current_utc)
