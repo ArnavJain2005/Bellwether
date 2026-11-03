@@ -416,6 +416,40 @@ def test_sig_price_failure_skips_trading_but_keeps_the_heartbeat(tmp_path):
     assert rig.heartbeat() is not None
 
 
+def test_orderbook_read_failure_skips_the_trade_without_pausing(tmp_path):
+    """A 429 on the pre-send orderbook read is transient: skip, keep going, no PAUSED."""
+    rig = make_loop(tmp_path, live=True)
+    with_edges(rig, 1)
+    default = rig.sig.handler
+    fail = {"on": True}
+
+    def flaky(request):
+        if fail["on"] and request.url.path.endswith("/orderbook"):
+            return httpx.Response(
+                429,
+                headers={"Retry-After": "1"},
+                json={"error": {"code": "RATE_LIMITED", "message": "x"}},
+            )
+        return default(request)
+
+    rig.bot.rest._http._transport = httpx.MockTransport(flaky)
+
+    async def go():
+        await rig.bot.startup()
+        await rig.bot.iteration()
+        failed_writes = [s for s in rig.sig.writes() if s.path == "/orders"]
+        fail["on"] = False
+        await rig.time.sleep(31)  # past the cooldown, the next loop may trade
+        await rig.bot.iteration()
+        return failed_writes
+
+    failed_writes = run(go())
+    assert failed_writes == []  # nothing was sent while the read was failing
+    assert not rig.paused
+    assert any("orderbook read failed" in d["reason"] for d in rig.decisions("skip"))
+    assert len([s for s in rig.sig.writes() if s.path == "/orders"]) == 1  # recovered
+
+
 # --- read budget ------------------------------------------------------------------------
 
 

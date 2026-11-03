@@ -440,9 +440,18 @@ class Bot:
                 return 0
         depths = []
         for leg in ev.legs:
-            book = await self.rest.get_exchange_orderbook(
-                leg.contract.sig_exchange_id, depth=BOOK_DEPTH
-            )
+            # A failed read here happens before any leg is sent, so nothing is at risk:
+            # skip this trade and try again next loop. A transient 429 must not turn
+            # into a PAUSED that waits for Arnav.
+            try:
+                book = await self.rest.get_exchange_orderbook(
+                    leg.contract.sig_exchange_id, depth=BOOK_DEPTH
+                )
+            except SigClientError as exc:
+                self._skip(
+                    ev, f"{ev.reason}; not sent: orderbook read failed ({type(exc).__name__})"
+                )
+                return 0
             depths.append(
                 strategy.depth_at(
                     [(lvl.price, lvl.quantity) for lvl in book.bids],
