@@ -145,13 +145,13 @@ def _refuse_to_erase_approvals() -> None:
     except yaml.YAMLError as exc:
         raise ValueError("existing bot/map.yaml is invalid; refusing to overwrite it") from exc
     if not isinstance(existing, dict) or not isinstance(existing.get("races"), list):
-        raise ValueError("existing bot/map.yaml is invalid; refusing to overwrite it")
+        raise TypeError("existing bot/map.yaml is invalid; refusing to overwrite it")
     for race in existing["races"]:
         if not isinstance(race, dict) or not isinstance(race.get("contracts"), list):
-            raise ValueError("existing bot/map.yaml is invalid; refusing to overwrite it")
+            raise TypeError("existing bot/map.yaml is invalid; refusing to overwrite it")
         for contract in race["contracts"]:
             if not isinstance(contract, dict) or not isinstance(contract.get("approved"), bool):
-                raise ValueError("existing bot/map.yaml is invalid; refusing to overwrite it")
+                raise TypeError("existing bot/map.yaml is invalid; refusing to overwrite it")
             if contract["approved"]:
                 raise ValueError(
                     "bot/map.yaml contains manual approvals; refusing to regenerate and erase them"
