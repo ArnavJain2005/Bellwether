@@ -43,7 +43,7 @@ read-only references.
 | **Account state** | Tournament balance, positions, orders, fills, P&L and settlement reads, assembled into a snapshot. Each read records where its data came from, how old it is, and which fields are still unresolved. | [`account_reads.py`](engine/sig_client/account_reads.py) · [`snapshot.py`](engine/account/snapshot.py) |
 | **Election-week bot** | A buy-only trading loop with two strategies: complement pricing within a race, and reference pricing against Kalshi and Polymarket. It has one risk gate, an idempotency journal and restart reconciliation, and it runs in dry run by default. | [`main.py`](bot/main.py) · [`strategy.py`](bot/strategy.py) · [`risk.py`](bot/risk.py) · [`orders.py`](bot/orders.py) |
 | **Reference prices** | Public Kalshi and Polymarket quotes, with staleness, spread and cross-venue disagreement checks before a fair value is formed. | [`refs.py`](bot/refs.py) |
-| **Contract mapping** | Venue discovery and filtering, and a candidate-matching workflow tied to pinned source data. The bot's map is approved by hand: 114 SIG contracts in 57 Senate, governor and chamber-control races, with 10 races excluded. | [`venue_markets/`](data/venue_markets/README.md) · [`r1_mapping/`](data/r1_mapping/README.md) · [`map.yaml`](bot/map.yaml) · [`map_review.md`](bot/map_review.md) |
+| **Contract mapping** | Venue discovery and filtering, and a candidate-matching workflow tied to pinned source data. The bot map flags 114 SIG contracts in 57 Senate, governor and chamber-control races as approved for the election-week bot, with 10 races excluded. These bot approvals are separate from formal R1 settlement-equivalence verification. | [`venue_markets/`](data/venue_markets/README.md) · [`r1_mapping/`](data/r1_mapping/README.md) · [`map.yaml`](bot/map.yaml) · [`map_review.md`](bot/map_review.md) |
 | **Dashboard** | A Streamlit monitor that opens the bot's SQLite database read-only. It has filters, 6-hour IST history, and a STOP control that requires confirmation. | [`app.py`](dashboard/app.py) · [`db.py`](dashboard/db.py) |
 | **Operations** | systemd units and a step-by-step runbook for a single Ubuntu server, plus hosting evidence and the server design. | [`BOT_RUNBOOK.md`](deploy/BOT_RUNBOOK.md) · [`deploy/`](deploy/README.md) |
 
@@ -190,7 +190,7 @@ run for this README.
 | :--- | :--- |
 | SIG read client, realtime feed, recovery ledger, account snapshot | On `main`, tested offline |
 | Election-week bot (strategies, risk gate, journal, reconciliation) | On `main`, tested with fakes. [`config/risk.yaml`](config/risk.yaml) is in `dry_run` mode, and NO orders are disabled. |
-| Contract map | 114 contracts approved by hand in Senate, governor and chamber-control races. Individual House seats are not approved. |
+| Contract map | 114 bot-approved contracts in 57 races; individual House seats are not approved. Formal R1 remains at 0 verified Polymarket matches, 0 verified Kalshi matches, and 237 missing reviewed SIG Info-tab texts. See the [mapping status and criteria](markets/README.md#relationship-to-the-election-week-bot-map-3-nov-2026). |
 | Dashboard | On `main`, tested on sample data |
 | Engine order path, durable recovery, ₹0 hosting gates | Open. See the [PRD acceptance gates](docs/PRD.md#acceptance-gates) and [open questions](docs/PRD.md#open-questions). |
 
