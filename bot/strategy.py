@@ -19,6 +19,13 @@ to the 0.005 grid in the less aggressive direction: a buy is floored.
   nets against the holding (bot/exits.py). Same fair-value checks, one-live-order and
   cooldown rules as the reference strategy. Size: min(held x
   max_exit_quantity_fraction, book depth at the price), whole shares.
+- Rotation exits (BOT-ROTATE, risk.yaml `rotation`, same path and checks as an exit):
+  with avg entry e_S of the shares held (bot/risk.py entry_price), exit on
+  take-profit when (b_S - e_S) / e_S >= take_profit_pct, or, with edge_gone, when
+  b_S >= f_S - edge (the reference buy edge: the reason to hold is gone) and
+  b_S >= e_S. Neither ever closes below e_S; with e_S unknown neither fires. The
+  edge exit above keeps its own rule.
+- Reinvest ranking (rank_buys): with rotation on, buys go highest edge first.
 """
 
 from __future__ import annotations
@@ -30,7 +37,7 @@ from datetime import datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 from bot.exits import ExitSettings
-from bot.limits import Limits
+from bot.limits import Limits, RotationSettings
 from bot.mapping import MappedContract
 from bot.refs import RefQuote, RefSettings, RefSnapshot, fair_value
 
@@ -238,8 +245,13 @@ def evaluate_exit(
     *,
     busy: Iterable[str] = (),
     last_order: Mapping[str, datetime] | None = None,
+    rotation: RotationSettings | None = None,
+    avg_entry: Decimal | None = None,
 ) -> Evaluation:
-    """Whether to close a holding. A leg is the complement buy that nets against it."""
+    """Whether to close a holding. A leg is the complement buy that nets against it.
+
+    `rotation` (enabled) and `avg_entry` add the take-profit and edge-gone triggers.
+    """
     base = {
         "strategy": "exit",
         "race_key": contract.race_key,
@@ -291,7 +303,13 @@ def evaluate_exit(
             f"{fmt(fair_side)} + {fmt(edge)} {refs}"
         )
     if bid_side < fair_side + edge:
-        return skip(f"hold: {miss}", fair=fair, edge=bid_side - fair_side)
+        rotated = _rotation_trigger(
+            rotation, avg_entry, bid_side, fair_side, current_edge(limits, now), held_side, refs
+        )
+        if rotated is None:
+            entry = "" if avg_entry is None else f"; entry {fmt(avg_entry, 4)}"
+            return skip(f"hold: {miss}{entry}", fair=fair, edge=bid_side - fair_side)
+        text = rotated
     side = other_side(held_side)
     if side == "no" and not no_orders_enabled(limits):
         return skip(f"{text}, but NO orders are disabled", fair=fair, edge=bid_side - fair_side)
@@ -308,6 +326,43 @@ def evaluate_exit(
         edge=bid_side - fair_side,
         **base,  # type: ignore[arg-type]
     )
+
+
+def _rotation_trigger(
+    rotation: RotationSettings | None,
+    avg_entry: Decimal | None,
+    bid_side: Decimal,
+    fair_side: Decimal,
+    buy_edge: Decimal,
+    held_side: str,
+    refs: str,
+) -> str | None:
+    """The take-profit or edge-gone reason, or None to hold. Never below avg_entry."""
+    if rotation is None or not rotation.enabled or avg_entry is None or avg_entry <= 0:
+        return None
+    label = "SIG bid" if held_side == "yes" else "SIG NO bid"
+    if bid_side < avg_entry:
+        return None
+    gain = (bid_side - avg_entry) / avg_entry
+    if gain >= rotation.take_profit_pct:
+        return (
+            f"take-profit: {label} {fmt(bid_side)} is {gain:.2%} over entry "
+            f"{fmt(avg_entry, 4)} (>= {rotation.take_profit_pct:.2%}) {refs}"
+        )
+    if rotation.edge_gone and bid_side >= fair_side - buy_edge:
+        return (
+            f"edge gone: {label} {fmt(bid_side)} >= fair {fmt(fair_side)} - edge "
+            f"{fmt(buy_edge)}, entry {fmt(avg_entry, 4)} {refs}"
+        )
+    return None
+
+
+def rank_buys(evaluations: Sequence[Evaluation]) -> list[Evaluation]:
+    """Highest edge first (skips last, in their order); ties keep their order."""
+    trades = [ev for ev in evaluations if not ev.is_skip]
+    skips = [ev for ev in evaluations if ev.is_skip]
+    trades.sort(key=lambda ev: ev.edge if ev.edge is not None else Decimal(-1), reverse=True)
+    return trades + skips
 
 
 def exit_quantity(held_qty: Decimal, fraction: Decimal, depth: Decimal) -> int:

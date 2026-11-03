@@ -7,6 +7,14 @@ refuses to start. YAML floats are read as exact Decimals from their source text
 Scale: `effective_cap` multiplies per_order, per_race, total_committed and loss_stop by
 `scale`. min_cash_reserve is NOT scaled: scaling it down would loosen the reserve, so
 the unscaled (tighter) value is used until Arnav says otherwise.
+
+BOT-ROTATE (all optional; absent = the behaviour before it):
+- target_deployment: total committed may reach at most this fraction of equity
+  (balance + total committed). 1.0 adds no limit beyond cash and the caps.
+- max_race_fraction: one race's committed cost may reach at most this fraction of
+  equity (balance + total committed), on top of caps.per_race.
+- rotation: take-profit and edge-gone exits, reinvest ranking and the re-entry
+  cooldown (bot/strategy.py, bot/main.py). Exits still need config/exits.yaml enabled.
 """
 
 from __future__ import annotations
@@ -65,6 +73,14 @@ class ReferenceSettings(_Frozen):
         return value
 
 
+class RotationSettings(_Frozen):
+    enabled: bool
+    take_profit_pct: Decimal = Field(gt=0, lt=1)
+    edge_gone: bool
+    reinvest_min_free_fraction: Decimal = Field(ge=0, lt=1)
+    reentry_cooldown_minutes: int = Field(ge=0, le=1440)
+
+
 class Strategies(_Frozen):
     complement: ComplementSettings
     reference: ReferenceSettings
@@ -84,6 +100,13 @@ class Limits(_Frozen):
     no_price_convention: Literal["unknown", "yes_price", "no_price"]
     loop_seconds: int = Field(ge=1, le=300)
     strategies: Strategies
+    target_deployment: Decimal | None = Field(default=None, gt=0, le=1)
+    max_race_fraction: Decimal | None = Field(default=None, gt=0, le=1)
+    rotation: RotationSettings | None = None
+
+    @property
+    def rotating(self) -> bool:
+        return self.rotation is not None and self.rotation.enabled
 
     @field_validator("tournament_id")
     @classmethod

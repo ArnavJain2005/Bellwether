@@ -20,8 +20,8 @@ def _repo_raw() -> dict:
 
 def test_repo_risk_yaml_loads_with_exact_decimals():
     limits = load_limits()
-    assert limits.scale == Decimal("0.10")
-    assert str(limits.scale) == "0.10"  # from the YAML text, never through float
+    assert limits.scale == Decimal("1.0")
+    assert str(limits.scale) == "1.0"  # from the YAML text, never through float
     assert limits.strategies.complement.max_sum_ask == Decimal("0.97")
     assert limits.no_price_convention == "unknown"
     assert limits.no_orders_enabled is False
@@ -75,7 +75,7 @@ def test_out_of_range_value_refuses_to_start(tmp_path, path, value):
 
 
 def test_non_finite_number_refuses_to_start(tmp_path):
-    text = DEFAULT_PATH.read_text(encoding="utf-8").replace("scale: 0.10", "scale: .nan")
+    text = DEFAULT_PATH.read_text(encoding="utf-8").replace("scale: 1.0 ", "scale: .nan ")
     path = tmp_path / "risk.yaml"
     path.write_text(text, encoding="utf-8")
     with pytest.raises(LimitsError):

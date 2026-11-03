@@ -31,6 +31,14 @@ Each loop (every loop_seconds):
      anything that cannot be explained -> PAUSED (reason 'reconcile').
   e. every 300 s: tournament markets; a market no longer open stops trading.
   f. heartbeat, every loop, whatever happened.
+
+BOT-ROTATE (risk.yaml `rotation` enabled): exits also fire on take-profit and
+edge-gone (bot/strategy.py); buys are ranked highest edge first and sent only while
+free cash (balance - min_cash_reserve) exceeds reinvest_min_free_fraction of the
+balance; buys on an exchange wait the longer of reentry_block_minutes and
+reentry_cooldown_minutes after an exit there. Every exit and every reinvest buy is
+also an event (kinds 'exit' and 'reinvest'). Orders still go only through
+bot/orders.py.
 An unexpected exception in a loop writes an error event and creates PAUSED; the loop
 keeps reading and writing the heartbeat. SIGTERM/SIGINT: live -> cancel all, then exit.
 """
@@ -74,7 +82,7 @@ from engine.sig_client.rest import SigRestClient
 
 logger = logging.getLogger(__name__)
 
-VERSION = "bot-ew-5"
+VERSION = "bot-rotate"
 MAX_ORDERS_PER_LOOP = 5
 PRICE_CHUNK = 100  # GET /exchanges/prices takes at most 100 ids
 ACCOUNT_EVERY_S = 60.0
@@ -539,6 +547,9 @@ class Bot:
             busy=self.busy_exchanges(),
             last_order=self.last_order,
         )
+        rotating = self.limits.rotating
+        if rotating:
+            evaluations = strategy.rank_buys(evaluations)
         reentry = self.reentry_blocked(now)
         for ev in evaluations:
             if ev.is_skip:
@@ -570,17 +581,48 @@ class Bot:
             if self.limiter.used(RequestKind.READ) + len(ev.legs) + 1 > READ_HEADROOM:
                 self._skip(ev, f"{ev.reason}; not sent: SIG read budget nearly used")
                 continue
+            if rotating:
+                if not await self._ensure_balance(ev):
+                    continue
+                low = self._free_cash_low()
+                if low:
+                    self._skip(ev, f"{ev.reason}; not sent: {low}")
+                    continue
             sent += await self.send(ev, now)
 
-    async def send(self, ev: Evaluation, now: datetime) -> int:
-        """Size, risk-check every leg, then place. Returns the orders placed or simulated."""
+    async def _ensure_balance(self, ev: Evaluation) -> bool:
+        """This loop's fresh balance read, once; False (and a skip) when it failed."""
         if self.loop_balance is None:
             try:
                 read = await self.rest.read_tournament_balance()
                 self.loop_balance = self.balance = read.tournament.myBalance
             except SigClientError as exc:
                 self._skip(ev, f"{ev.reason}; not sent: balance read failed ({type(exc).__name__})")
-                return 0
+                return False
+        return True
+
+    def _free_cash_low(self) -> str | None:
+        """Why reinvesting stops: free cash at or under the rotation threshold, or None."""
+        rotation = self.limits.rotation
+        if rotation is None or self.loop_balance is None:
+            return None
+        balance = self.loop_balance - self.batch_spent
+        free = balance - self.limits.effective_cap("min_cash_reserve")
+        floor = rotation.reinvest_min_free_fraction * self.loop_balance
+        if free > floor:
+            return None
+        return (
+            f"free cash {free} (balance {balance} - reserve) is at or under "
+            f"{rotation.reinvest_min_free_fraction:.0%} of balance ({floor}): fully deployed"
+        )
+
+    def _mode_tag(self) -> str:
+        return "" if self.live else "dry run: "
+
+    async def send(self, ev: Evaluation, now: datetime) -> int:
+        """Size, risk-check every leg, then place. Returns the orders placed or simulated."""
+        if not await self._ensure_balance(ev):
+            return 0
         depths = []
         for leg in ev.legs:
             # A failed read here happens before any leg is sent, so nothing is at risk:
@@ -614,6 +656,15 @@ class Bot:
                 self.last_order[leg.contract.sig_exchange_id] = now
                 self._ordered_this_loop.add(leg.contract.sig_exchange_id)
                 placed += 1
+                if self.limits.rotating:
+                    self.event(
+                        "info",
+                        "reinvest",
+                        f"{self._mode_tag()}{record.status}: edge {strategy.fmt(ev.edge)}: "
+                        f"{intent.reason}"[:500],
+                        # Dry run repeats would-be buys every cooldown: once a minute each.
+                        throttle=None if self.live else f"reinvest:{leg.contract.sig_exchange_id}",
+                    )
             # Only journaled orders lower the balance risk sees: the journal adds the
             # same cost back in the loss-stop proxy. A dry-run 'would_order' has no
             # journal row, so subtracting it would make the proxy fall and trip the
@@ -657,9 +708,16 @@ class Bot:
         if settings is None or not settings.enabled:
             return 0
         busy = self.busy_exchanges()
+        rotation = self.limits.rotation if self.limits.rotating else None
+        rows = self.conn.execute("SELECT * FROM orders").fetchall() if rotation else []
 
         def evaluate(c: MappedContract, held: HeldPosition | None) -> Evaluation:
             kalshi, poly = self._ref_quotes(refs, c)
+            entry = (
+                risk.entry_price(rows, c.sig_exchange_id, held.side, held.quantity)
+                if rotation is not None and held is not None
+                else None
+            )
             return strategy.evaluate_exit(
                 c,
                 quotes.get(c.sig_exchange_id),
@@ -672,6 +730,8 @@ class Bot:
                 now,
                 busy=busy,
                 last_order=self.last_order,
+                rotation=rotation,
+                avg_entry=entry,
             )
 
         candidates: list[tuple[MappedContract, Evaluation]] = []
@@ -797,11 +857,19 @@ class Bot:
         self.last_order[exchange_id] = now
         self._ordered_this_loop.add(exchange_id)
         self._exit_at[exchange_id] = now
+        self.event(
+            "info",
+            "exit",
+            f"{self._mode_tag()}{record.status}: {intent.reason}"[:500],
+            throttle=None if self.live else f"exit:{exchange_id}",
+        )
         return 1
 
     def reentry_blocked(self, now: datetime) -> dict[str, datetime]:
         """Exchanges whose buys wait after an exit there: exchange id -> until when."""
-        minutes = self.exits.reentry_minutes()
+        minutes = self.exits.reentry_minutes() or 0
+        if self.limits.rotating and self.limits.rotation is not None:
+            minutes = max(minutes, self.limits.rotation.reentry_cooldown_minutes)
         if not minutes:
             return {}
         times = dict(self._exit_at)

@@ -22,6 +22,9 @@ journal), against start_balance - effective loss_stop. It is only a proxy: the j
 counts what was paid, so it does not catch mark-to-market losses on open positions,
 nor a position that settles at zero while its filled cost still counts. The reserve and
 the per-order, per-race and total caps still use cash and committed as before.
+BOT-ROTATE adds two optional rooms on equity (balance + total committed):
+target_deployment x equity - total committed, and max_race_fraction x equity - race
+committed.
 
 Exits (BOT-EW-5) pass check_exit, never check: a complement buy that nets against a
 holding frees capital, so the caps do not apply, but the holding must come from a fresh
@@ -352,6 +355,22 @@ def check(intent: Intent, state: RiskState, *, probe: bool = False) -> RiskResul
         ("total committed cap", total_cap - state.total_committed),
         ("minimum cash reserve", state.balance - reserve),
     ]
+    # BOT-ROTATE: fractions of equity, balance + total committed (cash + what is invested).
+    equity = state.balance + state.total_committed
+    if limits.target_deployment is not None:
+        rooms.append(
+            (
+                f"target deployment {limits.target_deployment}",
+                limits.target_deployment * equity - state.total_committed,
+            )
+        )
+    if limits.max_race_fraction is not None:
+        rooms.append(
+            (
+                f"max race fraction {limits.max_race_fraction} for {intent.race_key}",
+                limits.max_race_fraction * equity - state.race_committed,
+            )
+        )
     max_quantity = min(_floor_shares(room, price) for _, room in rooms)
     cost = price * intent.quantity
     for name, room in rooms:
@@ -527,3 +546,42 @@ def journal_position(
             else:
                 low -= rest
     return filled, low, high
+
+
+def entry_price(
+    rows: Iterable[Mapping[str, object]], exchange_id: str, side: str, held: Decimal
+) -> Decimal | None:
+    """Average entry price per share of the `held` shares on one exchange and side.
+
+    SIG nets FIFO, so the shares still held are the newest lots. The lots are the
+    journal's own filled buys of that side (exits excluded), newest first, each at its
+    filled cost per share (the larger of totalCost and price_side x quantity_traded, an
+    upper bound). None (unknown: no take-profit or edge-gone exit) when the journal's
+    lots do not cover `held` (manual or pre-journal shares), or a buy there has a fill
+    that is not established.
+    """
+    if held <= 0:
+        return None
+    lots: list[tuple[str, str, Decimal, Decimal]] = []
+    for row in rows:
+        if (
+            str(row["sig_exchange_id"]) != exchange_id
+            or str(row["side"]) != side
+            or _strategy(row) in EXIT_STRATEGIES
+            or row["status"] == "rejected"
+        ):
+            continue
+        filled = _filled(row)
+        if filled is None:
+            return None
+        cost, shares = filled
+        if shares > 0:
+            lots.append((str(row["created_utc"]), str(row["key"]), cost, shares))
+    need, total = held, Decimal(0)
+    for _, _, cost, shares in sorted(lots, reverse=True):
+        take = min(need, shares)
+        total += cost * take / shares
+        need -= take
+        if need == 0:
+            return total / held
+    return None
