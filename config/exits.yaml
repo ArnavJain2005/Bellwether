@@ -1,0 +1,10 @@
+# Owner: Arnav only. Agents never edit this file. Absent file = no exits (today's behaviour).
+# Re-read every loop: edits take effect without a restart. An invalid file = exits off,
+# one error event, buys continue.
+enabled: false                 # Arnav flips to true after the exit probe passes
+mechanism: auto                # auto | complement_buy  (auto = complement_buy; sell is not built)
+exit_edge: 0.03
+exit_edge_election_night: 0.04 # switches with reference.election_night_from_utc
+max_exit_quantity_fraction: 1.0
+reentry_block_minutes: 10      # no new buy on an exchange for this long after an exit there
+sides: [yes, no]               # Arnav may restrict to [yes]

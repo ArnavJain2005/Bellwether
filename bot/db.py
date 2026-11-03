@@ -26,7 +26,34 @@ ORDER_STATUSES = (
     "unknown",
 )
 
-_SCHEMA = """
+_ORDERS = """
+CREATE TABLE IF NOT EXISTS {name} (
+  key TEXT PRIMARY KEY, created_utc TEXT NOT NULL, updated_utc TEXT NOT NULL,
+  race_key TEXT, sig_market_id TEXT, sig_exchange_id TEXT NOT NULL,
+  side TEXT NOT NULL CHECK (side IN ('yes','no')),
+  action TEXT NOT NULL CHECK (action = 'buy'),
+  price_side TEXT NOT NULL, wire_price TEXT NOT NULL, quantity INTEGER NOT NULL,
+  expires_utc TEXT NOT NULL,
+  strategy TEXT NOT NULL CHECK (strategy IN ('complement','reference','probe','exit',
+    'exit_probe')),
+  reason TEXT,
+  status TEXT NOT NULL CHECK (status IN ('journaled','sent','resting','filled','partial',
+    'cancelled','expired','rejected','unknown')),
+  sig_order_id TEXT, quantity_traded TEXT, total_cost TEXT, http_status INTEGER,
+  error TEXT, response_json TEXT,
+  exit_of_side TEXT CHECK (exit_of_side IS NULL OR exit_of_side IN ('yes','no'))
+);
+"""
+# Columns of the orders table before BOT-EW-5 (exit_of_side was added after them).
+_ORDER_COLUMNS_EW4 = (
+    "key, created_utc, updated_utc, race_key, sig_market_id, sig_exchange_id, side, action, "
+    "price_side, wire_price, quantity, expires_utc, strategy, reason, status, sig_order_id, "
+    "quantity_traded, total_cost, http_status, error, response_json"
+)
+
+_SCHEMA = (
+    _ORDERS.format(name="orders")
+    + """
 CREATE TABLE IF NOT EXISTS heartbeat (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   ts_utc TEXT, mode TEXT CHECK (mode IN ('dry_run','live')), version TEXT,
@@ -39,20 +66,6 @@ CREATE TABLE IF NOT EXISTS heartbeat (
 CREATE TABLE IF NOT EXISTS ladder_state (
   id INTEGER PRIMARY KEY CHECK (id = 1), step TEXT NOT NULL, since_utc TEXT NOT NULL,
   ladder_sha256 TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS orders (
-  key TEXT PRIMARY KEY, created_utc TEXT NOT NULL, updated_utc TEXT NOT NULL,
-  race_key TEXT, sig_market_id TEXT, sig_exchange_id TEXT NOT NULL,
-  side TEXT NOT NULL CHECK (side IN ('yes','no')),
-  action TEXT NOT NULL CHECK (action = 'buy'),
-  price_side TEXT NOT NULL, wire_price TEXT NOT NULL, quantity INTEGER NOT NULL,
-  expires_utc TEXT NOT NULL,
-  strategy TEXT NOT NULL CHECK (strategy IN ('complement','reference','probe')),
-  reason TEXT,
-  status TEXT NOT NULL CHECK (status IN ('journaled','sent','resting','filled','partial',
-    'cancelled','expired','rejected','unknown')),
-  sig_order_id TEXT, quantity_traded TEXT, total_cost TEXT, http_status INTEGER,
-  error TEXT, response_json TEXT
 );
 CREATE TABLE IF NOT EXISTS decisions (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts_utc TEXT NOT NULL, race_key TEXT,
@@ -80,6 +93,7 @@ CREATE TABLE IF NOT EXISTS events (
   kind TEXT NOT NULL, message TEXT NOT NULL
 );
 """
+)
 
 
 def utc_stamp(moment: datetime | None = None) -> str:
@@ -102,7 +116,35 @@ def connect(path: Path = DB_PATH) -> sqlite3.Connection:
     if "ladder_step" not in columns:
         conn.execute("ALTER TABLE heartbeat ADD COLUMN ladder_step TEXT")
     conn.commit()
+    _migrate_orders_ew5(conn)
     return conn
+
+
+def _migrate_orders_ew5(conn: sqlite3.Connection) -> None:
+    """A database made before BOT-EW-5: rebuild orders with the exit strategies and
+    exit_of_side. SQLite cannot change a CHECK in place, so the rows are copied into a
+    new table in one transaction; nothing is copied twice and nothing is lost."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(orders)")}
+    if "exit_of_side" in columns:
+        return
+    try:
+        _rebuild_orders(conn)
+    except sqlite3.Error:
+        if conn.in_transaction:
+            conn.rollback()  # the old table stays exactly as it was
+        raise
+
+
+def _rebuild_orders(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        "BEGIN IMMEDIATE;\n"
+        + _ORDERS.format(name="orders_ew5")
+        + f"INSERT INTO orders_ew5 ({_ORDER_COLUMNS_EW4}) "
+        f"SELECT {_ORDER_COLUMNS_EW4} FROM orders;\n"
+        "DROP TABLE orders;\n"
+        "ALTER TABLE orders_ew5 RENAME TO orders;\n"
+        "COMMIT;\n"
+    )
 
 
 def _insert(conn: sqlite3.Connection, table: str, row: dict[str, Any]) -> int:

@@ -12,6 +12,13 @@ place(intent):
 Placements are serialised by one lock, so no intent is sent while another order's
 outcome is being resolved, and none is sent while any order is 'unknown'.
 
+place_exit(intent, held=..., settings=...) is the same path for exits (BOT-EW-5), with
+risk.check_exit in place of risk.check. Exit orders never rest: after the placement
+answer any open remainder is cancelled at once, then the order is confirmed with an
+open-orders read (and its fills if it closed). A remainder still open after that, or a
+response whose canonical action or side differs from what was sent ("exit
+canonicalised"), creates PAUSED.
+
 cancel(order_key) and cancel_all(reason) are protective: no risk check, they work while
 paused or stopped, they never place or enlarge anything, they write an event and then
 refresh statuses from the open-orders read.
@@ -34,8 +41,9 @@ from typing import Any, Protocol
 
 from bot import db, risk
 from bot.db import STATE_DIR
+from bot.exits import ExitSettings
 from bot.limits import Limits
-from bot.risk import Intent
+from bot.risk import EXIT_STRATEGIES, HeldPosition, Intent
 from bot.sig_writer import CancelIncomplete, SigWriter, WriteNoResponse, WriteResponse
 from engine.sig_client.errors import SigClientError, SigRateBudgetError
 from engine.sig_client.rate_limiter import RateLimiter, RequestKind
@@ -51,6 +59,7 @@ DEFAULT_RATE_LIMIT_WAIT_S = 60.0
 NO_RESPONSE_RETRIES = 3  # Arnav's decision (b): at most 3 retries within 5 minutes
 NO_RESPONSE_WINDOW_S = 300.0
 NO_RESPONSE_BACKOFF_S = (10.0, 30.0, 60.0)
+EXIT_EXPIRY_S = 30  # a backstop only: an exit's remainder is cancelled right away
 # Decision-row market columns a caller may fill through place(context=...).
 DECISION_CONTEXT = frozenset(
     {"party", "sig_bid", "sig_ask", "kalshi_mid", "poly_mid", "fair", "edge"}
@@ -278,39 +287,138 @@ class OrderPath:
             reason = f"dry run: {result.reason}"
             self._decision(intent, "would_order", reason)
             return OrderRecord(key=None, status="would_order", reason=reason)
+        expiry = expiry_seconds if expiry_seconds is not None else self._limits.order_expiry_seconds
+        key = await self._journal_and_send(
+            intent, price_text, intent.reason or result.reason, expiry, probe
+        )
+        return OrderRecord.from_row(db.get_order(self._conn, key))
 
+    async def _journal_and_send(
+        self, intent: Intent, price_text: str, reason: str, expiry: int, probe: bool
+    ) -> str:
+        """Journal the order (committed), then send it. Returns its key."""
         key = self._new_key()
         now = self._now()
-        expiry = expiry_seconds if expiry_seconds is not None else self._limits.order_expiry_seconds
-        reason = intent.reason or result.reason
-        db.insert_order(
-            self._conn,
-            {
-                "key": key,
-                "created_utc": db.utc_stamp(now),
-                "updated_utc": db.utc_stamp(now),
-                "race_key": intent.race_key,
-                "sig_market_id": intent.sig_market_id,
-                "sig_exchange_id": intent.sig_exchange_id,
-                "side": intent.side,
-                "action": "buy",
-                "price_side": str(intent.price_side),
-                "wire_price": price_text,
-                "quantity": intent.quantity,
-                "expires_utc": db.utc_stamp(now + timedelta(seconds=expiry)),
-                "strategy": intent.strategy,
-                "reason": reason,
-                "status": "journaled",
-            },
-        )
+        row: dict[str, Any] = {
+            "key": key,
+            "created_utc": db.utc_stamp(now),
+            "updated_utc": db.utc_stamp(now),
+            "race_key": intent.race_key,
+            "sig_market_id": intent.sig_market_id,
+            "sig_exchange_id": intent.sig_exchange_id,
+            "side": intent.side,
+            "action": "buy",
+            "price_side": str(intent.price_side),
+            "wire_price": price_text,
+            "quantity": intent.quantity,
+            "expires_utc": db.utc_stamp(now + timedelta(seconds=expiry)),
+            "strategy": intent.strategy,
+            "reason": reason,
+            "status": "journaled",
+        }
+        if intent.strategy in EXIT_STRATEGIES:
+            row["exit_of_side"] = intent.exit_of_side
+        db.insert_order(self._conn, row)
         self._decision(intent, "order", reason, key)
         if db.any_unknown(self._conn):  # second guard, right before the first send
             db.update_order(self._conn, key, status="rejected", error="not sent: unknown order")
-            return OrderRecord.from_row(db.get_order(self._conn, key))
+            return key
         db.update_order(self._conn, key, status="sent")
-        row = db.get_order(self._conn, key)
-        await self._send(row, request_bytes(row, self._writer.tournament_id), intent, probe)
+        sent = db.get_order(self._conn, key)
+        await self._send(sent, request_bytes(sent, self._writer.tournament_id), intent, probe)
+        return key
+
+    # --- exits ----------------------------------------------------------------------
+
+    async def place_exit(
+        self,
+        intent: Intent,
+        *,
+        held: HeldPosition | None,
+        settings: ExitSettings | None,
+        probe: bool = False,
+        context: Mapping[str, Any] | None = None,
+    ) -> OrderRecord:
+        """One exit through risk.check_exit, the journal and the retry rules; never rests.
+
+        The holding must come from a fresh positions read when live; a dry run accepts
+        the account snapshot's (nothing is sent). `probe` is for bot/exit_probe.py.
+        """
+        async with self._lock:
+            self._context = {k: v for k, v in (context or {}).items() if k in DECISION_CONTEXT}
+            try:
+                return await self._place_exit(intent, held, settings, probe)
+            finally:
+                self._context = {}
+
+    async def _place_exit(
+        self,
+        intent: Intent,
+        held: HeldPosition | None,
+        settings: ExitSettings | None,
+        probe: bool,
+    ) -> OrderRecord:
+        state = risk.build_state(
+            self._conn,
+            self._limits,
+            race_key=intent.race_key,
+            balance=None,  # exits free capital: no cash cap applies
+            writes_last_min=self._limiter.used(RequestKind.WRITE),
+            state_dir=self._state_dir,
+            extra_committed=self._extra_committed(),
+        )
+        rows = self._conn.execute(
+            "SELECT * FROM orders WHERE sig_exchange_id = ?", (intent.sig_exchange_id,)
+        ).fetchall()
+        live_rows = [r for r in rows if r["status"] in risk.LIVE_STATUSES]
+        live_exits = risk.live_exit_quantity(rows, intent.sig_exchange_id)
+        result = risk.check_exit(
+            intent,
+            state,
+            held=held,
+            settings=settings,
+            live_exit_quantity=live_exits,
+            live_orders_on_exchange=len(live_rows),
+            require_fresh=self._live,
+            probe=probe,
+        )
+        if not result.allowed:
+            self._decision(intent, "blocked", result.reason)
+            return OrderRecord(key=None, status="blocked", reason=result.reason)
+        try:
+            price_text = format_price(wire_price(intent, self._limits, probe=False))
+        except OrderRefused as exc:
+            self._decision(intent, "blocked", str(exc))
+            return OrderRecord(key=None, status="blocked", reason=str(exc))
+        if not (self._live and (self._limits.mode == "live" or probe)):
+            reason = f"dry run: {result.reason}"
+            self._decision(intent, "would_order", reason)
+            return OrderRecord(key=None, status="would_order", reason=reason)
+        expiry = min(EXIT_EXPIRY_S, self._limits.order_expiry_seconds)
+        key = await self._journal_and_send(
+            intent, price_text, intent.reason or result.reason, expiry, probe
+        )
+        await self._close_exit(key)
         return OrderRecord.from_row(db.get_order(self._conn, key))
+
+    async def _close_exit(self, key: str) -> None:
+        """Cancel an exit's open remainder at once, then confirm it with a read."""
+        row = db.get_order(self._conn, key)
+        if row["status"] in ("rejected", "unknown", "journaled"):
+            return  # nothing placed, or already paused as unknown
+        if row["status"] == "resting":
+            if row["sig_order_id"] is None:
+                self.pause(f"exit {key} rests with no SIG order id: cancel it by hand")
+                return
+            await self.cancel(key)  # protective; refreshes statuses from a read
+        else:
+            await self.refresh_statuses()
+        row = db.get_order(self._conn, key)
+        if row["status"] == "resting":
+            db.insert_event(
+                self._conn, "error", "exit", f"exit {key}: remainder still open after cancel"
+            )
+            self.pause(f"exit {key} remainder still open after cancel")
 
     def _unknown(self, key: str, why: str, **fields: Any) -> None:
         db.update_order(self._conn, key, status="unknown", error=why, **fields)
@@ -462,7 +570,14 @@ class OrderPath:
             error=terminal if isinstance(terminal, str) else None,
         )
         mismatches = self._mismatches(row, body, traded, intent, probe)
-        if mismatches:
+        canonicalised = [
+            m for m in mismatches if m.startswith(("canonical side", "canonical action"))
+        ]
+        if intent.strategy in EXIT_STRATEGIES and canonicalised:
+            text = "; ".join(mismatches)
+            db.insert_event(self._conn, "error", "exit", f"exit canonicalised: order {key}: {text}")
+            self.pause(f"exit canonicalised: order {key}: {text}", kind="mismatch")
+        elif mismatches:
             text = "; ".join(mismatches)
             db.insert_event(self._conn, "error", "mismatch", f"order {key}: {text}")
             self.pause(f"mismatch on order {key}: {text}", kind="mismatch")

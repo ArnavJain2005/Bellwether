@@ -73,6 +73,8 @@ class FakeSig:
     seen: list[Seen] = field(default_factory=list)
     next_order_id: int = 7001
     order_reply: Any = None  # a callable(body) -> httpx.Response, or None for "resting"
+    positions: dict[str, Decimal] = field(default_factory=dict)  # signed: + YES, - NO
+    settled: set[str] = field(default_factory=set)
 
     def quote(self, exchange_id: str) -> tuple[Decimal | None, Decimal | None]:
         return self.quotes.get(exchange_id, (D("0.50"), D("0.60")))  # no edge, no complement
@@ -102,7 +104,7 @@ class FakeSig:
         if method == "GET" and path == f"/tournaments/{SLUG}/portfolio/positions":
             return self._ok(
                 {
-                    "positions": [],
+                    "positions": [self._position(e, q) for e, q in self.positions.items()],
                     "summary": {
                         "totalMarketValue": 0,
                         "totalCostBasis": 0,
@@ -134,6 +136,24 @@ class FakeSig:
     @staticmethod
     def _ok(body: Any) -> httpx.Response:
         return httpx.Response(200, content=_encode(body).encode())
+
+    def _position(self, exchange_id: str, quantity: Decimal) -> dict[str, Any]:
+        return {
+            "exchangeId": exchange_id,
+            "marketId": self._market_of(exchange_id),
+            "marketTitle": "m",
+            "option": None,
+            "settled": exchange_id in self.settled,
+            "quantity": quantity,
+            "avgCost": D("0.40"),
+            "currentPrice": D("0.50"),
+            "marketValue": 0,
+            "costBasis": 0,
+            "unrealizedPnl": 0,
+            "unrealizedPnlPct": 0,
+            "moneyEarned": 0,
+            "lots": [],
+        }
 
     def _tournament(self) -> dict[str, Any]:
         return {
@@ -244,6 +264,64 @@ class FakeSig:
             return self.order_reply(body)
         return self.resting(body)
 
+    def fill_now(
+        self,
+        body: dict[str, Any],
+        traded: int | None = None,
+        *,
+        canonical: dict[str, Any] | None = None,
+    ) -> httpx.Response:
+        """Fill `traded` shares (all by default) at the limit; the rest stays open.
+
+        The fill nets into `positions` (a YES buy adds, a NO buy subtracts) and cash moves
+        as with netting: a buy that reduces a holding returns 1 - price per share.
+        """
+        quantity = int(body["quantity"])
+        traded = quantity if traded is None else traded
+        order_id = self.next_order_id
+        self.next_order_id += 1
+        sign = 1 if body["side"] == "yes" else -1
+        before = self.positions.get(body["exchangeId"], D(0))
+        price = Decimal(str(body["price"]))
+        for _ in range(traded):
+            if before * sign < 0:  # reduces the holding: netted
+                self.balance += 1 - price
+            else:
+                self.balance -= price
+            before += sign
+        self.positions[body["exchangeId"]] = before
+        self.fills[order_id] = D(traded)
+        self.open_orders.append(
+            {
+                "id": order_id,
+                "exchangeId": body["exchangeId"],
+                "side": body["side"],
+                "action": "buy",
+                "quantity": quantity - traded,
+                "priceLimit": body["price"],
+                "open": traded < quantity,
+                "createdAt": "2026-11-03T23:30:00.000Z",
+                "expirationDate": body["expirationDate"],
+            }
+        )
+        reply = {
+            "orderId": order_id,
+            "exchangeId": body["exchangeId"],
+            "open": traded < quantity,
+            "remainingQuantity": quantity - traded,
+            "action": "buy",
+            "side": body["side"],
+            "price": body["price"],
+            "quantity": quantity,
+            "terminalReasonCode": None,
+            "quantityTraded": traded,
+            "totalCost": price * traded,
+            "fillPrice": price if traded else None,
+            "all": None,
+        }
+        reply.update(canonical or {})
+        return self._ok(reply)
+
     def resting(self, body: dict[str, Any]) -> httpx.Response:
         """Accept the order: it rests on the book and stays open."""
         order_id = self.next_order_id
@@ -336,6 +414,7 @@ def make_loop(
     sig_contracts: list[MappedContract] | None = None,
     ladder: LoadedLadder | None = None,
     ladder_path: Path | None = None,
+    exits_path: Path | None = None,
 ) -> LoopRig:
     time = FakeTime()
     start = time.t
@@ -390,5 +469,7 @@ def make_loop(
         now=now,
         ladder=ladder,
         **({} if ladder_path is None else {"ladder_path": ladder_path}),
+        # Never the repository's config/exits.yaml: a missing file means no exits.
+        exits_path=exits_path or tmp_path / "no-exits.yaml",
     )
     return LoopRig(bot, sig, kalshi, time, conn, state_dir)

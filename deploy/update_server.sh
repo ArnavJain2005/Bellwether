@@ -10,6 +10,7 @@
 #   bot/map.yaml       origin/main's version, with every race the server had excluded
 #                      set back to exclude: true (approvals from main are kept)
 #   config/ladder.yaml restored as it was, unless origin/main changed it too (stops)
+#   config/exits.yaml  the same (Arnav's enabled: true/false survives an update)
 # Backups go to bot/state/backup-<UTC timestamp>/. On any failure after the update the
 # backups are restored and the rollback commands are printed.
 set -euo pipefail
@@ -31,12 +32,12 @@ fi
 [ -x "$PY" ] || die "$PY not found"
 [ "$(git rev-parse --abbrev-ref HEAD)" = main ] || die "the checkout is not on main"
 
-KEEP_RE='^(config/risk\.yaml|bot/map\.yaml|config/ladder\.yaml)$'
+KEEP_RE='^(config/risk\.yaml|bot/map\.yaml|config/ladder\.yaml|config/exits\.yaml)$'
 OTHER=$(git status --porcelain --untracked-files=no | cut -c4- | grep -Ev "$KEEP_RE" || true)
 [ -z "$OTHER" ] || die "other tracked files have local changes, resolve them first:
 $OTHER"
-if ! git diff --cached --quiet -- config/risk.yaml bot/map.yaml config/ladder.yaml; then
-  die "staged edits to risk.yaml, map.yaml or ladder.yaml must be reviewed and unstaged first"
+if ! git diff --cached --quiet -- config/risk.yaml bot/map.yaml config/ladder.yaml config/exits.yaml; then
+  die "staged edits to risk.yaml, map.yaml, ladder.yaml or exits.yaml must be reviewed and unstaged first"
 fi
 
 echo "== fetching origin (a read-only token may be asked for; username oauth2)"
@@ -55,6 +56,11 @@ HAD_LADDER=false
 if [ -f config/ladder.yaml ]; then
   cp -p config/ladder.yaml "$BACKUP/ladder.yaml"
   HAD_LADDER=true
+fi
+HAD_EXITS=false
+if [ -f config/exits.yaml ]; then
+  cp -p config/exits.yaml "$BACKUP/exits.yaml"
+  HAD_EXITS=true
 fi
 echo "== backups in $BACKUP"
 echo "== checking that local map edits are exclusions only"
@@ -104,29 +110,53 @@ elif $HAD_LADDER && git cat-file -e "$NEW_HEAD:config/ladder.yaml" 2>/dev/null; 
     exit 1
   fi
 fi
+KEEP_EXITS=false
+if git cat-file -e "$OLD_HEAD:config/exits.yaml" 2>/dev/null; then
+  if ! git diff --quiet "$OLD_HEAD" -- config/exits.yaml; then
+    if ! git diff --quiet "$OLD_HEAD" "$NEW_HEAD" -- config/exits.yaml; then
+      echo "config/exits.yaml has server edits AND changed on origin/main. Nothing was changed:"
+      git --no-pager diff "$OLD_HEAD" "$NEW_HEAD" -- config/exits.yaml
+      exit 1
+    fi
+    KEEP_EXITS=true
+  fi
+elif $HAD_EXITS && git cat-file -e "$NEW_HEAD:config/exits.yaml" 2>/dev/null; then
+  # An untracked server copy would block the update; it may go only if main's is identical.
+  if git show "$NEW_HEAD:config/exits.yaml" | cmp -s - config/exits.yaml; then
+    rm config/exits.yaml
+  else
+    echo "config/exits.yaml on the server differs from origin/main's. Nothing was changed:"
+    git show "$NEW_HEAD:config/exits.yaml" | diff -u - config/exits.yaml || true
+    exit 1
+  fi
+fi
 
 restore_and_explain() {
   echo "update_server: FAILED: $1" >&2
   cp -p "$BACKUP/risk.yaml" config/risk.yaml
   cp -p "$BACKUP/map.yaml" bot/map.yaml
   if $HAD_LADDER; then cp -p "$BACKUP/ladder.yaml" config/ladder.yaml; fi
-  echo "The server's risk.yaml, map.yaml and ladder.yaml (if any) are restored from $BACKUP." >&2
+  if $HAD_EXITS; then cp -p "$BACKUP/exits.yaml" config/exits.yaml; fi
+  echo "The server's risk.yaml, map.yaml, ladder.yaml and exits.yaml (if any) are restored from $BACKUP." >&2
   echo "To roll the code back to $OLD_HEAD as well:" >&2
   echo "  git reset --hard $OLD_HEAD" >&2
   echo "  cp -p $BACKUP/risk.yaml config/risk.yaml" >&2
   echo "  cp -p $BACKUP/map.yaml bot/map.yaml" >&2
   if $HAD_LADDER; then echo "  cp -p $BACKUP/ladder.yaml config/ladder.yaml" >&2; fi
+  if $HAD_EXITS; then echo "  cp -p $BACKUP/exits.yaml config/exits.yaml" >&2; fi
   exit 1
 }
 
 # --- 5. reset the edited files, fast-forward, restore ------------------------------------
 git checkout -- config/risk.yaml bot/map.yaml
 if $KEEP_LADDER; then git checkout -- config/ladder.yaml; fi
+if $KEEP_EXITS; then git checkout -- config/exits.yaml; fi
 # The fetch above already brought origin/main: a fast-forward to it is `git pull --ff-only`
 # without a second fetch, so the risk.yaml check above is about exactly what lands.
 git merge --ff-only "$NEW_HEAD" || restore_and_explain "fast-forward failed"
 cp -p "$BACKUP/risk.yaml" config/risk.yaml
 if $KEEP_LADDER; then cp -p "$BACKUP/ladder.yaml" config/ladder.yaml; fi
+if $KEEP_EXITS; then cp -p "$BACKUP/exits.yaml" config/exits.yaml; fi
 
 # --- 4. map.yaml: main's file, with the server's excluded races excluded again -----------
 "$PY" - "$BACKUP/map.yaml" bot/map.yaml <<'PYEOF' || restore_and_explain "map.yaml re-exclusion failed"
@@ -161,6 +191,8 @@ git --no-pager diff -- bot/map.yaml
 # --- 6. checks ---------------------------------------------------------------------------
 echo "== ladder check (the server's risk.yaml and ladder.yaml)"
 "$PY" -m bot.ladder check || restore_and_explain "python -m bot.ladder check failed"
+echo "== exits check (the server's exits.yaml)"
+"$PY" -c "from bot.exits import load_exits; s = load_exits(); print('exits.yaml absent: no exits' if s is None else f'exits enabled={s.enabled} mechanism={s.resolved_mechanism} edge={s.exit_edge}/{s.exit_edge_election_night} sides={list(s.sides)}')" || restore_and_explain "config/exits.yaml is invalid"
 
 echo "== tests"
 # The tests read the committed config, so they run on a clean copy of the new HEAD (the

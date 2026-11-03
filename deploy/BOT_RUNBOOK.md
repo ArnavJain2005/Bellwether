@@ -322,6 +322,37 @@ risk.yaml's limits): the bot drops to it at its next loop. After a restart the b
 resumes its step only if ladder.yaml is byte-identical to the file that step was set
 under; otherwise it starts again at L0.
 
+## 13b. Reduce-only exits (BOT-EW-5)
+
+An exit closes shares the bot holds when SIG's bid for that side is at least fair +
+`exit_edge`. It is a complement buy (a NO buy closes YES, a YES buy closes NO) that nets
+against the holding; the bot never sells. `config/exits.yaml` ships with
+`enabled: false`. `update_server.sh` keeps your edits to it.
+
+First run the exit probe (LIVE, one share; the bot must be stopped). Pick an approved
+exchange where the bot holds at least 2 shares (the dashboard's positions, or the latest
+`snapshots.positions_json`):
+
+```bash
+sudo systemctl stop bellwether-bot
+EXCHANGE_ID=941   # replace: an approved sig_exchange_id holding >= 2 shares
+sudo systemd-run --uid=bellwether --gid=bellwether --property=EnvironmentFile=/etc/bellwether.env --working-directory=/opt/bellwether --pty --wait --collect /opt/bellwether/.venv/bin/python -m bot.exit_probe --exchange "$EXCHANGE_ID" --i-am-arnav
+sudo systemctl start bellwether-bot
+```
+
+Only on `VERDICT: OK`, switch exits on. No restart is needed: the bot re-reads the file
+every loop.
+
+```bash
+sudo -u bellwether sed -i 's/^enabled: false/enabled: true/' /opt/bellwether/config/exits.yaml   # on
+sudo -u bellwether sed -i 's/^enabled: true/enabled: false/' /opt/bellwether/config/exits.yaml   # off
+sqlite3 -readonly /opt/bellwether/bot/state/bellwether.db "SELECT ts_utc, verdict, reason FROM decisions WHERE strategy = 'exit' ORDER BY id DESC LIMIT 10"
+```
+
+If the file is invalid, exits stay off, one `exit` error event is written and buys carry
+on. That error event also keeps the ladder's clean gate shut for `clean_minutes`.
+`LADDER_HOLD` and `PAUSED` also stop exits.
+
 ## 14. Laptop fallback
 
 If the server is unavailable, run the bot from the repository on a laptop that stays
