@@ -1,13 +1,13 @@
 """Offline operator launcher checks; no systemd service, network or SIG key."""
 
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
 import os
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 
 SCRIPT = Path(__file__).resolve().parents[2] / "deploy/botctl.sh"
@@ -63,14 +63,14 @@ class BotctlTests(unittest.TestCase):
 
     def run_ctl(self, command: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(["bash", str(self.script), command], cwd=self.app,
-                              env=self.env, capture_output=True, text=True, timeout=5)
+                              env=self.env, capture_output=True, text=True, timeout=5, check=False)
 
     def heartbeat(self, *, age: int = 0, paused: int = 0, mode: str = "dry_run") -> None:
         db = self.app / "bot/state/bellwether.db"
         with sqlite3.connect(db) as conn:
             conn.execute("CREATE TABLE heartbeat (id INT, ts_utc TEXT, mode TEXT, "
                          "paused INT, pause_reason TEXT)")
-            ts = (datetime.now(timezone.utc) - timedelta(seconds=age)).isoformat()
+            ts = (datetime.now(UTC) - timedelta(seconds=age)).isoformat()
             conn.execute("INSERT INTO heartbeat VALUES (1, ?, ?, ?, '')", (ts, mode, paused))
 
     def test_start_enables_service_after_dry_run_preflight(self) -> None:
