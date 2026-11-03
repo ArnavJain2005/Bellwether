@@ -35,6 +35,9 @@ KEEP_RE='^(config/risk\.yaml|bot/map\.yaml|config/ladder\.yaml)$'
 OTHER=$(git status --porcelain --untracked-files=no | cut -c4- | grep -Ev "$KEEP_RE" || true)
 [ -z "$OTHER" ] || die "other tracked files have local changes, resolve them first:
 $OTHER"
+if ! git diff --cached --quiet -- config/risk.yaml bot/map.yaml config/ladder.yaml; then
+  die "staged edits to risk.yaml, map.yaml or ladder.yaml must be reviewed and unstaged first"
+fi
 
 echo "== fetching origin (a read-only token may be asked for; username oauth2)"
 git fetch origin main
@@ -54,6 +57,26 @@ if [ -f config/ladder.yaml ]; then
   HAD_LADDER=true
 fi
 echo "== backups in $BACKUP"
+echo "== checking that local map edits are exclusions only"
+"$PY" - "$OLD_HEAD" "$BACKUP/map.yaml" <<'PYEOF' || die "bot/map.yaml has edits beyond race exclusions; nothing was updated"
+from pathlib import Path
+import subprocess
+import sys
+
+old_sha, server_path = sys.argv[1:]
+old = subprocess.run(
+    ["git", "show", f"{old_sha}:bot/map.yaml"], check=True, stdout=subprocess.PIPE
+).stdout.splitlines(keepends=True)
+server = Path(server_path).read_bytes().splitlines(keepends=True)
+if len(old) != len(server):
+    sys.exit("server map has added or removed lines")
+for number, (committed, local) in enumerate(zip(old, server), start=1):
+    if committed == local or (
+        committed == b"  exclude: false\n" and local == b"  exclude: true\n"
+    ):
+        continue
+    sys.exit(f"server map has another change at line {number}")
+PYEOF
 
 # --- 3. risk.yaml (and ladder.yaml): stop if main changed what the server edits ------------
 if ! git diff --quiet "$OLD_HEAD" "$NEW_HEAD" -- config/risk.yaml; then
@@ -162,3 +185,4 @@ Then confirm the heartbeat (ladder_step, scale and caps are the active step's):
 Ladder gates at any time:
   sudo -u bellwether $APP/$PY -m bot.ladder status
 EOF
+
