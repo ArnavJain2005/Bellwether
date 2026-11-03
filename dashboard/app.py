@@ -30,6 +30,7 @@ if str(_REPO_ROOT) not in sys.path:
 from dashboard.db import (
     DEFAULT_HISTORY_HOURS,
     OPEN_ORDER_STATUSES,
+    QUOTE_INACTIVE_SECONDS,
     QUOTE_STALE_SECONDS,
     STOP_CONTRACT_PATH,
     FilterCriteria,
@@ -523,9 +524,16 @@ def build_needs_attention_items(snapshot: MonitorSnapshot) -> list[AttentionItem
                 )
             )
 
-    # 6. STALE quotes (>60s)
+    # 6. STALE quotes (>60s). Rows older than QUOTE_INACTIVE_SECONDS are contracts the
+    # bot no longer refreshes; they are summarised in one item.
+    inactive_quotes: list[str] = []
     for row in snapshot.quotes_table.rows:
         age_sec = compute_age_seconds(row.get("ts_utc"), snapshot.fetched_at_utc)
+        if age_sec is not None and age_sec > QUOTE_INACTIVE_SECONDS:
+            inactive_quotes.append(
+                f"{row.get('sig_exchange_id') or 'unknown'} ({row.get('race_key') or '—'})"
+            )
+            continue
         if age_sec is None or age_sec > QUOTE_STALE_SECONDS:
             age_str = f"{round(age_sec)}s" if age_sec is not None else "no timestamp"
             contract = str(row.get("sig_exchange_id") or "unknown")
@@ -538,6 +546,21 @@ def build_needs_attention_items(snapshot: MonitorSnapshot) -> list[AttentionItem
                     detail=f"Quote age {age_str} (> {int(QUOTE_STALE_SECONDS)}s threshold)",
                 )
             )
+
+    if inactive_quotes:
+        shown = ", ".join(inactive_quotes[:5])
+        more = f" (+{len(inactive_quotes) - 5} more)" if len(inactive_quotes) > 5 else ""
+        items.append(
+            AttentionItem(
+                severity="warn",
+                category="quote_inactive",
+                title=f"INACTIVE QUOTES ({len(inactive_quotes)})",
+                detail=(
+                    f"Not refreshed for > {int(QUOTE_INACTIVE_SECONDS // 60)} min "
+                    f"(excluded, closed or old-run contracts): {shown}{more}"
+                ),
+            )
+        )
 
     # 7. Exposure over 90% of a cap
     for row in snapshot.exposure_table.rows:
@@ -1229,6 +1252,23 @@ def render_positions_panel_html(
             if row.committed is not None
             else "—"
         )
+        mv_str = (
+            format_susq(row.market_value, with_unit=False)
+            if row.market_value is not None
+            else "—"
+        )
+        upnl_str, upnl_dir = (
+            format_signed_susq(row.unrealized_pnl, with_unit=False)
+            if row.unrealized_pnl is not None
+            else ("—", "neutral")
+        )
+        upnl_cls = (
+            "bw-val-positive"
+            if upnl_dir == "positive"
+            else "bw-val-negative"
+            if upnl_dir == "negative"
+            else "bw-val-neutral"
+        )
         mkt_cell = (
             f'<td class="bw-nowrap">{_esc(row.sig_market_id)}</td>'
             if show_all_columns
@@ -1245,6 +1285,8 @@ def render_positions_panel_html(
             f'<td class="bw-num">{_esc(price_str)}</td>'
             f'<td class="bw-num">{_esc(cost_str)}</td>'
             f'<td class="bw-num">{_esc(comm_str)}</td>'
+            f'<td class="bw-num">{_esc(mv_str)}</td>'
+            f'<td class="bw-num {upnl_cls}">{_esc(upnl_str)}</td>'
             f"</tr>"
         )
 
@@ -1271,6 +1313,8 @@ def render_positions_panel_html(
         f'        <th class="bw-num">PRICE_SIDE</th>'
         f'        <th class="bw-num">TOTAL_COST</th>'
         f'        <th class="bw-num">COMMITTED</th>'
+        f'        <th class="bw-num">MKT VALUE</th>'
+        f'        <th class="bw-num">UNREAL P&amp;L</th>'
         f'      </tr></thead>'
         f'      <tbody>{"".join(rows_html)}</tbody>'
         f'    </table>'
@@ -1356,6 +1400,8 @@ def render_race_pnl_panel_html(
         f"Snapshot #{race_pnl.snapshot_id} @ {race_pnl.snapshot_ts_ist} | "
         f"{len(rows)}/{len(race_pnl.rows)} race(s)"
     )
+    if race_pnl.source == "positions_unrealized":
+        meta += " | unrealized, from SIG positions"
     return (
         f'<div class="bw-panel {panel_cls}" data-testid="panel-race-pnl">'
         f'  <div class="bw-panel-header">'
