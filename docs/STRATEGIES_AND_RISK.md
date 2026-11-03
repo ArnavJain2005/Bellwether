@@ -27,21 +27,21 @@ flowchart TD
   CheckCooldown -->|No| SplitStrat{"Strategy Type"}
 
   subgraph CompStrat["Strategy A: Intra-Race Complement Arbitrage"]
-    SplitStrat -->|Both D & R Approved| CheckAsks{"YES Asks:<br/>ask_D + ask_R <= 0.970?"}
+    SplitStrat -->|Both D and R Approved| CheckAsks{"YES Asks:<br/>ask_D + ask_R <= 0.970?"}
     CheckAsks -->|Yes| BuyBothYes["Leg 1: BUY YES (D) @ ask_D<br/>Leg 2: BUY YES (R) @ ask_R<br/>(Equal Qty, Locks in >= 3c/share)"]
-    CheckAsks -->|No| CheckBids{"NO Orders Enabled &<br/>bid_D + bid_R >= 1.030?"}
+    CheckAsks -->|No| CheckBids{"NO Orders Enabled and<br/>bid_D + bid_R >= 1.030?"}
     CheckBids -->|Yes| BuyBothNo["Leg 1: BUY NO (D) @ 1 - bid_D<br/>Leg 2: BUY NO (R) @ 1 - bid_R<br/>(Equal Qty, Locks in >= 3c/share)"]
     CheckBids -->|No| SkipComp["Verdict: SKIP<br/>(no complement edge)"]
   end
 
   subgraph RefStrat["Strategy B: Cross-Venue Reference Pricing"]
     SplitStrat -->|Per Contract| FairVal["Form Fair Value f<br/>(bot/refs.py: Kalshi & Polymarket)"]
-    FairVal --> ValidFair{"Age <= 30s &<br/>Spread <= 0.04 &<br/>|Kalshi - Poly| <= 0.03?"}
+    FairVal --> ValidFair{"Age <= 30s and<br/>Spread <= 0.04 and<br/>Venue Diff <= 0.03?"}
     ValidFair -->|No| SkipRef["Verdict: SKIP<br/>(ref stale / wide / venues disagree)"]
     ValidFair -->|Yes| EdgeRegime["Active Edge Threshold e:<br/>0.04 (Normal) or 0.06 (Election Night)"]
     EdgeRegime --> CheckYesEdge{"SIG ask <= f - e?"}
     CheckYesEdge -->|Yes| BuyYesRef["Leg: BUY YES @ floor(SIG ask)<br/>Edge = f - ask"]
-    CheckYesEdge -->|No| CheckNoEdge{"NO Orders Enabled &<br/>SIG bid >= f + e?"}
+    CheckYesEdge -->|No| CheckNoEdge{"NO Orders Enabled and<br/>SIG bid >= f + e?"}
     CheckNoEdge -->|Yes| BuyNoRef["Leg: BUY NO @ floor(1 - SIG bid)<br/>Edge = bid - f"]
     CheckNoEdge -->|No| SkipNoEdge["Verdict: SKIP<br/>(no edge)"]
   end
@@ -78,14 +78,14 @@ Once the portfolio approaches full deployment, capital rotation (`bot/strategy.p
 
 ```mermaid
 flowchart TD
-  Hold(["Held Position on Side S in {YES, NO}<br/>Quantity Q_held · FIFO Avg Entry e_S"]) --> Gates{"exits.yaml enabled?<br/>Not PAUSED / LADDER_HOLD?<br/>No Live Order & >30s Cooldown?"}
+  Hold["Held Position on Side S (YES or NO)<br/>Quantity Q_held · FIFO Avg Entry e_S"] --> Gates{"exits.yaml enabled?<br/>Not PAUSED or LADDER_HOLD?<br/>No Live Order and Cooldown Passed?"}
   Gates -->|No| SkipExit["Hold Position"]
   Gates -->|Yes| SideMap["Compute Side-Relative Prices:<br/>If S == YES: f_S = f, b_S = SIG_bid<br/>If S == NO: f_S = 1 - f, b_S = 1 - SIG_ask"]
 
   SideMap --> T1{"Trigger 1: Valuation Reversal<br/>b_S >= f_S + exit_edge<br/>(0.03 normal / 0.04 election night)?"}
   T1 -->|Yes| FireExit["Fire Reduce-Only Exit"]
 
-  T1 -->|No| CheckRot{"rotation.enabled in risk.yaml<br/>& e_S known & b_S >= e_S?"}
+  T1 -->|No| CheckRot{"rotation.enabled in risk.yaml<br/>and e_S known and b_S >= e_S?"}
   CheckRot -->|No| SkipExit
   CheckRot -->|Yes| T2{"Trigger 2: Take-Profit<br/>(b_S - e_S) / e_S >= 8%?"}
   T2 -->|Yes| FireExit
@@ -93,11 +93,11 @@ flowchart TD
   T3 -->|Yes| FireExit
   T3 -->|No| SkipExit
 
-  FireExit --> CompBuy["Place Complement Buy on Opposite Side ~S<br/>Price = floor(1 - b_S)<br/>Qty = min(held - live_exits, book_depth)<br/>Cancel Any Unfilled Remainder Immediately"]
+  FireExit --> CompBuy["Place Complement Buy on Opposite Side<br/>Price = floor(1 - b_S)<br/>Qty = min(held - live_exits, book_depth)<br/>Cancel Any Unfilled Remainder Immediately"]
   CompBuy --> Cooldown["Block Re-Entry on Exchange for 10 Minutes<br/>Release Average Journal Cost for Ranked Reinvestment"]
 ```
 
-###Three Exit Triggers (`evaluate_exit`)
+### Three Exit Triggers (`evaluate_exit`)
 Let $S \in \{\text{YES}, \text{NO}\}$ be the held side, $f_S$ be the reference fair value for side $S$ ($f$ for `YES`, $1 - f$ for `NO`), $b_S$ be SIG's best bid for side $S$ ($\text{SIG}_{\text{bid}}$ for `YES`, $1 - \text{SIG}_{\text{ask}}$ for `NO`), and $e_S$ be the FIFO average entry price of the currently held shares from the order journal (`risk.entry_price`):
 1. **Valuation Reversal Exit (`BOT-EW-5`):** Fires when SIG's bid exceeds reference fair value by at least `exit_edge` ($0.03$ normal, $0.04$ election night):
    $$b_S \ge f_S + \text{exit\_edge}$$
@@ -115,13 +115,13 @@ Every order (`risk.check` for entries, `risk.check_exit` for exits) must pass al
 flowchart TB
   Cand(["Candidate Order (Leg, Quantity, Price_Side)"]) --> G1{"1. Control Files:<br/>STOP or PAUSED present?"}
   G1 -->|Yes| Deny1["DENY: stop file / paused"]
-  G1 -->|No| G2{"2. Unknown Orders:<br/>Any order in status 'unknown'?"}
+  G1 -->|No| G2{"2. Unknown Orders:<br/>Any order in status unknown?"}
   G2 -->|Yes| Deny2["DENY: unknown order exists"]
-  G2 -->|No| G3{"3. Balance & Loss Stop:<br/>balance >= start_balance - loss_stop?"}
+  G2 -->|No| G3{"3. Balance and Loss Stop:<br/>balance >= start_balance - loss_stop?"}
   G3 -->|No| Deny3["DENY: loss stop breached"]
   G3 -->|Yes| G4{"4. Write Rate Budget:<br/>writes_last_min + legs <= max_writes_per_min (20)?"}
   G4 -->|No| Deny4["DENY: write rate limit"]
-  G4 -->|Yes| G5{"5. Action, Side & Price Grid:<br/>action == 'buy', price in [0.005, 0.995],<br/>exact multiple of 0.005, NO enabled?"}
+  G4 -->|Yes| G5{"5. Action, Side and Price Grid:<br/>action == buy, price 0.005 to 0.995,<br/>exact multiple of 0.005, NO enabled?"}
   G5 -->|No| Deny5["DENY: off-grid or NO disabled"]
   G5 -->|Yes| G6{"6. Per-Order Cap:<br/>order_cost <= scale * per_order?"}
   G6 -->|No| Deny6["DENY: exceeds per_order cap"]
@@ -135,10 +135,11 @@ flowchart TB
   G10 -->|No| Deny10["DENY: exceeds target_deployment"]
   G10 -->|Yes| G11{"11. Minimum Cash Reserve:<br/>balance - cost >= min_cash_reserve?"}
   G11 -->|No| Deny11["DENY: breaches min_cash_reserve"]
-  G11 -->|Yes| G12["ALLOW -> Commit to SQLite Journal & Send"]
+  G11 -->|Yes| G12["ALLOW: Commit to SQLite Journal and Send"]
 ```
 
 ### Key Accounting Rules in `bot/risk.py`
 - **Worst-Case Commitment Accounting (`committed`):** `total_committed` and `race_committed` include filled shares (`total_cost`), resting open orders (`price_side * remaining_qty`), **and `unknown` orders at 100% of their full notional size**, plus `preexisting_committed` from manual trading.
 - **Exit Commitment Release (`exit_commitments`):** When a reduce-only exit fills, it releases the **FIFO average journal entry cost** of the closed shares (not the exit proceeds), ensuring realized gains or losses never distort the remaining cost basis.
 - **Automatic Size Scaling (`joint_quantity` / `allowed_quantity`):** If a candidate order's book-depth size exceeds any cap (per-order, per-race, 15% race fraction, total committed, target deployment, or cash reserve), `bot/strategy.py` automatically scales the share quantity down to the largest integer $Q \ge 1$ that passes `risk.check`.
+
