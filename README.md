@@ -12,8 +12,8 @@
 > - **A live monitoring dashboard** with a confirmation-gated STOP control.
 
 <p align="center">
-  <img src="docs/assets/screenshots/dashboard-live-monitor.png" alt="Bellwether election-week monitor showing heartbeat, exposure by race, quotes with edges, orders, decisions and events" width="100%">
-  <br><sub><em>Sample data.</em> The election-week monitor: bot heartbeat, exposure against caps, SIG quotes against Kalshi and Polymarket, and every order, decision and event with its reason.</sub>
+  <img src="docs/assets/screenshots/dashboard-live-monitor.png" alt="Bellwether election-week monitor showing status strip, 4 key metrics, needs-attention alert box, orders and decisions" width="100%">
+  <br><sub><em>Sample data.</em> The election-week monitor (v2): live status strip, 4 key metrics with exposure bar, derived "Needs attention" problem box, and tabbed inspection of orders, decisions, quotes, positions and events.</sub>
 </p>
 
 ## The problem
@@ -44,7 +44,7 @@ read-only references.
 | **Election-week bot** | A buy-only trading loop with two strategies: complement pricing within a race, and reference pricing against Kalshi and Polymarket. It has one risk gate, an idempotency journal and restart reconciliation, and it runs in dry run by default. | [`main.py`](bot/main.py) · [`strategy.py`](bot/strategy.py) · [`risk.py`](bot/risk.py) · [`orders.py`](bot/orders.py) |
 | **Reference prices** | Public Kalshi and Polymarket quotes, with staleness, spread and cross-venue disagreement checks before a fair value is formed. | [`refs.py`](bot/refs.py) |
 | **Contract mapping** | Venue discovery and filtering, and a candidate-matching workflow tied to pinned source data. The bot map flags 114 SIG contracts in 57 Senate, governor and chamber-control races as approved for the election-week bot, with 10 races excluded. These bot approvals are separate from formal R1 settlement-equivalence verification. | [`venue_markets/`](data/venue_markets/README.md) · [`r1_mapping/`](data/r1_mapping/README.md) · [`map.yaml`](bot/map.yaml) · [`map_review.md`](bot/map_review.md) |
-| **Dashboard** | A Streamlit monitor that opens the bot's SQLite database read-only. It has filters, 6-hour IST history, and a STOP control that requires confirmation. | [`app.py`](dashboard/app.py) · [`db.py`](dashboard/db.py) |
+| **Dashboard** | A Streamlit monitor that opens the bot's SQLite database read-only. Simplified v2 layout with a unified status strip, 4 big numbers, a derived "Needs attention" alert box, 4 detail tabs (Orders & Decisions, Quotes & Exposure, Positions & History, Events), 6-hour IST history, a confirmation-gated STOP control, and legacy layout rollback (`?ui=legacy`). | [`app.py`](dashboard/app.py) · [`db.py`](dashboard/db.py) |
 | **Operations** | systemd units and a step-by-step runbook for a single Ubuntu server, plus hosting evidence and the server design. | [`BOT_RUNBOOK.md`](deploy/BOT_RUNBOOK.md) · [`deploy/`](deploy/README.md) |
 
 ## Architecture
@@ -130,16 +130,16 @@ synthetic, and none show real trading.
 ## Testing and quality
 
 These counts were measured on `main` at
-[`c9d22ca`](https://github.com/ArnavJain2005/Bellwether/commit/c9d22ca7128095f08e8e8c294406a0a598fb86e9)
-on Nov 2, 2026:
+[`becbbe2`](https://github.com/ArnavJain2005/Bellwether/commit/becbbe262ed050a24d74288f968092f9e61d7c25)
+on Nov 4, 2026:
 
 | Suite | Tests | In CI |
 | :--- | ---: | :---: |
 | Engine (`tests/`) | 2,020 | ✓ |
-| Bot (`bot/tests/`) | 207 | ✓ |
+| Bot (`bot/tests/`) | 386 | ✓ |
 | Data and mapping (`data/*/tests/`) | 725 | run separately |
-| Dashboard (`dashboard/tests/`) | 25 | run separately (needs Streamlit) |
-| **Total** | **2,977** | |
+| Dashboard (`dashboard/tests/`) | 34 | run separately (needs Streamlit) |
+| **Total** | **3,165** | |
 
 - Every suite passes, and `ruff check .` is clean.
 - [GitHub Actions](.github/workflows/ci.yml) runs Ruff and `pytest` on Python 3.11 for
@@ -207,4 +207,4 @@ figures are claimed here.
 
 Built by **Arnav Jain** for the SIG Predictions Cup 2026.
 
-<sub>Audited against `main` at `c9d22ca` (PR #56), Nov 2, 2026. SUSQies are simulated competition funds; no real money is traded.</sub>
+<sub>Audited against `main` at `becbbe2` (PR #65), Nov 4, 2026. SUSQies are simulated competition funds; no real money is traded.</sub>
