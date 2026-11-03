@@ -1187,6 +1187,24 @@ races:
     kalshi_ticker: CONTROLS-2026-R
     polymarket_token_id: '51939490109676186832507970701169130490548061087912630009168726706475001411420'
     approved: true
+- race_key: house:AL-02
+  exclude: false
+  note: 'MAP-ALL: Kalshi KXHOUSERACE, rules verified'
+  contracts:
+  - party: D
+    sig_market_id: '318'
+    sig_exchange_id: '1007'
+    sig_title: Will the Democratic Party win the AL-02 House race?
+    kalshi_ticker: KXHOUSERACE-AL02-26-D
+    polymarket_token_id: '13189761649035136014216228195645475511361901020555722779072382901094466765019'
+    approved: true
+  - party: R
+    sig_market_id: '319'
+    sig_exchange_id: '1008'
+    sig_title: Will the Republican Party win the AL-02 House race?
+    kalshi_ticker: KXHOUSERACE-AL02-26-R
+    polymarket_token_id: '110498646838643141699770234895735915394620065036723874056548571888067488950164'
+    approved: true
 - race_key: house:AZ-01
   exclude: false
   note: ''
@@ -1197,14 +1215,14 @@ races:
     sig_title: Will the Democratic Party win the AZ-01 House race?
     kalshi_ticker: HOUSEAZ1-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '198'
     sig_exchange_id: '887'
     sig_title: Will the Republican Party win the AZ-01 House race?
     kalshi_ticker: HOUSEAZ1-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
 - race_key: house:AZ-06
   exclude: false
   note: ''
@@ -1215,14 +1233,14 @@ races:
     sig_title: Will the Democratic Party win the AZ-06 House race?
     kalshi_ticker: HOUSEAZ6-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '200'
     sig_exchange_id: '889'
     sig_title: Will the Republican Party win the AZ-06 House race?
     kalshi_ticker: HOUSEAZ6-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
 - race_key: house:CA-22
   exclude: false
   note: ''
@@ -1233,14 +1251,32 @@ races:
     sig_title: Will the Democratic Party win the CA-22 House race?
     kalshi_ticker: HOUSECA22-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '202'
     sig_exchange_id: '891'
     sig_title: Will the Republican Party win the CA-22 House race?
     kalshi_ticker: HOUSECA22-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
+- race_key: house:CA-48
+  exclude: false
+  note: 'MAP-ALL: Kalshi KXHOUSERACE, rules verified'
+  contracts:
+  - party: D
+    sig_market_id: '203'
+    sig_exchange_id: '892'
+    sig_title: Will the Democratic Party win the CA-48 House race?
+    kalshi_ticker: KXHOUSERACE-CA48-26-D
+    polymarket_token_id: '59802490472036913873496121286677427483662122509187681183126522612013504797043'
+    approved: true
+  - party: R
+    sig_market_id: '204'
+    sig_exchange_id: '893'
+    sig_title: Will the Republican Party win the CA-48 House race?
+    kalshi_ticker: KXHOUSERACE-CA48-26-R
+    polymarket_token_id: '74883630455715593214751459772360468028930271344780030243472846680635150664331'
+    approved: true
 - race_key: house:CO-03
   exclude: false
   note: ''
@@ -1251,14 +1287,32 @@ races:
     sig_title: Will the Democratic Party win the CO-03 House race?
     kalshi_ticker: HOUSECO3-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '206'
     sig_exchange_id: '895'
     sig_title: Will the Republican Party win the CO-03 House race?
     kalshi_ticker: HOUSECO3-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
+- race_key: house:CO-04
+  exclude: false
+  note: 'MAP-ALL: Kalshi KXHOUSERACE, rules verified'
+  contracts:
+  - party: D
+    sig_market_id: '207'
+    sig_exchange_id: '896'
+    sig_title: Will the Democratic Party win the CO-04 House race?
+    kalshi_ticker: KXHOUSERACE-CO04-26-D
+    polymarket_token_id: '21114904170244249083059864962815455303156569744726868991298626905734505722454'
+    approved: true
+  - party: R
+    sig_market_id: '208'
+    sig_exchange_id: '897'
+    sig_title: Will the Republican Party win the CO-04 House race?
+    kalshi_ticker: KXHOUSERACE-CO04-26-R
+    polymarket_token_id: '93912560256245525429984546771927493927155759286650495356669416323669943507847'
+    approved: true
 - race_key: house:CO-08
   exclude: false
   note: ''
@@ -1269,14 +1323,50 @@ races:
     sig_title: Will the Democratic Party win the CO-08 House race?
     kalshi_ticker: HOUSECO8-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '210'
     sig_exchange_id: '899'
     sig_title: Will the Republican Party win the CO-08 House race?
     kalshi_ticker: HOUSECO8-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
+- race_key: house:FL-07
+  exclude: false
+  note: 'MAP-ALL: Kalshi KXHOUSERACE, rules verified'
+  contracts:
+  - party: D
+    sig_market_id: '320'
+    sig_exchange_id: '1009'
+    sig_title: Will the Democratic Party win the FL-07 House race?
+    kalshi_ticker: KXHOUSERACE-FL07-26-D
+    polymarket_token_id: '48595994389294380413605252588038399089739882614541392889205137632817333951567'
+    approved: true
+  - party: R
+    sig_market_id: '321'
+    sig_exchange_id: '1010'
+    sig_title: Will the Republican Party win the FL-07 House race?
+    kalshi_ticker: KXHOUSERACE-FL07-26-R
+    polymarket_token_id: '28134558928888227948813381987057565018866784201189850460618625875753502909061'
+    approved: true
+- race_key: house:FL-09
+  exclude: false
+  note: 'MAP-ALL: Kalshi KXHOUSERACE, rules verified'
+  contracts:
+  - party: D
+    sig_market_id: '211'
+    sig_exchange_id: '900'
+    sig_title: Will the Democratic Party win the FL-09 House race?
+    kalshi_ticker: KXHOUSERACE-FL09-26-D
+    polymarket_token_id: null
+    approved: true
+  - party: R
+    sig_market_id: '322'
+    sig_exchange_id: '1011'
+    sig_title: Will the Republican Party win the FL-09 House race?
+    kalshi_ticker: KXHOUSERACE-FL09-26-R
+    polymarket_token_id: '14535768089815400273847771354088826502078939671987391994275253603566532191654'
+    approved: true
 - race_key: house:FL-13
   exclude: false
   note: ''
@@ -1287,14 +1377,68 @@ races:
     sig_title: Will the Democratic Party win the FL-13 House race?
     kalshi_ticker: HOUSEFL13-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '212'
     sig_exchange_id: '901'
     sig_title: Will the Republican Party win the FL-13 House race?
     kalshi_ticker: HOUSEFL13-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
+- race_key: house:FL-16
+  exclude: false
+  note: 'MAP-ALL: Kalshi KXHOUSERACE, rules verified'
+  contracts:
+  - party: D
+    sig_market_id: '324'
+    sig_exchange_id: '1013'
+    sig_title: Will the Democratic Party win the FL-16 House race?
+    kalshi_ticker: KXHOUSERACE-FL16-26-D
+    polymarket_token_id: '106958534192257552731131706251545716690561203965658398267038573027472601603038'
+    approved: true
+  - party: R
+    sig_market_id: '325'
+    sig_exchange_id: '1014'
+    sig_title: Will the Republican Party win the FL-16 House race?
+    kalshi_ticker: KXHOUSERACE-FL16-26-R
+    polymarket_token_id: '15056064872112675856476546973246733011825608647719006314444015066456521530341'
+    approved: true
+- race_key: house:FL-20
+  exclude: false
+  note: 'MAP-ALL: Kalshi KXHOUSERACE, rules verified'
+  contracts:
+  - party: D
+    sig_market_id: '326'
+    sig_exchange_id: '1015'
+    sig_title: Will the Democratic Party win the FL-20 House race?
+    kalshi_ticker: KXHOUSERACE-FL20-26-D
+    polymarket_token_id: '7861599392964570899063295249757924331582887786226297517280676454972508298031'
+    approved: true
+  - party: R
+    sig_market_id: '327'
+    sig_exchange_id: '1016'
+    sig_title: Will the Republican Party win the FL-20 House race?
+    kalshi_ticker: KXHOUSERACE-FL20-26-R
+    polymarket_token_id: null
+    approved: true
+- race_key: house:FL-22
+  exclude: false
+  note: 'MAP-ALL: Kalshi KXHOUSERACE, rules verified'
+  contracts:
+  - party: D
+    sig_market_id: '328'
+    sig_exchange_id: '1017'
+    sig_title: Will the Democratic Party win the FL-22 House race?
+    kalshi_ticker: KXHOUSERACE-FL22-26-D
+    polymarket_token_id: '9888897571794010752121877049436014412394792546592129944638664529404498838517'
+    approved: true
+  - party: R
+    sig_market_id: '329'
+    sig_exchange_id: '1018'
+    sig_title: Will the Republican Party win the FL-22 House race?
+    kalshi_ticker: KXHOUSERACE-FL22-26-R
+    polymarket_token_id: '12503562961051694670561093522011301968376611490945772097489304120208051360657'
+    approved: true
 - race_key: house:IA-01
   exclude: false
   note: ''
@@ -1305,14 +1449,32 @@ races:
     sig_title: Will the Democratic Party win the IA-01 House race?
     kalshi_ticker: HOUSEIA1-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '214'
     sig_exchange_id: '903'
     sig_title: Will the Republican Party win the IA-01 House race?
     kalshi_ticker: HOUSEIA1-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
+- race_key: house:IA-02
+  exclude: false
+  note: 'MAP-ALL: Kalshi KXHOUSERACE, rules verified'
+  contracts:
+  - party: D
+    sig_market_id: '215'
+    sig_exchange_id: '904'
+    sig_title: Will the Democratic Party win the IA-02 House race?
+    kalshi_ticker: KXHOUSERACE-IA02-26-D
+    polymarket_token_id: '24808423328362642269928339618535398875519836942812329525201323299850907438220'
+    approved: true
+  - party: R
+    sig_market_id: '216'
+    sig_exchange_id: '905'
+    sig_title: Will the Republican Party win the IA-02 House race?
+    kalshi_ticker: KXHOUSERACE-IA02-26-R
+    polymarket_token_id: '106183024660666533834062502031813793169247762855988914383541855843680035368680'
+    approved: true
 - race_key: house:IA-03
   exclude: false
   note: ''
@@ -1323,14 +1485,32 @@ races:
     sig_title: Will the Democratic Party win the IA-03 House race?
     kalshi_ticker: HOUSEIA3-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '218'
     sig_exchange_id: '907'
     sig_title: Will the Republican Party win the IA-03 House race?
     kalshi_ticker: HOUSEIA3-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
+- race_key: house:KY-04
+  exclude: false
+  note: 'MAP-ALL: Kalshi KXHOUSERACE, rules verified'
+  contracts:
+  - party: D
+    sig_market_id: '219'
+    sig_exchange_id: '908'
+    sig_title: Will the Democratic Party win the KY-04 House race?
+    kalshi_ticker: KXHOUSERACE-KY04-26-D
+    polymarket_token_id: null
+    approved: true
+  - party: R
+    sig_market_id: '220'
+    sig_exchange_id: '909'
+    sig_title: Will the Republican Party win the KY-04 House race?
+    kalshi_ticker: KXHOUSERACE-KY04-26-R
+    polymarket_token_id: '4360584608318889792359076982751499707146205412289783849766659973245585132129'
+    approved: true
 - race_key: house:ME-02
   exclude: true
   note: 'ME: runoff / ranked-choice risk'
@@ -1359,14 +1539,14 @@ races:
     sig_title: Will the Democratic Party win the MI-07 House race?
     kalshi_ticker: HOUSEMI7-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '331'
     sig_exchange_id: '1020'
     sig_title: Will the Republican Party win the MI-07 House race?
     kalshi_ticker: HOUSEMI7-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
 - race_key: house:MI-10
   exclude: false
   note: ''
@@ -1377,14 +1557,32 @@ races:
     sig_title: Will the Democratic Party win the MI-10 House race?
     kalshi_ticker: HOUSEMI10-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '333'
     sig_exchange_id: '1022'
     sig_title: Will the Republican Party win the MI-10 House race?
     kalshi_ticker: HOUSEMI10-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
+- race_key: house:MN-01
+  exclude: false
+  note: 'MAP-ALL: Kalshi KXHOUSERACE, rules verified'
+  contracts:
+  - party: D
+    sig_market_id: '334'
+    sig_exchange_id: '1023'
+    sig_title: Will the Democratic Party win the MN-01 House race?
+    kalshi_ticker: KXHOUSERACE-MN01-26-D
+    polymarket_token_id: '53556044615407667948482140924138670085564709060050296606327145637179427254399'
+    approved: true
+  - party: R
+    sig_market_id: '335'
+    sig_exchange_id: '1024'
+    sig_title: Will the Republican Party win the MN-01 House race?
+    kalshi_ticker: KXHOUSERACE-MN01-26-R
+    polymarket_token_id: '58414915443056575600546845688231939406497093430617962204950899073959516863962'
+    approved: true
 - race_key: house:MN-02
   exclude: false
   note: ''
@@ -1395,14 +1593,32 @@ races:
     sig_title: Will the Democratic Party win the MN-02 House race?
     kalshi_ticker: HOUSEMN2-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '337'
     sig_exchange_id: '1026'
     sig_title: Will the Republican Party win the MN-02 House race?
     kalshi_ticker: HOUSEMN2-26-R
     polymarket_token_id: '11097105156238262475273771834712888925665173080240395368749303861446470757383'
-    approved: false
+    approved: true
+- race_key: house:MN-05
+  exclude: false
+  note: 'MAP-ALL: Kalshi KXHOUSERACE, rules verified'
+  contracts:
+  - party: D
+    sig_market_id: '338'
+    sig_exchange_id: '1027'
+    sig_title: Will the Democratic Party win the MN-05 House race?
+    kalshi_ticker: KXHOUSERACE-MN05-26-D
+    polymarket_token_id: '20781040640207419108275494852260640607740976077797936236220411009198028862221'
+    approved: true
+  - party: R
+    sig_market_id: '339'
+    sig_exchange_id: '1028'
+    sig_title: Will the Republican Party win the MN-05 House race?
+    kalshi_ticker: KXHOUSERACE-MN05-26-R
+    polymarket_token_id: null
+    approved: true
 - race_key: house:MT-01
   exclude: false
   note: ''
@@ -1413,14 +1629,14 @@ races:
     sig_title: Will the Democratic Party win the MT-01 House race?
     kalshi_ticker: HOUSEMT1-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '224'
     sig_exchange_id: '913'
     sig_title: Will the Republican Party win the MT-01 House race?
     kalshi_ticker: HOUSEMT1-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
 - race_key: house:NE-02
   exclude: false
   note: ''
@@ -1431,14 +1647,14 @@ races:
     sig_title: Will the Democratic Party win the NE-02 House race?
     kalshi_ticker: HOUSENE2-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '226'
     sig_exchange_id: '915'
     sig_title: Will the Republican Party win the NE-02 House race?
     kalshi_ticker: HOUSENE2-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
 - race_key: house:NH-01
   exclude: false
   note: ''
@@ -1449,14 +1665,14 @@ races:
     sig_title: Will the Democratic Party win the NH-01 House race?
     kalshi_ticker: HOUSENH1-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '376'
     sig_exchange_id: '1065'
     sig_title: Will the Republican Party win the NH-01 House race?
     kalshi_ticker: HOUSENH1-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
 - race_key: house:NJ-07
   exclude: false
   note: ''
@@ -1467,14 +1683,32 @@ races:
     sig_title: Will the Democratic Party win the NJ-07 House race?
     kalshi_ticker: HOUSENJ7-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '228'
     sig_exchange_id: '917'
     sig_title: Will the Republican Party win the NJ-07 House race?
     kalshi_ticker: HOUSENJ7-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
+- race_key: house:NY-13
+  exclude: false
+  note: 'MAP-ALL: Kalshi KXHOUSERACE, rules verified'
+  contracts:
+  - party: D
+    sig_market_id: '229'
+    sig_exchange_id: '918'
+    sig_title: Will the Democratic Party win the NY-13 House race?
+    kalshi_ticker: KXHOUSERACE-NY13-26-D
+    polymarket_token_id: '58170582826434624369183137827470621458750832571934268895241793899476487858088'
+    approved: true
+  - party: R
+    sig_market_id: '230'
+    sig_exchange_id: '919'
+    sig_title: Will the Republican Party win the NY-13 House race?
+    kalshi_ticker: KXHOUSERACE-NY13-26-R
+    polymarket_token_id: null
+    approved: true
 - race_key: house:NY-17
   exclude: false
   note: ''
@@ -1485,14 +1719,14 @@ races:
     sig_title: Will the Democratic Party win the NY-17 House race?
     kalshi_ticker: HOUSENY17-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '232'
     sig_exchange_id: '921'
     sig_title: Will the Republican Party win the NY-17 House race?
     kalshi_ticker: HOUSENY17-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
 - race_key: house:PA-01
   exclude: false
   note: ''
@@ -1503,14 +1737,14 @@ races:
     sig_title: Will the Democratic Party win the PA-01 House race?
     kalshi_ticker: HOUSEPA1-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '234'
     sig_exchange_id: '923'
     sig_title: Will the Republican Party win the PA-01 House race?
     kalshi_ticker: HOUSEPA1-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
 - race_key: house:PA-07
   exclude: false
   note: ''
@@ -1521,14 +1755,14 @@ races:
     sig_title: Will the Democratic Party win the PA-07 House race?
     kalshi_ticker: HOUSEPA7-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '236'
     sig_exchange_id: '925'
     sig_title: Will the Republican Party win the PA-07 House race?
     kalshi_ticker: HOUSEPA7-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
 - race_key: house:PA-08
   exclude: false
   note: ''
@@ -1539,14 +1773,14 @@ races:
     sig_title: Will the Democratic Party win the PA-08 House race?
     kalshi_ticker: HOUSEPA8-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '238'
     sig_exchange_id: '927'
     sig_title: Will the Republican Party win the PA-08 House race?
     kalshi_ticker: HOUSEPA8-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
 - race_key: house:PA-10
   exclude: false
   note: ''
@@ -1557,14 +1791,50 @@ races:
     sig_title: Will the Democratic Party win the PA-10 House race?
     kalshi_ticker: HOUSEPA10-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '240'
     sig_exchange_id: '929'
     sig_title: Will the Republican Party win the PA-10 House race?
     kalshi_ticker: HOUSEPA10-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
+- race_key: house:SC-01
+  exclude: false
+  note: 'MAP-ALL: Kalshi KXHOUSERACE, rules verified'
+  contracts:
+  - party: D
+    sig_market_id: '241'
+    sig_exchange_id: '930'
+    sig_title: Will the Democratic Party win the SC-01 House race?
+    kalshi_ticker: KXHOUSERACE-SC01-26-D
+    polymarket_token_id: '85565449085981219626125045806096417728054675797071084365546294832037886206869'
+    approved: true
+  - party: R
+    sig_market_id: '242'
+    sig_exchange_id: '931'
+    sig_title: Will the Republican Party win the SC-01 House race?
+    kalshi_ticker: KXHOUSERACE-SC01-26-R
+    polymarket_token_id: '9923678446010680223075564519648906123468834936314053947915034634742964733395'
+    approved: true
+- race_key: house:TN-05
+  exclude: false
+  note: 'MAP-ALL: Kalshi KXHOUSERACE, rules verified'
+  contracts:
+  - party: D
+    sig_market_id: '340'
+    sig_exchange_id: '1029'
+    sig_title: Will the Democratic Party win the TN-05 House race?
+    kalshi_ticker: KXHOUSERACE-TN05-26-D
+    polymarket_token_id: '21093900327085732156538279868500731871043932639237011371281062480462349465304'
+    approved: true
+  - party: R
+    sig_market_id: '341'
+    sig_exchange_id: '1030'
+    sig_title: Will the Republican Party win the TN-05 House race?
+    kalshi_ticker: KXHOUSERACE-TN05-26-R
+    polymarket_token_id: '70611387410738959528084339484893630361746409691183277603893453160832832415748'
+    approved: true
 - race_key: house:TX-15
   exclude: false
   note: ''
@@ -1575,14 +1845,32 @@ races:
     sig_title: Will the Democratic Party win the TX-15 House race?
     kalshi_ticker: HOUSETX15-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '244'
     sig_exchange_id: '933'
     sig_title: Will the Republican Party win the TX-15 House race?
     kalshi_ticker: HOUSETX15-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
+- race_key: house:TX-23
+  exclude: false
+  note: 'MAP-ALL: Kalshi KXHOUSERACE, rules verified'
+  contracts:
+  - party: D
+    sig_market_id: '245'
+    sig_exchange_id: '934'
+    sig_title: Will the Democratic Party win the TX-23 House race?
+    kalshi_ticker: KXHOUSERACE-TX23-26-D
+    polymarket_token_id: '61226688777298855109760287075145560866932162430262148603800321887784593630496'
+    approved: true
+  - party: R
+    sig_market_id: '246'
+    sig_exchange_id: '935'
+    sig_title: Will the Republican Party win the TX-23 House race?
+    kalshi_ticker: KXHOUSERACE-TX23-26-R
+    polymarket_token_id: '55410211684588113064622608223269234944992958173935625527924582089831994856267'
+    approved: true
 - race_key: house:TX-28
   exclude: false
   note: ''
@@ -1593,14 +1881,14 @@ races:
     sig_title: Will the Democratic Party win the TX-28 House race?
     kalshi_ticker: HOUSETX28-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '248'
     sig_exchange_id: '937'
     sig_title: Will the Republican Party win the TX-28 House race?
     kalshi_ticker: HOUSETX28-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
 - race_key: house:VA-01
   exclude: false
   note: ''
@@ -1611,14 +1899,14 @@ races:
     sig_title: Will the Democratic Party win the VA-01 House race?
     kalshi_ticker: HOUSEVA1-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '249'
     sig_exchange_id: '938'
     sig_title: Will the Republican Party win the VA-01 House race?
     kalshi_ticker: HOUSEVA1-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
 - race_key: house:VA-02
   exclude: false
   note: ''
@@ -1629,14 +1917,32 @@ races:
     sig_title: Will the Democratic Party win the VA-02 House race?
     kalshi_ticker: HOUSEVA2-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '250'
     sig_exchange_id: '939'
     sig_title: Will the Republican Party win the VA-02 House race?
     kalshi_ticker: HOUSEVA2-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
+- race_key: house:VA-05
+  exclude: false
+  note: 'MAP-ALL: Kalshi KXHOUSERACE, rules verified'
+  contracts:
+  - party: D
+    sig_market_id: '344'
+    sig_exchange_id: '1033'
+    sig_title: Will the Democratic Party win the VA-05 House race?
+    kalshi_ticker: KXHOUSERACE-VA05-26-D
+    polymarket_token_id: '30424541292784877350495001354252975055952568624850695789713995653053526735723'
+    approved: true
+  - party: R
+    sig_market_id: '345'
+    sig_exchange_id: '1034'
+    sig_title: Will the Republican Party win the VA-05 House race?
+    kalshi_ticker: KXHOUSERACE-VA05-26-R
+    polymarket_token_id: '83253007588985953900662535978265304048199216427463571583210985764316132662845'
+    approved: true
 - race_key: house:VA-07
   exclude: false
   note: ''
@@ -1647,14 +1953,14 @@ races:
     sig_title: Will the Democratic Party win the VA-07 House race?
     kalshi_ticker: HOUSEVA7-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '346'
     sig_exchange_id: '1035'
     sig_title: Will the Republican Party win the VA-07 House race?
     kalshi_ticker: HOUSEVA7-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
 - race_key: house:WA-03
   exclude: false
   note: ''
@@ -1665,14 +1971,14 @@ races:
     sig_title: Will the Democratic Party win the WA-03 House race?
     kalshi_ticker: HOUSEWA3-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '348'
     sig_exchange_id: '1037'
     sig_title: Will the Republican Party win the WA-03 House race?
     kalshi_ticker: HOUSEWA3-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
 - race_key: house:WI-01
   exclude: false
   note: ''
@@ -1683,14 +1989,14 @@ races:
     sig_title: Will the Democratic Party win the WI-01 House race?
     kalshi_ticker: HOUSEWI1-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '350'
     sig_exchange_id: '1039'
     sig_title: Will the Republican Party win the WI-01 House race?
     kalshi_ticker: HOUSEWI1-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
 - race_key: house:WI-03
   exclude: false
   note: ''
@@ -1701,11 +2007,11 @@ races:
     sig_title: Will the Democratic Party win the WI-03 House race?
     kalshi_ticker: HOUSEWI3-26-D
     polymarket_token_id: null
-    approved: false
+    approved: true
   - party: R
     sig_market_id: '352'
     sig_exchange_id: '1041'
     sig_title: Will the Republican Party win the WI-03 House race?
     kalshi_ticker: HOUSEWI3-26-R
     polymarket_token_id: null
-    approved: false
+    approved: true
