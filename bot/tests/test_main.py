@@ -128,7 +128,7 @@ def test_depth_caps_the_size(tmp_path):
 
 def test_complement_checks_both_legs_before_sending_either(tmp_path):
     # per_race 5 x 0.10 = 0.50: each leg alone fits (0.40, 0.50), both together do not.
-    rig = make_loop(tmp_path, races=1, live=True, limits=make_limits(mode="live", per_race=5))
+    rig = make_loop(tmp_path, races=1, live=True, limits=make_limits(mode="live", per_race=5, start_balance=100000))
     d, r = list(rig.bot.contracts)
     rig.sig.quotes[d] = (D("0.35"), D("0.40"))
     rig.sig.quotes[r] = (D("0.45"), D("0.50"))
@@ -233,6 +233,21 @@ def test_live_startup_cancels_all(tmp_path):
     run(rig.bot.startup())
     assert [s.path for s in rig.sig.writes()] == ["/orders/cancel-all"]
     assert rig.events("start")
+
+
+def test_live_startup_requires_loss_stop_baseline_before_any_sig_call(tmp_path):
+    rig = make_loop(tmp_path, live=True, limits=make_limits(mode="live", start_balance=None))
+    assert run(rig.bot.run()) == 2
+    assert rig.sig.seen == []
+    assert rig.orders() == []
+    assert "live mode requires start_balance" in rig.events("stop")[0]["message"]
+
+
+def test_dry_run_allows_unset_loss_stop_baseline(tmp_path):
+    rig = make_loop(tmp_path, live=False, limits=make_limits(mode="live", start_balance=None))
+    run(rig.bot.startup())
+    assert rig.sig.writes() == []
+    assert "loss stop is disabled" in rig.events("start")[0]["message"]
 
 
 def test_empty_map_refuses_to_start(tmp_path):
