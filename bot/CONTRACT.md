@@ -66,4 +66,7 @@ snapshots (append every 60 s)
 events (append)
   id PK AUTOINCREMENT, ts_utc, level ('info'|'warn'|'error'), kind, message
   kinds: start, stop, pause, resume, order_rejected, order_unknown, rate_limited,
-         ref_stale, mismatch, reconcile, market_closed, probe, ladder, exit
+         ref_stale, mismatch, reconcile, market_closed, probe, ladder, exit, reinvest
+  (BOT-ROTATE: every exit placed, and every buy placed while risk.yaml `rotation` is
+  enabled, is an 'exit' or 'reinvest' event with its reason; in dry run at most once
+  per exchange per minute)
