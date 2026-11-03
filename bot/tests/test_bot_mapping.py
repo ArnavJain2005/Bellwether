@@ -63,8 +63,10 @@ def test_load_map_reads_yaml(tmp_path: Path):
 
 def test_committed_map_is_valid_and_valid_if_fully_approved():
     approved = load_map(MAP_PATH)  # raises on any validation failure
-    assert all(not c.race_key.startswith("house:") for c in approved)
     data = yaml.safe_load(MAP_PATH.read_text(encoding="utf-8"))
+    excluded = {r["race_key"] for r in data["races"] if r["exclude"]}
+    assert approved
+    assert all(c.race_key not in excluded for c in approved)
     for race in data["races"]:
         race["exclude"] = False
         for c in race["contracts"]:
