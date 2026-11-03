@@ -1,11 +1,11 @@
 # Owner: Arnav only. Agents never edit this file.
 mode: dry_run                 # dry_run | live (live also needs --live on the command line)
 tournament_id: bda92870-621e-47b0-bc3c-3602c5c26f55
-scale: 0.10                   # multiplies every cap; 0.10 first live hours, then 0.5, then 1.0
+scale: 1.0                    # multiplies every cap (BOT-ROTATE: full size)
 caps:                         # SUSQies of cost (price x shares)
   per_order: 500
   per_race: 2000
-  total_committed: 10000      # filled + resting + unknown orders, all races
+  total_committed: 100000     # BOT-ROTATE: the full starting balance (initialBalance 100000)
   min_cash_reserve: 90000
   loss_stop: 2000             # no new orders if balance < start_balance - loss_stop
 start_balance: null           # fill from the SIG app before going live
@@ -28,3 +28,11 @@ strategies:
     max_ref_spread: 0.04
     max_ref_age_s: 30
     max_venue_disagreement: 0.03
+target_deployment: 1.0        # BOT-ROTATE: committed <= this x (balance + committed)
+max_race_fraction: 0.15       # BOT-ROTATE: one race's committed <= this x (balance + committed)
+rotation:                     # BOT-ROTATE; exits also need config/exits.yaml enabled: true
+  enabled: true
+  take_profit_pct: 0.08       # exit when (best bid - avg entry) / avg entry >= this
+  edge_gone: true             # exit when best bid >= fair - reference edge (never below entry)
+  reinvest_min_free_fraction: 0.02  # buy only while balance - min_cash_reserve > this x balance
+  reentry_cooldown_minutes: 10      # no buy on an exchange this long after an exit there
