@@ -5,10 +5,12 @@
 | Path | Writer | Readers | Purpose |
 | --- | --- | --- | --- |
 | config/risk.yaml | Arnav | bot | limits, mode, strategy settings |
+| config/ladder.yaml | Arnav | bot | optional limits ladder (steps L1..Ln of scale + caps); absent = risk.yaml only |
 | bot/map.yaml | bot/make_map.py drafts, Arnav approves | bot | approved SIG <-> Kalshi/Polymarket contracts |
 | bot/state/bellwether.db | bot | dashboard (read-only) | SQLite, WAL mode, all bot state |
 | bot/state/STOP | Arnav or dashboard | bot | exists -> cancel all orders, stop, exit |
 | bot/state/PAUSED | bot | Arnav, dashboard | exists -> no new orders; Arnav deletes it to resume |
+| bot/state/LADDER_HOLD | Arnav | bot | exists -> the ladder does not climb (orders unaffected) |
 
 bot/state/ is git-ignored.
 
@@ -25,7 +27,13 @@ bot/state/ is git-ignored.
 heartbeat (exactly one row, id = 1, rewritten every loop)
   id, ts_utc, mode ('dry_run'|'live'), version, loop_ms, reads_last_min, writes_last_min,
   paused (0/1), pause_reason, stop_seen (0/1), balance, start_balance, committed, scale,
-  cap_total, cap_per_race, min_cash_reserve, edge_now, election_night (0/1)
+  cap_total, cap_per_race, min_cash_reserve, edge_now, election_night (0/1),
+  ladder_step ('L0'..'Ln'; NULL when there is no config/ladder.yaml)
+  scale, cap_total, cap_per_race and min_cash_reserve are the active ladder step's.
+
+ladder_state (exactly one row, id = 1; only with config/ladder.yaml; rewritten on every
+step change)
+  id, step ('L0'..'Ln'), since_utc, ladder_sha256 (of the ladder.yaml the step was set under)
 
 orders (one row per idempotency key, inserted and committed BEFORE sending)
   key PK, created_utc, updated_utc, race_key, sig_market_id, sig_exchange_id,
@@ -53,4 +61,4 @@ snapshots (append every 60 s)
 events (append)
   id PK AUTOINCREMENT, ts_utc, level ('info'|'warn'|'error'), kind, message
   kinds: start, stop, pause, resume, order_rejected, order_unknown, rate_limited,
-         ref_stale, mismatch, reconcile, market_closed, probe
+         ref_stale, mismatch, reconcile, market_closed, probe, ladder

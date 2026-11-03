@@ -85,3 +85,79 @@ def test_denied_intent_makes_zero_requests(tmp_path, setup):
     assert rig.rows() == []
     verdicts = [r["verdict"] for r in rig.conn.execute("SELECT verdict FROM decisions")]
     assert verdicts == ["blocked"]
+
+
+# --- the ladder: only the active step's Limits ever reach the order endpoint -----------
+
+
+def _assignments(tree: ast.AST, attr: str):
+    """(enclosing function name, node) for every `<x>.<attr> = ...` in the tree."""
+    for func in ast.walk(tree):
+        if not isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        for node in ast.walk(func):
+            targets = []
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, ast.AnnAssign | ast.AugAssign):
+                targets = [node.target]
+            for target in targets:
+                if isinstance(target, ast.Attribute) and target.attr == attr:
+                    yield func.name, node
+
+
+def test_limits_change_only_through_apply_limits_and_set_limits():
+    places = set()
+    for path in _bot_sources():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for attr in ("_limits", "limits"):
+            for func, _ in _assignments(tree, attr):
+                places.add((path.name, attr, func))
+        if path.name not in ("main.py", "orders.py") and list(_references(tree, "set_limits")):
+            places.add((path.name, "set_limits", "?"))
+    assert places == {
+        ("orders.py", "_limits", "__init__"),
+        ("orders.py", "_limits", "set_limits"),
+        ("main.py", "limits", "__init__"),
+        ("main.py", "limits", "apply_limits"),
+        ("ladder.py", "limits", "__init__"),
+        ("ladder.py", "limits", "_set"),
+    }
+
+
+def test_every_order_is_checked_against_the_active_step(tmp_path, monkeypatch):
+    from bot import risk
+    from bot.tests.test_ladder import EDGE, ladder_loop, loops, run
+
+    rig = ladder_loop(tmp_path)
+    checked = []
+    real_check = risk.check
+
+    def spy(intent, state, **kwargs):
+        bot = rig.bot
+        checked.append((state.limits, bot.limits, bot.path.limits, bot.ladder.limits))
+        return real_check(intent, state, **kwargs)
+
+    monkeypatch.setattr(risk, "check", spy)
+    posted_steps = []
+    real_post = rig.bot.writer.post_order
+
+    async def post(body):
+        assert checked and checked[-1][0] is rig.bot.ladder.limits
+        posted_steps.append(rig.bot.ladder.step)
+        return await real_post(body)
+
+    rig.bot.writer.post_order = post
+
+    async def go():
+        await rig.bot.startup()
+        ids = list(rig.bot.contracts)
+        rig.sig.quotes[ids[0]] = EDGE
+        await loops(rig, 6)  # L0, orders under L0
+        rig.sig.quotes.pop(ids[0])
+        rig.sig.quotes[ids[2]] = EDGE
+        await loops(rig, 3)  # L1, L2, L3
+
+    run(go())
+    assert checked and all(s is b is p is a for s, b, p, a in checked)
+    assert posted_steps[0] == "L0" and "L0" != posted_steps[-1]

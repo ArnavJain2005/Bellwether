@@ -223,6 +223,31 @@ PAUSED means no new orders; cancels still work and the heartbeat keeps running.
 A `reconcile` pause in live mode returns while its cause remains, for example an open
 order you placed by hand in the SIG app. Cancel or let it finish first.
 
+## 13a. Update the server and the limits ladder (BOT-EW-4)
+
+Update to `origin/main` without losing the server's edits to `config/risk.yaml`,
+`bot/map.yaml` exclusions and `config/ladder.yaml` (a live stop cancels every open order):
+
+```bash
+sudo systemctl stop bellwether-bot
+cd /opt/bellwether && sudo -u bellwether bash deploy/update_server.sh
+sudo systemctl start bellwether-bot
+```
+
+The ladder (`config/ladder.yaml`) raises scale and caps one step at a time, only when
+the step's time has passed and every health gate passes. No restart is needed for:
+
+```bash
+sudo -u bellwether touch /opt/bellwether/bot/state/LADDER_HOLD   # freeze (no climbing)
+sudo -u bellwether rm /opt/bellwether/bot/state/LADDER_HOLD      # unfreeze
+sudo -u bellwether /opt/bellwether/.venv/bin/python -m bot.ladder status   # every gate
+```
+
+To step down, lower `max_step` in `config/ladder.yaml` (e.g. `max_step: L1`, or `L0` for
+risk.yaml's limits): the bot drops to it at its next loop. After a restart the bot
+resumes its step only if ladder.yaml is byte-identical to the file that step was set
+under; otherwise it starts again at L0.
+
 ## 14. Laptop fallback
 
 If the server is unavailable, run the bot from the repository on a laptop that stays

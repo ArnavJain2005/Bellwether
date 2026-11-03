@@ -97,6 +97,13 @@ class Limits(_Frozen):
         value = getattr(self.caps, name)
         return value * self.scale if name in SCALED_CAPS else value
 
+    def with_step(self, scale: Decimal, caps: Caps) -> Limits:
+        """A new frozen Limits with only scale and caps replaced (bot/ladder.py steps).
+
+        The step's scale and caps are validated by bot/ladder.py before this is called.
+        """
+        return self.model_copy(update={"scale": scale, "caps": caps})
+
 
 class _DecimalLoader(yaml.SafeLoader):
     """SafeLoader that reads floats as exact Decimals from their source text."""
