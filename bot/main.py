@@ -195,6 +195,10 @@ class Bot:
     # --- startup --------------------------------------------------------------------
 
     async def startup(self) -> None:
+        if self.live and self.limits.start_balance is None:
+            raise StartupError(
+                "live mode requires start_balance in config/risk.yaml for the loss stop"
+            )
         if not self.contracts:
             raise StartupError("bot/map.yaml has no approved contracts: refusing to start")
         await self.rest.verify_tournament()
