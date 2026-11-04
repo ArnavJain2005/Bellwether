@@ -75,17 +75,17 @@ flowchart TB
 
   Kalshi -->|Public HTTPS| RefCol
   Poly -->|Public HTTPS| RefCol
-  SIG <-->|Authenticated HTTPS<br/>Exact Decimal Wire| SigClient
-  Writer -->|POST /orders · DELETE /orders| SIG
+  SIG -->|Exact Decimal Wire| SigClient
+  Writer -->|POST and DELETE Orders| SIG
 
-  Loop -->|Atomic Upserts & Snapshots| DB
+  Loop -->|Atomic Upserts and Snapshots| DB
   RiskGate -->|Blocked Verdicts| DB
-  OrderPath -->|1. Commit 'journaled'<br/>2. Update Terminal Status| DB
+  OrderPath -->|Commit journal and update status| DB
   Flags -->|Checked Every Pass| Loop
-  OrderPath -->|On 'unknown' Order| Flags
+  OrderPath -->|On unknown order create PAUSED| Flags
 
   DB -->|SQLite URI mode=ro| DashDB
-  DashUI -.->|2-Click Confirmed<br/>Atomic 'x' Create STOP| Flags
+  DashUI -->|Confirmed STOP Creation| Flags
 ```
 
 ---
@@ -97,73 +97,70 @@ Every iteration of `Bot.iteration()` executes a deterministic sequence designed 
 ```mermaid
 sequenceDiagram
   autonumber
-  participant FS as Control Files<br/>(STOP / PAUSED / LADDER_HOLD)
-  participant Loop as Bot Loop<br/>(bot/main.py)
-  participant SIG as SIG REST API<br/>(engine/sig_client)
-  participant Refs as Kalshi & Polymarket<br/>(bot/refs.py)
-  participant Strat as Strategy & Rotation<br/>(bot/strategy.py)
-  participant Risk as Risk Gate<br/>(bot/risk.py)
-  participant Journal as OrderPath & SQLite<br/>(bot/orders.py · db.py)
+  participant FS as Control Files (STOP / PAUSED / LADDER_HOLD)
+  participant Bot as Bot Loop (bot/main.py)
+  participant SIG as SIG REST API (engine/sig_client)
+  participant Refs as Kalshi and Polymarket (bot/refs.py)
+  participant Strat as Strategy and Rotation (bot/strategy.py)
+  participant Risk as Risk Gate (bot/risk.py)
+  participant Journal as OrderPath and SQLite (bot/orders.py)
 
-  Loop->>FS: Check bot/state/STOP
+  Bot->>FS: Check bot/state/STOP
   alt STOP file exists or signal received
-    Loop->>SIG: POST /orders/cancel-all (if live)
-    Loop->>Journal: Record 'stop' event & final heartbeat
-    Loop-->>Loop: Exit 0 (systemd does not restart)
+    Bot->>SIG: POST /orders/cancel-all (if live)
+    Bot->>Journal: Record stop event and final heartbeat
+    Bot-->>Bot: Exit 0 (systemd does not restart)
   end
 
-  Loop->>Journal: Evaluate Limits Ladder (L0 -> L1 -> L2 -> L3)
+  Bot->>Journal: Evaluate Limits Ladder (L0 to L3)
   alt Every 60s (Account & Snapshot Cycle)
-    Loop->>SIG: GET /tournaments/{slug} (balance)
-    Loop->>SIG: GET /tournaments/{slug}/portfolio/positions
-    Loop->>SIG: Walk GET /orders?status=open
-    Loop->>Journal: Refresh resting order statuses & reconcile positions
-    Loop->>Journal: Cancel stale orders (> order_expiry_seconds)
-    Loop->>Journal: Insert 60s snapshot & per-race exposure
+    Bot->>SIG: GET /tournaments/{slug} (balance)
+    Bot->>SIG: GET /tournaments/{slug}/portfolio/positions
+    Bot->>SIG: Walk GET /orders?status=open
+    Bot->>Journal: Refresh resting order statuses & reconcile positions
+    Bot->>Journal: Cancel stale orders (> order_expiry_seconds)
+    Bot->>Journal: Insert 60s snapshot & per-race exposure
   end
 
-  par Parallel Quote Collection
-    Loop->>Refs: Fetch Kalshi & Polymarket order books
-  and Chunked SIG Price Reads
-    Loop->>SIG: GET /exchanges/prices (chunks of 50)
-  end
-  Loop->>Journal: Upsert quotes_latest for all 202 contracts
+  Bot->>Refs: Fetch Kalshi and Polymarket order books (concurrent)
+  Bot->>SIG: GET /exchanges/prices (chunks of 50)
+  Bot->>Journal: Upsert quotes_latest for all 202 contracts
 
   rect rgb(22, 36, 32)
-    Note over Loop,Journal: Phase 1: Reduce-Only Exits (Before Buys)
+    Note over Bot,Journal: Phase 1: Reduce-Only Exits (Before Buys)
     alt config/exits.yaml enabled == true and not PAUSED/LADDER_HOLD
-      Loop->>Strat: evaluate_exit() per held contract (Val Reversal / Take-Profit / Edge-Gone)
+      Bot->>Strat: evaluate_exit() per held contract (Val Reversal / Take-Profit / Edge-Gone)
       loop Each Exit Candidate
-        Loop->>SIG: Fresh positions & order book read
-        Loop->>Risk: risk.check_exit() (held qty, live exits, grid, rate budget)
+        Bot->>SIG: Fresh positions & order book read
+        Bot->>Risk: risk.check_exit() (held qty, live exits, grid, rate budget)
         alt Approved
-          Loop->>Journal: Commit 'journaled' row (action='buy', exit_of_side='yes'|'no')
-          Loop->>SIG: POST /orders (complement buy that nets against holding)
-          Loop->>SIG: Immediately cancel any unfilled remainder
-          Loop->>Journal: Update row ('filled'|'partial'|'cancelled'|'unknown') & log 'exit' event
+          Bot->>Journal: Commit journaled row (action=buy, complement exit)
+          Bot->>SIG: POST /orders (complement buy that nets against holding)
+          Bot->>SIG: Immediately cancel any unfilled remainder
+          Bot->>Journal: Update row (filled, partial, cancelled, unknown) and log exit event
         end
       end
     end
   end
 
   rect rgb(24, 30, 44)
-    Note over Loop,Journal: Phase 2: Ranked Entries & Reinvestment
-    Loop->>Strat: evaluate_complement() & evaluate_reference() across all races
+    Note over Bot,Journal: Phase 2: Ranked Entries & Reinvestment
+    Bot->>Strat: evaluate_complement() & evaluate_reference() across all races
     Strat->>Strat: rank_buys() — Sort candidates by highest edge first
     loop Each Ranked Buy Candidate (while free cash > 2% of balance)
-      Loop->>SIG: Read exchange order book depth (if read budget allows)
-      Loop->>Risk: risk.check() (12-stage gate: caps, 15% race fraction, reserve, cooldown)
+      Bot->>SIG: Read exchange order book depth (if read budget allows)
+      Bot->>Risk: risk.check() (12-stage gate: caps, 15% race fraction, reserve, cooldown)
       alt Verdict == ALLOWED
-        Loop->>Journal: Commit 'journaled' row with deterministic idempotency key
-        Loop->>SIG: POST /orders (same-key retry on transient errors)
-        Loop->>Journal: Record final status & 'reinvest' event
+        Bot->>Journal: Commit journaled row with deterministic idempotency key
+        Bot->>SIG: POST /orders (same-key retry on transient errors)
+        Bot->>Journal: Record final status and reinvest event
       else Verdict == DENIED
-        Loop->>Journal: Append 'blocked' decision with exact reason
+        Bot->>Journal: Append 'blocked' decision with exact reason
       end
     end
   end
 
-  Loop->>Journal: Rewrite single-row heartbeat (id=1) with loop_ms, rate counts & caps
+  Bot->>Journal: Rewrite single-row heartbeat (id=1) with loop_ms, rate counts and caps
 ```
 
 ---
@@ -222,9 +219,9 @@ stateDiagram-v2
   L2 --> Hold: bot/state/LADDER_HOLD present
   Hold --> L0: LADDER_HOLD removed (resumes current step)
 
-  L3 --> L2: Operator lowers max_step: L2
-  L2 --> L1: Operator lowers max_step: L1
-  L1 --> L0: Operator lowers max_step: L0
+  L3 --> L2: Operator lowers max_step to L2
+  L2 --> L1: Operator lowers max_step to L1
+  L1 --> L0: Operator lowers max_step to L0
 ```
 
 ### 3.3 Realtime Market-Data Recovery Ledger (`engine/sig_client/recovery.py`)
@@ -236,14 +233,14 @@ stateDiagram-v2
   [*] --> UNINITIALIZED: Market registered
 
   UNINITIALIZED --> BOOTSTRAP_PENDING: Subscription requested
-  BOOTSTRAP_PENDING --> HEALTHY: Initial REST snapshot<br/>establishes baseline revision R
+  BOOTSTRAP_PENDING --> HEALTHY: Initial REST snapshot establishes baseline revision R
 
-  HEALTHY --> HEALTHY: Delta arrives with<br/>revision == R + 1 (R := R + 1)
-  HEALTHY --> GAP_DETECTED: Delta revision > R + 1,<br/>socket disconnect, or parse error
+  HEALTHY --> HEALTHY: Delta arrives with revision == R + 1 (R set to R + 1)
+  HEALTHY --> GAP_DETECTED: Delta revision > R + 1 or socket disconnect
 
-  GAP_DETECTED --> RESYNCING: REST resync initiated<br/>(Trading Fail-Closed / Blocked)
-  RESYNCING --> HEALTHY: Fresh REST snapshot verified<br/>at revision >= gap target
-  RESYNCING --> GAP_DETECTED: Resync read fails or<br/>new gap occurs during resync
+  GAP_DETECTED --> RESYNCING: REST resync initiated (Trading Blocked)
+  RESYNCING --> HEALTHY: Fresh REST snapshot verified at revision >= gap target
+  RESYNCING --> GAP_DETECTED: Resync read fails or new gap occurs during resync
 ```
 
 ---
@@ -256,3 +253,4 @@ stateDiagram-v2
 | **Secret Redaction** | `SUSQ_API_KEY` is read exclusively from environment variables (`/etc/bellwether.env`), wrapped in a secret string type, and scrubbed from exceptions, logs, reprs, and SQLite error columns. | Enforced by [`bot/tests/test_secrets.py`](../bot/tests/test_secrets.py) and pre-commit `gitleaks`. |
 | **Dashboard Read-Only Isolation** | [`dashboard/db.py`](../dashboard/db.py) opens SQLite via `file:.../bellwether.db?mode=ro`. It never imports `bot/` or `engine/`, never reads `.env`, and makes zero network requests. | Enforced by AST & SQLite write-rejection tests in [`dashboard/tests/test_dashboard.py`](../dashboard/tests/test_dashboard.py). |
 | **Single Permitted Control Write** | The only filesystem write in `dashboard/` is `write_stop_file()`, which creates `bot/state/STOP` using exclusive file creation (`mode="x"`) after a two-click operator confirmation. | Verified across 43 unit and `AppTest` integration tests in `dashboard/tests/`. |
+

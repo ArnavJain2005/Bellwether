@@ -72,7 +72,7 @@ flowchart TB
     Exits["Phase 1: Reduce-Only Exits (bot/strategy.py)<br/>Valuation Reversal · Take-Profit (+8%) · Edge-Gone<br/>(Executed as Complement Buys — Never Sells)"]
     Entries["Phase 2: Ranked Entries (bot/strategy.py)<br/>Intra-Race Complement (D+R <= 0.970)<br/>Cross-Venue Reference (Ask <= Fair - Edge)<br/>Sorted Highest-Edge First"]
     Gate["12-Stage Fail-Closed Risk Gate (bot/risk.py)<br/>Caps · 15% Max Race Equity · Cash Reserve · Grid"]
-    Journal["Write-Ahead OrderPath (bot/orders.py)<br/>1. Commit 'journaled' Row to SQLite<br/>2. Send POST /orders (Same-Key Retries)<br/>3. On Ambiguity -> Mark 'unknown' & Write PAUSED"]
+    Journal["Write-Ahead OrderPath (bot/orders.py)<br/>1. Commit journaled Row to SQLite<br/>2. Send POST /orders (Same-Key Retries)<br/>3. On Ambiguity: Mark unknown and Write PAUSED"]
 
     Collect --> Exits --> Entries --> Gate
     Gate -->|Allowed| Journal
@@ -88,18 +88,18 @@ flowchart TB
   end
 
   Refs -->|Public HTTPS| Collect
-  SIG <-->|Authenticated HTTPS| Collect
-  Journal -->|POST /orders · DELETE /orders| SIG
+  SIG -->|Market Data REST and WS| Collect
+  Journal -->|POST and DELETE Orders| SIG
   Map --> Collect
   RiskCFG --> Gate
 
-  Collect -->|Quotes · Snapshots · Heartbeat| DB
+  Collect -->|Quotes and Snapshots| DB
   Gate -->|Blocked Decisions| DB
-  Journal -->|Order Lifecycle & Events| DB
+  Journal -->|Order Lifecycle and Events| DB
   Files -->|Checked Every Loop| Collect
 
-  DB -->|Read-Only (mode=ro)| UI
-  UI -.->|2-Click Confirmed<br/>Atomic STOP File Only| Files
+  DB -->|Read-Only mode=ro| UI
+  UI -->|Confirmed STOP File Only| Files
 ```
 
 For the full 10-second loop sequence diagram and state machines (Order Journal, Limits Ladder, and WebSocket Recovery Ledger), see **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)**.
@@ -111,20 +111,20 @@ For the full 10-second loop sequence diagram and state machines (Order Journal, 
 ```mermaid
 flowchart LR
   subgraph S1["1. Complement Arbitrage"]
-    C1["Both D & R Approved in Race<br/>ask_D + ask_R <= 0.970<br/>or bid_D + bid_R >= 1.030"] --> C2["Buy Equal Qty on Both Legs<br/>Locks in >= 3.0c / share"]
+    C1["Both D and R Approved in Race<br/>ask_D + ask_R <= 0.970<br/>or bid_D + bid_R >= 1.030"] --> C2["Buy Equal Qty on Both Legs<br/>Locks in >= 3.0c / share"]
   end
 
   subgraph S2["2. Reference Pricing"]
-    R1["Kalshi & Polymarket Midpoints<br/>Age <= 30s · Spread <= 0.04<br/>Venue Diff <= 0.03"] --> R2["Buy YES if Ask <= Fair - Edge<br/>Buy NO if Bid >= Fair + Edge<br/>(Edge: 4c Normal -> 6c Election Night)"]
+    R1["Kalshi & Polymarket Midpoints<br/>Age <= 30s · Spread <= 0.04<br/>Venue Diff <= 0.03"] --> R2["Buy YES if Ask <= Fair - Edge<br/>Buy NO if Bid >= Fair + Edge<br/>(Edge: 4c Normal to 6c Election Night)"]
   end
 
   subgraph S3["3. Capital Rotation (BOT-ROTATE)"]
     E1["Held Position (FIFO Avg Entry e_S)<br/>1. Val Reversal: bid >= fair + exit_edge<br/>2. Take-Profit: (bid - e_S) / e_S >= 8%<br/>3. Edge-Gone: bid >= fair - edge (>= e_S)"] --> E2["Complement Buy on Opposite Side<br/>Nets Position Down Safely<br/>+ 10m Re-Entry Cooldown"]
   end
 
-  C2 --> Rank["rank_buys()<br/>Highest Edge First<br/>-> 12-Stage risk.check()"]
+  C2 --> Rank["rank_buys()<br/>Highest Edge First<br/>Feeds 12-Stage risk.check()"]
   R2 --> Rank
-  E2 -.->|Releases Committed Capital| Rank
+  E2 -->|Releases Committed Capital| Rank
 ```
 
 For the complete mathematical specification and the 12-stage `risk.check` flowchart, see **[`docs/STRATEGIES_AND_RISK.md`](docs/STRATEGIES_AND_RISK.md)**.
