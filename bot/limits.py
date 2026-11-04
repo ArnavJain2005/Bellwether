@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from engine.config import MIDTERM_ELECTIONS
 
@@ -64,6 +64,16 @@ class ReferenceSettings(_Frozen):
     max_ref_spread: Decimal = Field(gt=0, lt=1)
     max_ref_age_s: int = Field(gt=0, le=3600)
     max_venue_disagreement: Decimal = Field(gt=0, lt=1)
+    # Optional high-confidence election-night gate (BOT-DEPLOY-15K).
+    # Absent/None preserves edge_election_night (0.06) across all contracts.
+    high_confidence_edge_election_night: Decimal | None = Field(default=None, gt=0, lt=1)
+    high_confidence_max_ref_spread: Decimal = Field(default=Decimal("0.02"), gt=0, lt=1)
+    high_confidence_max_ref_age_s: int = Field(default=15, gt=0, le=3600)
+    high_confidence_max_venue_disagreement: Decimal = Field(
+        default=Decimal("0.015"), gt=0, lt=1
+    )
+    high_confidence_min_prob: Decimal = Field(default=Decimal("0.05"), ge=0, lt=Decimal("0.5"))
+    high_confidence_max_prob: Decimal = Field(default=Decimal("0.95"), gt=Decimal("0.5"), le=1)
 
     @field_validator("election_night_from_utc")
     @classmethod
@@ -71,6 +81,38 @@ class ReferenceSettings(_Frozen):
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("election_night_from_utc must carry a UTC offset (end in Z)")
         return value
+
+    @model_validator(mode="after")
+    def _high_confidence_bounds(self) -> ReferenceSettings:
+        hc_edge = self.high_confidence_edge_election_night
+        if hc_edge is None:
+            return self
+        if hc_edge < self.edge:
+            raise ValueError(
+                f"high_confidence_edge_election_night {hc_edge} < daytime edge {self.edge}"
+            )
+        if hc_edge > self.edge_election_night:
+            raise ValueError(
+                f"high_confidence_edge_election_night {hc_edge} > "
+                f"edge_election_night {self.edge_election_night}"
+            )
+        if self.high_confidence_max_ref_spread > self.max_ref_spread:
+            raise ValueError(
+                f"high_confidence_max_ref_spread {self.high_confidence_max_ref_spread} > "
+                f"max_ref_spread {self.max_ref_spread}"
+            )
+        if self.high_confidence_max_ref_age_s > self.max_ref_age_s:
+            raise ValueError(
+                f"high_confidence_max_ref_age_s {self.high_confidence_max_ref_age_s} > "
+                f"max_ref_age_s {self.max_ref_age_s}"
+            )
+        if self.high_confidence_max_venue_disagreement > self.max_venue_disagreement:
+            raise ValueError(
+                "high_confidence_max_venue_disagreement "
+                f"{self.high_confidence_max_venue_disagreement} > "
+                f"max_venue_disagreement {self.max_venue_disagreement}"
+            )
+        return self
 
 
 class RotationSettings(_Frozen):

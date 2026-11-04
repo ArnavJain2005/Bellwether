@@ -138,10 +138,10 @@ def test_invalid_ladder_is_a_limits_error_and_refuses_to_start(monkeypatch, caps
     ("field", "value"),
     [
         ("scale", "1.5"),
-        ("per_order", 1501),
-        ("per_race", 6001),
-        ("total_committed", 70001),
-        ("min_cash_reserve", 24999),
+        ("per_order", 2001),
+        ("per_race", 15001),
+        ("total_committed", 100001),
+        ("min_cash_reserve", -1),
         ("loss_stop", 15001),
     ],
 )
@@ -158,14 +158,18 @@ def test_hard_ceilings_refuse_to_load(field, value):
 
 def test_values_at_the_ceilings_load():
     raw = raw_ladder()
+    raw["steps"][0]["caps"]["min_cash_reserve"] = 60000
+    raw["steps"][1]["caps"]["min_cash_reserve"] = 30000
     raw["steps"][2]["caps"] = {
-        "per_order": 1500,
-        "per_race": 6000,
-        "total_committed": 70000,
-        "min_cash_reserve": 30000,
+        "per_order": 2000,
+        "per_race": 15000,
+        "total_committed": 100000,
+        "min_cash_reserve": 0,
         "loss_stop": 15000,
     }
-    assert loaded(raw).limits_for("L3").effective_cap("total_committed") == 70000
+    l3 = loaded(raw).limits_for("L3")
+    assert l3.effective_cap("total_committed") == 100000
+    assert l3.effective_cap("min_cash_reserve") == 0
 
 
 @pytest.mark.parametrize("where", ["top", "step", "caps"])
@@ -495,6 +499,33 @@ def test_lowering_max_step_steps_down_at_the_next_loop(tmp_path):
     downs = ladder_events(rig, "max_step lowered")
     assert downs[0].startswith("ladder L3 -> L1: max_step lowered to L1")
     assert rig.heartbeat()["cap_total"] == "1000.00"
+
+
+def test_editing_active_step_caps_updates_limits_at_next_loop(tmp_path):
+    rig = ladder_loop(tmp_path)
+    path = tmp_path / "ladder.yaml"
+
+    async def go():
+        await rig.bot.startup()
+        await loops(rig, 9)
+        assert rig.bot.ladder.step == "L3"
+        assert rig.bot.limits.effective_cap("total_committed") == 65000
+        assert rig.bot.limits.effective_cap("min_cash_reserve") == 30000
+        updated = raw_ladder()
+        updated["steps"][0]["caps"]["min_cash_reserve"] = 60000
+        updated["steps"][1]["caps"]["min_cash_reserve"] = 35000
+        updated["steps"][2]["caps"]["total_committed"] = 79611
+        updated["steps"][2]["caps"]["min_cash_reserve"] = 10000
+        write(path, updated)
+        await loops(rig, 1)
+
+    run(go())
+    assert rig.bot.ladder.step == "L3"
+    assert rig.bot.limits.effective_cap("total_committed") == 79611
+    assert rig.bot.limits.effective_cap("min_cash_reserve") == 10000
+    assert rig.heartbeat()["cap_total"] == "79611.0"
+    assert rig.heartbeat()["min_cash_reserve"] == "10000"
+    assert ladder_events(rig, "active step caps updated")
 
 
 def test_invalid_reread_freezes_the_step_until_the_file_is_valid(tmp_path):

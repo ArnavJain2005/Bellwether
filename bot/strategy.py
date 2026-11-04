@@ -9,8 +9,9 @@ to the 0.005 grid in the less aggressive direction: a buy is floored.
   -> buy YES on both at their asks. Best bids summing to >= min_sum_bid -> buy NO on both
   at 1 - bid (NO orders enabled only). Both legs get the same quantity.
 - Reference: fair from refs.fair_value; the edge switches to edge_election_night at
-  election_night_from_utc. Ask <= fair - edge -> buy YES at the ask. Bid >= fair + edge
-  -> buy NO at 1 - bid (NO orders enabled only).
+  election_night_from_utc (or high_confidence_edge_election_night when configured and the
+  contract passes the strict 2-venue high-confidence checks). Ask <= fair - edge -> buy
+  YES at the ask. Bid >= fair + edge -> buy NO at 1 - bid (NO orders enabled only).
 - Size: min(risk max_quantity, book depth at the price); below 1 share -> skip.
 - Exit (BOT-EW-5, reduce-only, config/exits.yaml): for a holding on side S with fair
   f_S (f for YES, 1 - f for NO) and SIG's best bid for S, b_S (YES: bid; NO: 1 - ask),
@@ -39,7 +40,7 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from bot.exits import ExitSettings
 from bot.limits import Limits, RotationSettings
 from bot.mapping import MappedContract
-from bot.refs import RefQuote, RefSettings, RefSnapshot, fair_value
+from bot.refs import ACTIVE, RefQuote, RefSettings, RefSnapshot, fair_value
 
 GRID = Decimal("0.005")
 MIN_PRICE = Decimal("0.005")
@@ -113,6 +114,15 @@ def ref_settings(limits: Limits) -> RefSettings:
     return RefSettings(ref.max_ref_spread, Decimal(ref.max_ref_age_s), ref.max_venue_disagreement)
 
 
+def high_confidence_ref_settings(limits: Limits) -> RefSettings:
+    ref = limits.strategies.reference
+    return RefSettings(
+        ref.high_confidence_max_ref_spread,
+        Decimal(ref.high_confidence_max_ref_age_s),
+        ref.high_confidence_max_venue_disagreement,
+    )
+
+
 def is_election_night(limits: Limits, now: datetime) -> bool:
     return now >= limits.strategies.reference.election_night_from_utc
 
@@ -120,6 +130,74 @@ def is_election_night(limits: Limits, now: datetime) -> bool:
 def current_edge(limits: Limits, now: datetime) -> Decimal:
     ref = limits.strategies.reference
     return ref.edge_election_night if is_election_night(limits, now) else ref.edge
+
+
+def check_high_confidence_reference(
+    kalshi: RefQuote | None,
+    poly: RefQuote | None,
+    fair: Decimal | None,
+    limits: Limits,
+    now: datetime,
+) -> tuple[bool, str]:
+    """Whether a reference contract passes the strict 2-venue high-confidence gate.
+
+    Requires BOTH Kalshi and Polymarket to have active, two-sided, non-crossed quotes
+    within the tighter spread/age/disagreement bounds, and `fair` to lie inside the
+    non-tail band [high_confidence_min_prob, high_confidence_max_prob] so an external
+    price jump toward 0 or 1 is never treated as a verified election call.
+    """
+    if fair is None:
+        return False, "no fair value"
+    if kalshi is None:
+        return False, "no kalshi quote"
+    if poly is None:
+        return False, "single-venue (no polymarket mapped)"
+    if poly.status != ACTIVE or poly.mid is None or poly.spread is None:
+        return False, f"single-venue (polymarket {poly.status})"
+    if kalshi.status != ACTIVE or kalshi.mid is None or kalshi.spread is None:
+        return False, f"kalshi {kalshi.status}"
+    hc = high_confidence_ref_settings(limits)
+    if kalshi.spread > hc.max_ref_spread:
+        return False, f"kalshi spread {kalshi.spread} > {hc.max_ref_spread}"
+    if poly.spread > hc.max_ref_spread:
+        return False, f"polymarket spread {poly.spread} > {hc.max_ref_spread}"
+    k_age = Decimal(str(max((now - kalshi.fetched_utc).total_seconds(), 0)))
+    if k_age > hc.max_ref_age_s:
+        return False, f"kalshi age {k_age:.0f}s > {hc.max_ref_age_s}s"
+    p_age = Decimal(str(max((now - poly.fetched_utc).total_seconds(), 0)))
+    if p_age > hc.max_ref_age_s:
+        return False, f"polymarket age {p_age:.0f}s > {hc.max_ref_age_s}s"
+    diff = abs(kalshi.mid - poly.mid)
+    if diff > hc.max_venue_disagreement:
+        return False, f"venue disagreement {diff} > {hc.max_venue_disagreement}"
+    ref = limits.strategies.reference
+    if fair < ref.high_confidence_min_prob or fair > ref.high_confidence_max_prob:
+        msg = (
+            f"fair {fmt(fair)} outside non-tail band "
+            f"[{ref.high_confidence_min_prob}, {ref.high_confidence_max_prob}]"
+        )
+        return False, msg
+    return True, "high-confidence 2-venue"
+
+
+def reference_edge_for_contract(
+    kalshi: RefQuote | None,
+    poly: RefQuote | None,
+    fair: Decimal | None,
+    limits: Limits,
+    now: datetime,
+) -> tuple[Decimal, bool, str]:
+    """(required_edge, is_high_confidence_override, detail_reason)."""
+    ref = limits.strategies.reference
+    if not is_election_night(limits, now):
+        return ref.edge, False, "daytime"
+    hc_edge = ref.high_confidence_edge_election_night
+    if hc_edge is None:
+        return ref.edge_election_night, False, "election-night standard"
+    ok, detail = check_high_confidence_reference(kalshi, poly, fair, limits, now)
+    if ok:
+        return hc_edge, True, detail
+    return ref.edge_election_night, False, detail
 
 
 def no_orders_enabled(limits: Limits) -> bool:
@@ -186,12 +264,13 @@ def evaluate_reference(
     refs = _ref_text(kalshi, poly)
     if fair is None:
         return skip(f"no fair value: {why} {refs}")
-    edge = current_edge(limits, now)
+    edge, high_conf, _ = reference_edge_for_contract(kalshi, poly, fair, limits, now)
+    tag = " [high-confidence 2-venue]" if high_conf else ""
     if sig.ask is not None and sig.ask <= fair - edge:
         price = buy_price(sig.ask)
         if price is None:
             return skip(f"SIG ask {fmt(sig.ask)} is outside the tradable range", fair=fair)
-        reason = f"SIG ask {fmt(sig.ask)} <= fair {fmt(fair)} - edge {fmt(edge)} {refs}"
+        reason = f"SIG ask {fmt(sig.ask)} <= fair {fmt(fair)} - edge {fmt(edge)} {refs}{tag}"
         return Evaluation(
             legs=(Leg(contract, "yes", price),),
             reason=reason,
@@ -200,7 +279,7 @@ def evaluate_reference(
             **base,  # type: ignore[arg-type]
         )
     if sig.bid is not None and sig.bid >= fair + edge:
-        reason = f"SIG bid {fmt(sig.bid)} >= fair {fmt(fair)} + edge {fmt(edge)} {refs}"
+        reason = f"SIG bid {fmt(sig.bid)} >= fair {fmt(fair)} + edge {fmt(edge)} {refs}{tag}"
         if not no_orders_enabled(limits):
             return skip(f"{reason}, but NO orders are disabled", fair=fair, edge=sig.bid - fair)
         price = buy_price(1 - sig.bid)
@@ -214,7 +293,7 @@ def evaluate_reference(
             **base,  # type: ignore[arg-type]
         )
     return skip(
-        f"no edge: SIG {fmt(sig.bid)}/{fmt(sig.ask)} vs fair {fmt(fair)} +/- {fmt(edge)} {refs}",
+        f"no edge: SIG {fmt(sig.bid)}/{fmt(sig.ask)} vs fair {fmt(fair)} +/- {fmt(edge)} {refs}{tag}",
         fair=fair,
     )
 
