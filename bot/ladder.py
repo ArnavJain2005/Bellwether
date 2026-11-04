@@ -11,12 +11,11 @@ edges, strategies, NO-order settings and the mapping always come from risk.yaml.
 
 No ladder.yaml at startup = no ladder: the bot behaves exactly as before. An invalid one
 refuses to start (LadderError is a LimitsError). While running, ladder.yaml is re-read
-every loop: max_step and LADDER_HOLD take effect without a restart. A re-read that fails
-validation (or a deleted file) keeps the current step, writes one error event and stops
-climbing until the file is valid again. The active step's caps are the ones it was
-entered with; an edit to the current step's caps applies the next time a step is
-entered. The only automatic downward move is to max_step, when the current step is above
-it.
+every loop: max_step, LADDER_HOLD, and valid edits to the active step's scale/caps take
+effect without a restart. A re-read that fails validation (or a deleted file) keeps the
+current step, writes one error event and stops climbing until the file is valid again.
+The only automatic downward step transition is to max_step, when the current step is
+above it.
 
 Gates for climbing from the current step to the next (each failure has a reason):
   1. schedule:  now >= next.not_before_utc, and next is at or below max_step.
@@ -67,10 +66,10 @@ IST = timezone(timedelta(hours=5, minutes=30), "IST")
 
 # Hard ceilings, checked at load: any breach refuses to start.
 MAX_SCALE = Decimal(1)
-MAX_PER_ORDER = Decimal(1500)
-MAX_PER_RACE = Decimal(6000)
-MAX_TOTAL_COMMITTED = Decimal(70000)
-MIN_CASH_RESERVE_FLOOR = Decimal(25000)
+MAX_PER_ORDER = Decimal(2000)
+MAX_PER_RACE = Decimal(15000)
+MAX_TOTAL_COMMITTED = Decimal(100000)
+MIN_CASH_RESERVE_FLOOR = Decimal(0)
 MAX_LOSS_STOP = Decimal(15000)
 MAX_RESERVE_DROP = Decimal(30000)  # per step, against the step before (L1 against L0)
 
@@ -647,20 +646,6 @@ class LadderController:
         if loaded is None:
             return None
         entered, now_defined = self.loaded.step(self.step), loaded.step(self.step)
-        if (
-            entered is not None
-            and now_defined is not None
-            and (entered.scale, entered.caps) != (now_defined.scale, now_defined.caps)
-            and self._changed_reported != loaded.sha256
-        ):
-            self._changed_reported = loaded.sha256
-            self._event(
-                "warn",
-                f"ladder.yaml changed {self.step}'s scale or caps; the active caps stay as "
-                f"entered until the next step change: {caps_text(self.limits)}",
-            )
-        # self.limits keeps the caps this step was entered with; max_step, the gates and
-        # the steps entered from now on use the new file.
         old_limits = self.limits
         self.loaded = loaded
         if loaded.index(self.step) > loaded.index(loaded.max_step):
@@ -669,6 +654,19 @@ class LadderController:
             self._event(
                 "info",
                 f"ladder {old} -> {self.step}: max_step lowered to {loaded.max_step}; "
+                f"{change_text(old_limits, self.limits)}",
+            )
+            return self.limits
+        if (
+            entered is not None
+            and now_defined is not None
+            and (entered.scale, entered.caps) != (now_defined.scale, now_defined.caps)
+        ):
+            self._changed_reported = loaded.sha256
+            self._set(self.step, self.since or now)
+            self._event(
+                "info",
+                f"ladder {self.step} -> {self.step}: active step caps updated; "
                 f"{change_text(old_limits, self.limits)}",
             )
             return self.limits
