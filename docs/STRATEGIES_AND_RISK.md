@@ -54,11 +54,11 @@ flowchart TD
 
 ### 2.1 Strategy A — Intra-Race Complement Arbitrage (`evaluate_complement`)
 In a two-party race where both the Democratic (`D`) and Republican (`R`) contracts are approved and mutually exclusive:
-- **Long YES Complement:** If the best asks on SIG satisfy:
-  $$\text{ask}_D + \text{ask}_R \le \text{max\_sum\_ask} \quad (0.970)$$
+- **Long YES Complement:** If the best asks on SIG satisfy the complement ceiling (`max_sum_ask` = 0.970):
+  $$\text{ask}_D + \text{ask}_R \le 0.970$$
   buying equal quantities $Q$ of `YES` on both `D` and `R` costs $Q \times (\text{ask}_D + \text{ask}_R) \le 0.970 Q$ while paying out $1.000 Q$ whenever either `D` or `R` wins.
-- **Long NO Complement:** When `no_orders_enabled: true`, if the best bids on SIG satisfy:
-  $$\text{bid}_D + \text{bid}_R \ge \text{min\_sum\_bid} \quad (1.030)$$
+- **Long NO Complement:** When `no_orders_enabled: true`, if the best bids on SIG satisfy the complement floor (`min_sum_bid` = 1.030):
+  $$\text{bid}_D + \text{bid}_R \ge 1.030$$
   the implied `NO` asks are $(1 - \text{bid}_D)$ and $(1 - \text{bid}_R)$, whose sum is $2 - (\text{bid}_D + \text{bid}_R) \le 0.970$. Buying equal quantities of `NO` on both `D` and `R` locks in at least $0.030$ per share.
 
 ### 2.2 Strategy B — Cross-Venue Reference Pricing (`evaluate_reference` & `bot/refs.py`)
@@ -99,11 +99,11 @@ flowchart TD
 
 ### Three Exit Triggers (`evaluate_exit`)
 Let $S \in \{\text{YES}, \text{NO}\}$ be the held side, $f_S$ be the reference fair value for side $S$ ($f$ for `YES`, $1 - f$ for `NO`), $b_S$ be SIG's best bid for side $S$ ($\text{SIG}_{\text{bid}}$ for `YES`, $1 - \text{SIG}_{\text{ask}}$ for `NO`), and $e_S$ be the FIFO average entry price of the currently held shares from the order journal (`risk.entry_price`):
-1. **Valuation Reversal Exit (`BOT-EW-5`):** Fires when SIG's bid exceeds reference fair value by at least `exit_edge` ($0.03$ normal, $0.04$ election night):
-   $$b_S \ge f_S + \text{exit\_edge}$$
+1. **Valuation Reversal Exit (`BOT-EW-5`):** Fires when SIG's bid exceeds reference fair value by at least `exit_edge` ($e_{\text{exit}} = 0.03$ normal, $0.04$ election night):
+   $$b_S \ge f_S + e_{\text{exit}}$$
 2. **Take-Profit Exit (`BOT-ROTATE`):** Fires when the unrealized percentage gain on the position reaches `take_profit_pct` ($8\%$):
    $$\frac{b_S - e_S}{e_S} \ge 0.08$$
-3. **Edge-Gone Exit (`BOT-ROTATE`):** Fires when the market has converged toward fair value so that the entry discount has disappeared ($b_S \ge f_S - \text{buy\_edge}$), **subject to the strict floor $b_S \ge e_S$** (never realizes a loss under `edge_gone`).
+3. **Edge-Gone Exit (`BOT-ROTATE`):** Fires when the market has converged toward fair value so that the entry discount has disappeared ($b_S \ge f_S - e_{\text{buy}}$), **subject to the strict floor $b_S \ge e_S$** (never realizes a loss under `edge_gone`).
 
 ---
 
