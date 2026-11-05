@@ -1,4 +1,4 @@
-<h1 align="center">Bellwether</h1>
+<h1 align="center"><img src="docs/assets/bellwether-title.gif" alt="Bellwether" width="100%"></h1>
 
 <p align="center"><strong>A risk-gated, real-time quantitative trading system for prediction markets — built for the SIG Predictions Cup 2026.</strong></p>
 
