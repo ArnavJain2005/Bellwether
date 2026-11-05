@@ -10,8 +10,9 @@
 </p>
 
 > **At a Glance (For Recruiters & Technical Reviewers)**
-> - **Cross-venue arbitrage & relative-value pricing:** Continuously prices **202 approved SIG contracts across 101 US midterm races** (Senate, Governor, House & Chamber Control) against real-money order books on **Kalshi** and **Polymarket**.
-> - **Three coordinated strategies + dynamic capital rotation (`BOT-ROTATE`):** Executes intra-race **complement arbitrage**, cross-venue **reference pricing**, and **reduce-only exits** (take-profit, edge-gone, and valuation reversal) with **highest-edge-first reinvestment**.
+> - **Competition result:** Finished **264th of 5,141 participants** (top 5%) with **final competition P&L of +5,850 SUSQies**.
+> - **Cross-venue arbitrage & relative-value pricing:** During the competition, priced **202 approved SIG contracts across 101 US midterm races** (Senate, Governor, House & Chamber Control) against real-money order books on **Kalshi** and **Polymarket**.
+> - **Three coordinated strategies + dynamic capital rotation (`BOT-ROTATE`):** Ran intra-race **complement arbitrage**, cross-venue **reference pricing**, and **reduce-only exits** (take-profit, edge-gone, and valuation reversal) with **highest-edge-first reinvestment**.
 > - **Institutional-grade execution safety:** Exact `Decimal` wire parsing (zero IEEE-754 float drift), a **write-ahead SQLite idempotency journal** committed before every network send, **buy-only complement netting** (never sends a sell order that could flip a position), a **12-stage fail-closed risk gate** enforced by an AST bypass test, and a **read-only Streamlit live monitor** with a 2-click emergency `STOP`.
 
 <p align="center">
@@ -41,9 +42,9 @@ The main README provides a concise executive overview. For engineers and intervi
 
 ## The Problem
 
-SIG's Predictions Cup runs US midterm election markets: **237 YES/NO contracts across 117 races**, traded with simulated tournament funds (`SUSQies`, 100,000 starting balance). **Kalshi** and **Polymarket** list many of the same races with deep real-money liquidity.
+SIG's Predictions Cup ran US midterm election markets: **237 YES/NO contracts across 117 races**, traded with simulated tournament funds (`SUSQies`, 100,000 starting balance). **Kalshi** and **Polymarket** list many of the same races with deep real-money liquidity.
 
-Bellwether continuously compares SIG's order books against Kalshi and Polymarket—as well as internal D vs. R complement pricing within each race—and executes on SIG when prices move out of line. SIG is the only venue Bellwether trades on; Kalshi and Polymarket are strictly read-only reference feeds.
+During the competition, Bellwether compared SIG's order books against Kalshi and Polymarket—as well as internal D vs. R complement pricing within each race—and executed on SIG when prices moved out of line. SIG was the only venue Bellwether traded on; Kalshi and Polymarket were strictly read-only reference feeds.
 
 **Why this is a hard systems & quantitative engineering problem:**
 1. **Settlement-rule equivalence:** Two similarly titled contracts can settle differently (e.g., Louisiana's runoff calendar vs. swearing-in rules, or Independent candidates). Every mapped contract requires rule verification.
@@ -254,4 +255,4 @@ For full server deployment, `systemd` setup, SSH port-forwarding, and live opera
 
 Designed and built by **Arnav Jain** for the **SIG Predictions Cup 2026**.
 
-<sub>Audited against `main` at `3426c77` (PR #70), Nov 4, 2026. `SUSQies` are simulated tournament funds on SIG's Super Market competition platform; no real money is traded on SIG.</sub>
+<sub>Technical snapshot audited against `main` at `3426c77` (PR #70), Nov 4, 2026. Final competition rank and P&L supplied by Arnav on Nov 5, 2026; supporting final leaderboard/account records are not committed here. `SUSQies` are simulated tournament funds on SIG's Super Market competition platform; no real money was traded on SIG.</sub>
