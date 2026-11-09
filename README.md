@@ -10,7 +10,7 @@
 </p>
 
 > **At a Glance (For Recruiters & Technical Reviewers)**
-> - **Competition result:** Finished **232nd of 5,141 participants** (top 4.5%) with **final competition P&L of +9,150 SUSQies**.
+> - **Competition result:** Finished **232nd of 5,141 participants** (top 4.5%) with **final competition P&L of +9,496 SUSQies**.
 > - **Cross-venue arbitrage & relative-value pricing:** During the competition, priced **202 approved SIG contracts across 101 US midterm races** (Senate, Governor, House & Chamber Control) against real-money order books on **Kalshi** and **Polymarket**.
 > - **Three coordinated strategies + dynamic capital rotation (`BOT-ROTATE`):** Ran intra-race **complement arbitrage**, cross-venue **reference pricing**, and **reduce-only exits** (take-profit, edge-gone, and valuation reversal) with **highest-edge-first reinvestment**.
 > - **Institutional-grade execution safety:** Exact `Decimal` wire parsing (zero IEEE-754 float drift), a **write-ahead SQLite idempotency journal** committed before every network send, **buy-only complement netting** (never sends a sell order that could flip a position), a **12-stage fail-closed risk gate** enforced by an AST bypass test, and a **read-only Streamlit live monitor** with a 2-click emergency `STOP`.
