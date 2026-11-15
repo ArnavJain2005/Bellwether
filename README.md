@@ -1,5 +1,11 @@
 <h1 align="center"><img src="docs/assets/bellwether-title.gif" alt="Bellwether" width="100%"></h1>
 
+<p align="center">
+  <a href="https://sig.com/"><img src="https://cdn.phenompeople.com/CareerConnectResources/SUSQA004Y/social/SIG_Black_logo_1200x630-1622729694221.jpg" alt="Susquehanna International Group (SIG) logo" width="250"></a>
+  &nbsp;&nbsp;
+  <a href="https://predictionscup.com/"><img src="https://predictionscup.com/media/p13hqgwn/predictionscupog.webp" alt="Susquehanna Predictions Cup logo" width="250"></a>
+</p>
+
 <p align="center"><strong>A risk-gated, real-time quantitative trading system for prediction markets — built for the SIG Predictions Cup 2026.</strong></p>
 
 <p align="center">
